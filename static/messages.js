@@ -5856,7 +5856,17 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
             window._compressionUi.sessionId===activeSid&&
             d.session&&d.session.session_id
           ){
-            window._compressionUi={...window._compressionUi, sessionId:d.session.session_id};
+            if(d.session.session_id!==activeSid&&window._compressionUi.phase==='running'){
+              // Turn completed (done event) but the compression UI is still in
+              // 'running' phase — the 'compressed' SSE event was lost or delayed.
+              // Clear the stale running state instead of rebinding it to the
+              // continuation session, which would surface a phantom "Compressing
+              // context" barrier on a session that never actually compressed.
+              if(typeof clearCompressionUi==='function') clearCompressionUi();
+              else window._compressionUi=null;
+            } else {
+              window._compressionUi={...window._compressionUi, sessionId:d.session.session_id};
+            }
           }
           // Find the last assistant message once for both reasoning persistence and timestamp
           lastAsst=[...S.messages].reverse().find(m=>m.role==='assistant');
