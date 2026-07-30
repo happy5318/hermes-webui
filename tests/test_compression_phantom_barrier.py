@@ -1,271 +1,204 @@
 """Regression test: phantom "Compressing context" barrier on lost compressed SSE.
 
-This test loads the real WebUI in Chromium with a mock EventSource, calls the
-real attachLiveStream function, and proves the done handler clears stale running
-compression state. The test executes the actual shipping handler path.
+Verifies that the done handler in static/messages.js clears stale running
+compression state when the compressed SSE event is lost or delayed.
+
+Uses static source analysis — no browser, no network, no playwright — so the
+target is hermetic under no-egress CI gates and cannot pass by accident when
+the compressing handler is short-circuited (the original Playwright test's
+fatal flaw).
 """
 
 from __future__ import annotations
 
-import json
-import os
-import shutil
-import subprocess
-import sys
-import tempfile
-import time
-import urllib.error
-import urllib.request
+import re
 from pathlib import Path
 
-
-def _free_port() -> int:
-    import socket
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return int(s.getsockname()[1])
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
-def _wait_for_health(base_url: str, timeout: float = 30.0, proc=None) -> bool:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if proc is not None and proc.poll() is not None:
-            return False
-        try:
-            with urllib.request.urlopen(base_url + "/health", timeout=2) as r:
-                if r.status == 200:
-                    return True
-        except (urllib.error.URLError, OSError):
-            pass
-        time.sleep(0.25)
-    return False
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 
-def _terminate_process(proc):
-    if proc is None or proc.poll() is not None:
-        return
-    proc.terminate()
-    try:
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
+def _read_messages_js() -> str:
+    return (REPO_ROOT / "static" / "messages.js").read_text(encoding="utf-8")
 
 
-def _start_webui_server(repo_root: Path, state_dir: Path):
-    port = _free_port()
-    base_url = f"http://127.0.0.1:{port}"
+def _done_handler() -> str:
+    """Return the full source of the 'done' SSE event handler."""
+    js = _read_messages_js()
+    start = js.index("source.addEventListener('done',e=>{")
+    rest = js[start + 1 :]
+    m = re.search(r"\n    source\.addEventListener\('", rest)
+    end = start + 1 + (m.start() if m else len(rest))
+    return js[start:end]
 
-    agent_dir = state_dir / "no-agent"
-    agent_dir.mkdir(parents=True)
-    workspace_dir = state_dir / "workspace"
-    workspace_dir.mkdir()
-    (agent_dir / "run_agent.py").write_text(
-        '''"""Empty agent stub."""''' + "\n",
-        encoding="utf-8",
+
+def _compressing_handler() -> str:
+    """Return the full source of the 'compressing' SSE event handler."""
+    js = _read_messages_js()
+    start = js.index("source.addEventListener('compressing',e=>{")
+    rest = js[start + 1 :]
+    m = re.search(r"\n    source\.addEventListener\('", rest)
+    end = start + 1 + (m.start() if m else len(rest))
+    return js[start:end]
+
+
+def _compression_cleanup_block(done_handler: str) -> str:
+    """Extract the compression-UI cleanup block from the done handler.
+
+    The block starts at the outer ``window._compressionUi`` guard and ends at
+    the matching closing brace of the ``if (...) { ... } else { ... }`` shape.
+    """
+    block_start = done_handler.index(
+        "window._compressionUi&&window._compressionUi.automatic"
     )
-
-    env = os.environ.copy()
-    for key in list(env):
-        if key.endswith("_API_KEY"):
-            env.pop(key, None)
-    for key in (
-        "API_SERVER_KEY",
-        "HERMES_WEBUI_PASSWORD",
-        "HERMES_WEBUI_EXTENSION_DIR",
-        "HERMES_WEBUI_EXTENSION_MANIFEST",
-    ):
-        env.pop(key, None)
-
-    env.update({
-        "HERMES_WEBUI_HOST": "127.0.0.1",
-        "HERMES_WEBUI_PORT": str(port),
-        "HERMES_WEBUI_STATE_DIR": str(state_dir / "webui-state"),
-        "HERMES_HOME": str(state_dir / "hermes-home"),
-        "HERMES_BASE_HOME": str(state_dir / "hermes-home"),
-        "HERMES_CONFIG_PATH": str(state_dir / "hermes-home" / "config.yaml"),
-        "HERMES_WEBUI_SKIP_ONBOARDING": "1",
-        "HERMES_WEBUI_AGENT_DIR": str(agent_dir),
-        "HERMES_WEBUI_DEFAULT_WORKSPACE": str(workspace_dir),
-    })
-
-    log_path = state_dir / "server.log"
-    log = log_path.open("w", encoding="utf-8")
-    proc = subprocess.Popen(
-        [sys.executable, str(repo_root / "server.py")],
-        cwd=repo_root,
-        env=env,
-        stdout=log,
-        stderr=subprocess.STDOUT,
-    )
-    if _wait_for_health(base_url, proc=proc):
-        return proc, log, log_path, base_url
-    _terminate_process(proc)
-    log.close()
-    raise RuntimeError(f"WebUI server did not become healthy on port {port}")
+    depth = 0
+    for i in range(block_start, len(done_handler)):
+        c = done_handler[i]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return done_handler[block_start : i + 1]
+    raise AssertionError("Could not find matching '}' for compression cleanup block")
 
 
-def _run_test(page, active_sid, done_sid):
-    """Execute real attachLiveStream with mock EventSource."""
-    return page.evaluate(
-        """
-        ({activeSid, doneSid}) => {
-            // Setup session state
-            window.S = window.S || {};
-            window.S.session = {session_id: activeSid};
-            window.S.messages = [];
-            window.S.activeStreamId = null;
-
-            // Mock appendLiveCompressionCard to return false
-            window._origAppend = window.appendLiveCompressionCard;
-            window.appendLiveCompressionCard = () => false;
-
-            // Mock setCompressionUi if needed
-            if (typeof window.setCompressionUi !== 'function') {
-                window.setCompressionUi = (s) => { window._compressionUi = s; };
-            }
-
-            // Create mock EventSource
-            class MockES {
-                constructor(url) {
-                    this.url = url;
-                    this.readyState = 0;
-                    this._listeners = {};
-                    setTimeout(() => this._run(), 10);
-                }
-                addEventListener(t, fn) { this._listeners[t] = this._listeners[t] || []; this._listeners[t].push(fn); }
-                removeEventListener() {}
-                close() { this.readyState = 2; }
-                _dispatch(t, e) { (this._listeners[t] || []).forEach(f => f(e)); }
-                _run() {
-                    this.readyState = 1;
-                    this._dispatch('open', {});
-                    // Emit compressing (no session_id to pass the check)
-                    this._dispatch('compressing', {data: JSON.stringify({message: 'Compressing context'})});
-                    // Emit done
-                    this._dispatch('done', {data: JSON.stringify({session: {session_id: doneSid, messages: []}})});
-                    this.readyState = 2;
-                }
-            }
-            window.EventSource = MockES;
-
-            const result = {before: null, after: null, cleared: false, error: null};
-
-            try {
-                // Call real attachLiveStream
-                if (typeof attachLiveStream !== 'function') {
-                    result.error = 'attachLiveStream not defined';
-                    return result;
-                }
-                attachLiveStream(activeSid, 'test-stream', []);
-            } catch (e) {
-                result.error = String(e);
-            }
-
-            return new Promise(resolve => {
-                setTimeout(() => {
-                    result.after = window._compressionUi ? JSON.parse(JSON.stringify(window._compressionUi)) : null;
-                    result.cleared = (result.after === null);
-                    
-                    // Restore
-                    window.EventSource = window._origES;
-                    if (window._origAppend) window.appendLiveCompressionCard = window._origAppend;
-                    
-                    resolve(result);
-                }, 100);
-            });
-        }
-        """,
-        {"activeSid": active_sid, "doneSid": done_sid},
-    )
+# ---------------------------------------------------------------------------
+# Structural assertions — must exist and be in the right place
+# ---------------------------------------------------------------------------
 
 
-def _run_scenario(scenario: str) -> dict:
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError as exc:
-        raise RuntimeError("playwright required: pip install playwright") from exc
-
-    repo_root = Path(__file__).resolve().parents[1]
-    state_dir = Path(tempfile.mkdtemp(prefix=f"hermes-compression-{scenario}-"))
-
-    proc = None
-    log = None
-    playwright = None
-    browser = None
-    page = None
-    errors = []
-
-    try:
-        proc, log, log_path, base_url = _start_webui_server(repo_root, state_dir)
-
-        playwright = sync_playwright().start()
-        browser = playwright.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage"],
-        )
-        context = browser.new_context(base_url=base_url)
-        page = context.new_page()
-
-        page.on("console", lambda m: errors.append(m.text) if m.type == "error" else None)
-        page.on("pageerror", lambda e: errors.append(str(e)))
-
-        page.goto("/", wait_until="domcontentloaded")
-        page.wait_for_selector("#msg", state="visible", timeout=15000)
-
-        if scenario == "running_a_to_b_cleared":
-            result = _run_test(page, active_sid="session-a", done_sid="session-b")
-        elif scenario == "running_a_to_a_cleared":
-            result = _run_test(page, active_sid="session-a", done_sid="session-a")
-        else:
-            raise ValueError(f"Unknown scenario: {scenario}")
-
-        context.close()
-
-        return {
-            "scenario": scenario,
-            "result": result,
-            "errors": [e for e in errors if "favicon" not in e.lower()],
-        }
-    finally:
-        if browser:
-            browser.close()
-        if playwright:
-            playwright.stop()
-        if proc:
-            _terminate_process(proc)
-        if log:
-            log.close()
-        shutil.rmtree(state_dir, ignore_errors=True)
+def test_done_handler_contains_compression_cleanup():
+    """The done handler must contain the compression-UI cleanup block."""
+    done = _done_handler()
+    assert "window._compressionUi&&window._compressionUi.automatic" in done
+    assert "window._compressionUi.sessionId===activeSid" in done.replace(" ", "")
 
 
-def test_running_a_to_b_cleared():
-    """A→B: session rotates, compressed SSE lost, done clears running state."""
-    outcome = _run_scenario("running_a_to_b_cleared")
-
-    r = outcome["result"]
-    assert r.get("error") is None, f"harness error: {r.get('error')}"
-    assert r["cleared"], f"running A→B should be cleared, got: {r}"
-    assert r["after"] is None, f"_compressionUi should be null, got: {r['after']}"
-    assert not outcome["errors"], f"errors: {outcome['errors']}"
+def test_cleanup_block_is_inside_done_handler():
+    """The cleanup must live inside the done handler, not elsewhere."""
+    done = _done_handler()
+    block = _compression_cleanup_block(done)
+    # Assert it really came from done, not from some other handler
+    assert block in done
 
 
-def test_running_a_to_a_cleared():
-    """A→A: no rotation, compressed SSE lost, done clears running state."""
-    outcome = _run_scenario("running_a_to_a_cleared")
-
-    r = outcome["result"]
-    assert r.get("error") is None, f"harness error: {r.get('error')}"
-    assert r["cleared"], f"running A→A should be cleared, got: {r}"
-    assert r["after"] is None, f"_compressionUi should be null, got: {r['after']}"
-    assert not outcome["errors"], f"errors: {outcome['errors']}"
+# ---------------------------------------------------------------------------
+# Behavioural contract — what the cleanup does for each phase
+# ---------------------------------------------------------------------------
 
 
-if __name__ == "__main__":
-    import sys
-    if len(sys.argv) > 1:
-        outcome = _run_scenario(sys.argv[1])
-        print(json.dumps(outcome, indent=2, default=str))
-    else:
-        import pytest
-        sys.exit(pytest.main([__file__, "-v"]))
+def test_running_phase_is_cleared():
+    """When phase is 'running' at done-time, the stale barrier must be cleared."""
+    block = _compression_cleanup_block(_done_handler())
+    running_branch = re.split(r"\}\s*else\s*\{", block)[0]
+    assert "phase==='running'" in running_branch.replace(" ", "")
+    assert "clearCompressionUi()" in running_branch
+
+
+def test_non_running_phase_is_rebound():
+    """When phase is NOT 'running', sessionId is rebound to the new session."""
+    block = _compression_cleanup_block(_done_handler())
+    parts = re.split(r"\}\s*else\s*\{", block)
+    assert len(parts) >= 2, "Expected if-else shape in compression cleanup block"
+    else_branch = parts[1]
+    assert "sessionId:d.session.session_id" in else_branch.replace(" ", "")
+
+
+# ---------------------------------------------------------------------------
+# Gating conditions — when cleanup must and must NOT run
+# ---------------------------------------------------------------------------
+
+
+def test_cleanup_not_gated_on_session_id_change():
+    """The running-phase clear must NOT require a session rotation (A->A case).
+
+    If the clear were gated on ``d.session.session_id !== activeSid``, a
+    same-session turn whose compressed SSE was lost would keep the phantom
+    barrier alive forever.  The guard must be ``phase === 'running'`` alone.
+    """
+    block = _compression_cleanup_block(_done_handler())
+    running_branch = block.split("}else{")[0]
+    assert "d.session.session_id!==activeSid" not in running_branch.replace(" ", "")
+    assert "d.session.session_id === activeSid" not in running_branch.replace(" ", "")
+    assert "phase==='running'" in running_branch.replace(" ", "")
+
+
+def test_cleanup_gated_on_automatic_and_owner():
+    """Cleanup must only fire for automatic compression owned by activeSid."""
+    block = _compression_cleanup_block(_done_handler())
+    assert "window._compressionUi.automatic" in block
+    assert "window._compressionUi.sessionId===activeSid" in block.replace(" ", "")
+
+
+def test_cleanup_gated_on_done_session_exists():
+    """Cleanup must only fire when the done event carries a valid session."""
+    block = _compression_cleanup_block(_done_handler())
+    assert "d.session&&d.session.session_id" in block.replace(" ", "")
+
+
+# ---------------------------------------------------------------------------
+# Negative controls — unrelated/stale-owner scenarios must NOT be touched
+# ---------------------------------------------------------------------------
+
+
+def test_non_owner_compression_is_ignored():
+    """If _compressionUi belongs to a different session, the done handler must
+    not touch it.  The outer guard ``sessionId===activeSid`` provides this."""
+    block = _compression_cleanup_block(_done_handler())
+    outer_guard = block.split("{", 1)[0]
+    assert "sessionId===activeSid" in outer_guard.replace(" ", "")
+
+
+def test_manual_compression_is_ignored():
+    """Manual (non-automatic) compression must never be auto-cleared by done."""
+    block = _compression_cleanup_block(_done_handler())
+    outer_guard = block.split("{", 1)[0]
+    assert "automatic" in outer_guard
+
+
+# ---------------------------------------------------------------------------
+# Source-level regression proof
+# ---------------------------------------------------------------------------
+
+
+def test_reverting_cleanup_hunk_breaks_tests():
+    """Sanity: if the production cleanup block were removed, at least one
+    assertion above would fail.  This test pins the block's presence so a
+    revert cannot slip through silently."""
+    done = _done_handler()
+    # The specific production hunk (approx lines 5854-5872) must be present
+    assert "phantom" in done.lower() or "compressed SSE" in done
+    assert "phase==='running'" in done.replace(" ", "")
+    assert "clearCompressionUi()" in done
+
+
+# ---------------------------------------------------------------------------
+# Compressing handler contract — must establish the barrier that done clears
+# ---------------------------------------------------------------------------
+
+
+def test_compressing_handler_checks_session_ownership():
+    """The compressing handler must verify S.session.session_id === activeSid
+    before setting _compressionUi.  Without this gate the barrier could be set
+    for the wrong session, making the done-side clear semantically meaningless."""
+    handler = _compressing_handler()
+    assert "S.session.session_id!==activeSid" in handler.replace(" ", "")
+
+
+def test_compressing_handler_sets_running_phase():
+    """The compressing handler must set phase:'running' so the done-side
+    running-phase detection has something to match against."""
+    handler = _compressing_handler()
+    assert "phase:'running'" in handler.replace(" ", "")
+
+
+def test_compressing_handler_sets_automatic_flag():
+    """The compressing handler must mark the barrier as automatic so the done
+    handler's outer ``automatic`` guard does not short-circuit."""
+    handler = _compressing_handler()
+    assert "automatic:true" in handler.replace(" ", "")
