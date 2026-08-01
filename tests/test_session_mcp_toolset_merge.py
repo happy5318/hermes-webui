@@ -390,3 +390,172 @@ def test_plugin_registry_collision_stays_restrict(monkeypatch):
         f"plugin '{plugin_name}' colliding with MCP server must RESTRICT, "
         f"not silently flip additive (got {result})"
     )
+
+
+# ── mcp-* canonical name collision: alpha + mcp-alpha ──────────────────────
+# Regression for the gate finding: dropping every mcp-* canonical name from
+# the shadow set enables a silent wrong-server resolution when two servers
+# have overlapping canonical names.
+
+
+def test_mcp_canonical_name_collision_restricts():
+    """When MCP servers ``alpha`` and ``mcp-alpha`` coexist, the bare token
+    ``mcp-alpha`` (submitted by the picker for the second server) collides with
+    the *canonical* name ``mcp-alpha`` (owned by the first server).  The
+    override must restrict — not flip additive, which would restore defaults
+    and let the runtime resolver match server ``alpha`` instead of the
+    intended ``mcp-alpha``."""
+    defaults = ["web", "file", "terminal", "delegation"]
+    override = ["mcp-alpha"]
+    mcp_servers = {"alpha", "mcp-alpha"}
+
+    # builtin_names includes the canonical names from both servers:
+    #   server alpha   → canonical mcp-alpha,   alias alpha
+    #   server mcp-alpha → canonical mcp-mcp-alpha, alias mcp-alpha
+    builtin_names = {"web", "file", "terminal", "delegation",
+                     "mcp-alpha", "mcp-mcp-alpha"}
+
+    result = _apply_override(defaults, override, mcp_servers,
+                             builtin_names=builtin_names)
+
+    assert result == ["mcp-alpha"], (
+        "bare token 'mcp-alpha' collides with canonical 'mcp-alpha' from "
+        "server 'alpha' — must RESTRICT, not flip additive (got {})".format(result)
+    )
+
+
+def test_ordinary_server_stays_additive_with_canonical_in_shadow():
+    """Negative control: a normal server ``foo`` (pick token ``foo``) stays
+    additive even though its canonical name ``mcp-foo`` is in the shadow set.
+    The bare token ``foo`` ≠ ``mcp-foo``, so there is no collision."""
+    defaults = ["web", "file"]
+    override = ["foo"]
+    mcp_servers = {"foo", "bar"}
+
+    # canonical ``mcp-foo`` is in the shadow set but does NOT collide with
+    # the bare picker token ``foo``.
+    builtin_names = {"web", "file", "terminal", "delegation", "mcp-foo", "mcp-bar"}
+
+    result = _apply_override(defaults, override, mcp_servers,
+                             builtin_names=builtin_names)
+
+    assert result == ["web", "file", "foo"], (
+        "bare token 'foo' must stay additive even with canonical 'mcp-foo' "
+        "in the shadow set (got {})".format(result)
+    )
+
+
+def test_plugin_canonical_mcp_prefix_collision_restricts():
+    """A plugin whose canonical name begins with ``mcp-`` (e.g. ``mcp-browser``)
+    must shadow a same-named MCP server alias.  The old code filtered *all*
+    ``mcp-*`` names from the shadow set, so a plugin ``mcp-browser`` could
+    silently flip additive."""
+    defaults = ["web", "file"]
+    override = ["mcp-browser"]
+    mcp_servers = {"mcp-browser"}
+
+    # Plugin canonical name is ``mcp-browser`` — it is in the shadow set.
+    builtin_names = {"web", "file", "terminal", "delegation", "mcp-browser"}
+
+    result = _apply_override(defaults, override, mcp_servers,
+                             builtin_names=builtin_names)
+
+    assert result == ["mcp-browser"], (
+        "plugin canonical 'mcp-browser' colliding with same-named MCP server "
+        "must RESTRICT (got {})".format(result)
+    )
+
+
+# ── Malformed registry return shapes must fail closed ──────────────────────
+
+
+def test_registry_returns_none_fails_closed(monkeypatch):
+    """When ``get_registered_toolset_names()`` returns None, the helper must
+    return None (not a partial static-only set)."""
+    import api.streaming as streaming
+
+    try:
+        from tools.registry import registry as _reg
+    except ImportError:
+        return  # CI without tools.registry — skip
+
+    _orig = _reg.get_registered_toolset_names
+    monkeypatch.setattr(_reg, "get_registered_toolset_names", lambda: None)
+    try:
+        result = streaming._builtin_toolset_names()
+    finally:
+        monkeypatch.setattr(_reg, "get_registered_toolset_names", _orig)
+
+    assert result is None, (
+        "None registry result must fail closed (return None), "
+        f"got {result!r}"
+    )
+
+
+def test_registry_returns_dict_fails_closed(monkeypatch):
+    """When ``get_registered_toolset_names()`` returns a dict (not a set/list/
+    tuple), the helper must return None."""
+    import api.streaming as streaming
+
+    try:
+        from tools.registry import registry as _reg
+    except ImportError:
+        return
+
+    _orig = _reg.get_registered_toolset_names
+    monkeypatch.setattr(_reg, "get_registered_toolset_names", lambda: {"a": 1})
+    try:
+        result = streaming._builtin_toolset_names()
+    finally:
+        monkeypatch.setattr(_reg, "get_registered_toolset_names", _orig)
+
+    assert result is None, (
+        f"dict registry result must fail closed, got {result!r}"
+    )
+
+
+def test_registry_returns_string_fails_closed(monkeypatch):
+    """When ``get_registered_toolset_names()`` returns a bare string, the
+    helper must return None."""
+    import api.streaming as streaming
+
+    try:
+        from tools.registry import registry as _reg
+    except ImportError:
+        return
+
+    _orig = _reg.get_registered_toolset_names
+    monkeypatch.setattr(_reg, "get_registered_toolset_names", lambda: "not-a-list")
+    try:
+        result = streaming._builtin_toolset_names()
+    finally:
+        monkeypatch.setattr(_reg, "get_registered_toolset_names", _orig)
+
+    assert result is None, (
+        f"string registry result must fail closed, got {result!r}"
+    )
+
+
+def test_registry_contains_non_string_entries_fails_closed(monkeypatch):
+    """When ``get_registered_toolset_names()`` returns entries that are not
+    strings, the helper must return None rather than string-coercing them."""
+    import api.streaming as streaming
+
+    try:
+        from tools.registry import registry as _reg
+    except ImportError:
+        return
+
+    _orig = _reg.get_registered_toolset_names
+    monkeypatch.setattr(
+        _reg, "get_registered_toolset_names",
+        lambda: ["valid", 42, object()],
+    )
+    try:
+        result = streaming._builtin_toolset_names()
+    finally:
+        monkeypatch.setattr(_reg, "get_registered_toolset_names", _orig)
+
+    assert result is None, (
+        f"non-string entries in registry must fail closed, got {result!r}"
+    )

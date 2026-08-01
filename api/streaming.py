@@ -6635,13 +6635,20 @@ def _builtin_toolset_names():
     try:
         from tools.registry import registry as _tool_registry
         _registered = _tool_registry.get_registered_toolset_names()
-        if isinstance(_registered, (set, list, tuple)):
-            # Exclude canonical mcp-* entries — those are the MCP tools
-            # themselves, not shadowing builtins.
-            for _name in _registered:
-                _name_str = str(_name)
-                if not _name_str.startswith('mcp-'):
-                    names.add(_name_str)
+        if not isinstance(_registered, (set, list, tuple)):
+            return None
+        # Union ALL registered canonical/plugin toolset names including
+        # mcp-* entries.  A bare override token that equals an existing
+        # canonical name (e.g. a server named "mcp-alpha" whose canonical
+        # is "mcp-mcp-alpha" collides with another server "alpha" whose
+        # canonical is "mcp-alpha") must NOT be treated as additive — the
+        # runtime resolver would match canonical "mcp-alpha" (server
+        # "alpha") instead of the intended server.  Including mcp-* names
+        # in the shadow set ensures the override restricts correctly.
+        for _name in _registered:
+            if not isinstance(_name, str):
+                return None
+            names.add(_name)
     except Exception:
         return None
     return names
