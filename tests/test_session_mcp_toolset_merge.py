@@ -475,12 +475,14 @@ def test_ordinary_server_stays_additive_with_canonical_in_shadow(monkeypatch):
         monkeypatch, ["mcp-foo", "mcp-bar"])
 
     if builtin is None:
-        # Registry unavailable → ``foo`` is not in the shadow set → treated as
-        # pure MCP (no collision) → additive.
+        # Registry unavailable → fail-closed RESTRICT.  We cannot prove
+        # ``foo`` is a bare MCP tick without the registry, so RESTRICT is
+        # the safe fallback.  The additive path is verified below when the
+        # registry is available.
         result = _apply_override(
             ["web", "file"], ["foo"], {"foo", "bar"}, builtin_names=None)
-        assert result == ["web", "file", "foo"], (
-            "unavailable registry: bare 'foo' must stay additive (got {})".format(result)
+        assert result == ["foo"], (
+            "unavailable registry must fail closed to RESTRICT (got {})".format(result)
         )
         return
 
