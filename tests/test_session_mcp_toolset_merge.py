@@ -398,25 +398,65 @@ def test_plugin_registry_collision_stays_restrict(monkeypatch):
 # have overlapping canonical names.
 
 
-def test_mcp_canonical_name_collision_restricts():
+def _patch_registry_and_get_builtin_names(monkeypatch, registered_names):
+    """Monkeypatch ``get_registered_toolset_names()`` to return *registered_names*
+    and call the real ``_builtin_toolset_names()``.  Returns the full shadow set
+    (static TOOLSETS keys + registered names), or ``None`` if the registry is
+    unavailable in this environment (fail-closed)."""
+    import api.streaming as streaming
+
+    try:
+        from tools.registry import registry as _reg
+    except ImportError:
+        return None  # CI without tools.registry — fail-closed
+
+    _orig = _reg.get_registered_toolset_names
+    monkeypatch.setattr(_reg, "get_registered_toolset_names",
+                        lambda: list(registered_names))
+    try:
+        return streaming._builtin_toolset_names()
+    finally:
+        monkeypatch.setattr(_reg, "get_registered_toolset_names", _orig)
+
+
+def test_mcp_canonical_name_collision_restricts(monkeypatch):
     """When MCP servers ``alpha`` and ``mcp-alpha`` coexist, the bare token
     ``mcp-alpha`` (submitted by the picker for the second server) collides with
     the *canonical* name ``mcp-alpha`` (owned by the first server).  The
     override must restrict — not flip additive, which would restore defaults
     and let the runtime resolver match server ``alpha`` instead of the
-    intended ``mcp-alpha``."""
-    defaults = ["web", "file", "terminal", "delegation"]
-    override = ["mcp-alpha"]
-    mcp_servers = {"alpha", "mcp-alpha"}
+    intended ``mcp-alpha``.
 
-    # builtin_names includes the canonical names from both servers:
-    #   server alpha   → canonical mcp-alpha,   alias alpha
-    #   server mcp-alpha → canonical mcp-mcp-alpha, alias mcp-alpha
-    builtin_names = {"web", "file", "terminal", "delegation",
-                     "mcp-alpha", "mcp-mcp-alpha"}
+    The shadow set is obtained from the real ``_builtin_toolset_names()``
+    (monkeypatched registry), not hand-constructed, so the test exercises the
+    actual enumeration path and would fail if the old ``mcp-*`` filtering were
+    restored."""
+    builtin = _patch_registry_and_get_builtin_names(
+        monkeypatch, ["mcp-alpha", "mcp-mcp-alpha"])
 
-    result = _apply_override(defaults, override, mcp_servers,
-                             builtin_names=builtin_names)
+    if builtin is None:
+        # Registry unavailable → fail-closed RESTRICT is correct.
+        result = _apply_override(
+            ["web", "file", "terminal", "delegation"], ["mcp-alpha"],
+            {"alpha", "mcp-alpha"}, builtin_names=None)
+        assert result == ["mcp-alpha"], (
+            "unavailable registry must restrict on mcp-* canonical collision "
+            "(got {})".format(result)
+        )
+        return
+
+    # Canonical ``mcp-alpha`` (from server ``alpha``) must be in the shadow
+    # set so the bare token ``mcp-alpha`` (from server ``mcp-alpha``) collides.
+    assert "mcp-alpha" in builtin, (
+        "canonical 'mcp-alpha' must be in the shadow set (got {})".format(builtin)
+    )
+    assert "mcp-mcp-alpha" in builtin, (
+        "canonical 'mcp-mcp-alpha' must be in the shadow set"
+    )
+
+    result = _apply_override(
+        ["web", "file", "terminal", "delegation"], ["mcp-alpha"],
+        {"alpha", "mcp-alpha"}, builtin_names=builtin)
 
     assert result == ["mcp-alpha"], (
         "bare token 'mcp-alpha' collides with canonical 'mcp-alpha' from "
@@ -424,20 +464,34 @@ def test_mcp_canonical_name_collision_restricts():
     )
 
 
-def test_ordinary_server_stays_additive_with_canonical_in_shadow():
+def test_ordinary_server_stays_additive_with_canonical_in_shadow(monkeypatch):
     """Negative control: a normal server ``foo`` (pick token ``foo``) stays
     additive even though its canonical name ``mcp-foo`` is in the shadow set.
-    The bare token ``foo`` ≠ ``mcp-foo``, so there is no collision."""
-    defaults = ["web", "file"]
-    override = ["foo"]
-    mcp_servers = {"foo", "bar"}
+    The bare token ``foo`` ≠ ``mcp-foo``, so there is no collision.
 
-    # canonical ``mcp-foo`` is in the shadow set but does NOT collide with
-    # the bare picker token ``foo``.
-    builtin_names = {"web", "file", "terminal", "delegation", "mcp-foo", "mcp-bar"}
+    Uses the real ``_builtin_toolset_names()`` (monkeypatched registry), not
+    hand-constructed shadow set."""
+    builtin = _patch_registry_and_get_builtin_names(
+        monkeypatch, ["mcp-foo", "mcp-bar"])
 
-    result = _apply_override(defaults, override, mcp_servers,
-                             builtin_names=builtin_names)
+    if builtin is None:
+        # Registry unavailable → ``foo`` is not in the shadow set → treated as
+        # pure MCP (no collision) → additive.
+        result = _apply_override(
+            ["web", "file"], ["foo"], {"foo", "bar"}, builtin_names=None)
+        assert result == ["web", "file", "foo"], (
+            "unavailable registry: bare 'foo' must stay additive (got {})".format(result)
+        )
+        return
+
+    assert "mcp-foo" in builtin
+    assert "foo" not in builtin, (
+        "bare token 'foo' must NOT be in the shadow set — only canonical "
+        "'mcp-foo' is (got {})".format(builtin)
+    )
+
+    result = _apply_override(
+        ["web", "file"], ["foo"], {"foo", "bar"}, builtin_names=builtin)
 
     assert result == ["web", "file", "foo"], (
         "bare token 'foo' must stay additive even with canonical 'mcp-foo' "
@@ -445,20 +499,35 @@ def test_ordinary_server_stays_additive_with_canonical_in_shadow():
     )
 
 
-def test_plugin_canonical_mcp_prefix_collision_restricts():
+def test_plugin_canonical_mcp_prefix_collision_restricts(monkeypatch):
     """A plugin whose canonical name begins with ``mcp-`` (e.g. ``mcp-browser``)
     must shadow a same-named MCP server alias.  The old code filtered *all*
     ``mcp-*`` names from the shadow set, so a plugin ``mcp-browser`` could
-    silently flip additive."""
-    defaults = ["web", "file"]
-    override = ["mcp-browser"]
-    mcp_servers = {"mcp-browser"}
+    silently flip additive.
 
-    # Plugin canonical name is ``mcp-browser`` — it is in the shadow set.
-    builtin_names = {"web", "file", "terminal", "delegation", "mcp-browser"}
+    Uses the real ``_builtin_toolset_names()`` (monkeypatched registry), not
+    hand-constructed shadow set."""
+    builtin = _patch_registry_and_get_builtin_names(
+        monkeypatch, ["mcp-browser"])
 
-    result = _apply_override(defaults, override, mcp_servers,
-                             builtin_names=builtin_names)
+    if builtin is None:
+        result = _apply_override(
+            ["web", "file"], ["mcp-browser"], {"mcp-browser"},
+            builtin_names=None)
+        assert result == ["mcp-browser"], (
+            "unavailable registry must restrict on mcp-* plugin collision "
+            "(got {})".format(result)
+        )
+        return
+
+    assert "mcp-browser" in builtin, (
+        "plugin canonical 'mcp-browser' must be in the shadow set "
+        "(got {})".format(builtin)
+    )
+
+    result = _apply_override(
+        ["web", "file"], ["mcp-browser"], {"mcp-browser"},
+        builtin_names=builtin)
 
     assert result == ["mcp-browser"], (
         "plugin canonical 'mcp-browser' colliding with same-named MCP server "
