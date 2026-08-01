@@ -6625,35 +6625,24 @@ def _builtin_toolset_names():
     except Exception:
         return None
     names = set()
-    found = False
     static = getattr(toolsets, 'TOOLSETS', None)
     if isinstance(static, dict):
         names.update(static.keys())
-        found = True
     # Registered canonical / plugin toolsets also shadow same-named MCP aliases
-    # at resolution time. Cover whichever accessor this build exposes.
-    for _accessor in ('registered_toolset_names', 'all_toolset_names',
-                      'canonical_toolset_names'):
-        try:
-            _fn = getattr(toolsets, _accessor, None)
-            if callable(_fn):
-                _extra = _fn()
-                if isinstance(_extra, (set, list, tuple, dict)) and _extra:
-                    names.update(_extra)
-                    found = True
-        except Exception:
-            continue
-    for _attr in ('REGISTERED_TOOLSETS', 'CANONICAL_TOOLSETS',
-                  'PLUGIN_TOOLSETS'):
-        _val = getattr(toolsets, _attr, None)
-        if isinstance(_val, dict):
-            names.update(_val.keys())
-            found = True
-        elif isinstance(_val, (set, list, tuple)):
-            names.update(_val)
-            found = True
-    if not found:
-        # Module imported but exposed no recognizable registry → unknown.
+    # at resolution time.  Enumerate the real runtime registry — the installed
+    # runtime does not expose the speculative accessor/attribute names, so a
+    # static enumeration would silently miss every registered/plugin toolset.
+    try:
+        from tools.registry import registry as _tool_registry
+        _registered = _tool_registry.get_registered_toolset_names()
+        if isinstance(_registered, (set, list, tuple)):
+            # Exclude canonical mcp-* entries — those are the MCP tools
+            # themselves, not shadowing builtins.
+            for _name in _registered:
+                _name_str = str(_name)
+                if not _name_str.startswith('mcp-'):
+                    names.add(_name_str)
+    except Exception:
         return None
     return names
 

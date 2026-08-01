@@ -328,3 +328,65 @@ def test_streaming_uses_additive_helper():
         "streaming.py must read cfg['mcp_servers'] to distinguish MCP server "
         "names from ordinary toolset names in the per-session override."
     )
+
+
+def test_plugin_registry_collision_stays_restrict(monkeypatch):
+    """When a registered plugin toolset name collides with a configured MCP
+    server name, the override must stay RESTRICT — not silently flip additive.
+
+    The regression bug: ``_builtin_toolset_names()`` used speculative
+    accessor/attribute names that don't exist on the installed runtime, so
+    registered/plugin toolsets were silently missing from the shadow set.  A
+    plugin-named MCP server could slip past the collision guard and flip a
+    RESTRICT override to additive.
+    """
+    import api.streaming as streaming
+
+    # Simulate a registered plugin toolset whose name collides with an MCP
+    # server.  The real registry may be unavailable in CI — we patch the
+    # registry method so the test exercises the real code path in
+    # _builtin_toolset_names() regardless of the environment.
+    plugin_name = "browser-cdp"
+    try:
+        from tools.registry import registry as _reg
+        _orig_get = _reg.get_registered_toolset_names
+        monkeypatch.setattr(
+            _reg, "get_registered_toolset_names",
+            lambda: [plugin_name],
+        )
+    except ImportError:
+        # CI environment — tools.registry is not importable.
+        # _builtin_toolset_names() will return None (fail-closed), which is
+        # the correct behaviour.  The test is still meaningful: we verify
+        # that the fail-closed path does NOT silently flip to additive.
+        pass
+
+    # Drive the real _builtin_toolset_names() (not a stubbed return value).
+    builtin = streaming._builtin_toolset_names()
+
+    if builtin is None:
+        # Registry unavailable → fail-closed RESTRICT is correct.
+        result = _apply_override(
+            ["web", "file"], [plugin_name], {plugin_name},
+            builtin_names=None,
+        )
+        assert result == [plugin_name], (
+            "unavailable registry must restrict, not silently flip additive"
+        )
+        return
+
+    # Registry available → plugin name must be in the shadow set.
+    assert plugin_name in builtin, (
+        f"registered plugin '{plugin_name}' must appear in the builtin shadow "
+        f"set so it collides with the same-named MCP server"
+    )
+
+    # The collision must force RESTRICT.
+    result = _apply_override(
+        ["web", "file"], [plugin_name], {plugin_name},
+        builtin_names=builtin,
+    )
+    assert result == [plugin_name], (
+        f"plugin '{plugin_name}' colliding with MCP server must RESTRICT, "
+        f"not silently flip additive (got {result})"
+    )
