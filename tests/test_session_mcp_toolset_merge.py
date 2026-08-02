@@ -401,14 +401,55 @@ def test_plugin_registry_collision_stays_restrict(monkeypatch):
 def _patch_registry_and_get_builtin_names(monkeypatch, registered_names):
     """Monkeypatch ``get_registered_toolset_names()`` to return *registered_names*
     and call the real ``_builtin_toolset_names()``.  Returns the full shadow set
-    (static TOOLSETS keys + registered names), or ``None`` if the registry is
-    unavailable in this environment (fail-closed)."""
+    (static TOOLSETS keys + registered names).
+
+    Both ``toolsets`` and ``tools.registry`` are made available unconditionally —
+    when they cannot be imported (CI without the agent runtime), lightweight
+    stand-ins are injected into ``sys.modules`` so the production
+    ``_builtin_toolset_names()`` import succeeds and the real enumeration path is
+    exercised.  This prevents a silent fallback that would hide a regression in
+    the ``mcp-*`` filtering.
+    """
+    import sys
+    import types
     import api.streaming as streaming
 
+    _injected = []  # (module_name, was_present) pairs for cleanup
+    _reg = None
+
+    # ── toolsets ──
+    if "toolsets" not in sys.modules:
+        _mock_toolsets = types.ModuleType("toolsets")
+        # Minimal TOOLSETS dict — the static keys the real module exposes.
+        # Only the keys matter for shadow-set membership; the values are unused.
+        _mock_toolsets.TOOLSETS = {  # type: ignore[attr-defined]
+            "web": None, "search": None, "file": None, "terminal": None,
+            "delegation": None, "vision": None, "computer_use": None,
+        }
+        sys.modules["toolsets"] = _mock_toolsets
+        _injected.append(("toolsets", False))
+    else:
+        _injected.append(("toolsets", True))
+
+    # ── tools.registry ──
     try:
         from tools.registry import registry as _reg
     except ImportError:
-        return None  # CI without tools.registry — fail-closed
+        _mock_registry = types.SimpleNamespace()
+        _mock_registry.get_registered_toolset_names = lambda: list(registered_names)
+        _reg = _mock_registry
+        _injected_module = types.ModuleType("tools.registry")
+        _injected_module.registry = _mock_registry  # type: ignore[attr-defined]
+        if "tools" not in sys.modules:
+            sys.modules["tools"] = types.ModuleType("tools")
+            _injected.append(("tools", False))
+        else:
+            _injected.append(("tools", True))
+        sys.modules["tools.registry"] = _injected_module
+        _injected.append(("tools.registry", False))
+    else:
+        _injected.append(("tools.registry", True))
+        _injected.append(("tools", True))
 
     _orig = _reg.get_registered_toolset_names
     monkeypatch.setattr(_reg, "get_registered_toolset_names",
@@ -417,6 +458,10 @@ def _patch_registry_and_get_builtin_names(monkeypatch, registered_names):
         return streaming._builtin_toolset_names()
     finally:
         monkeypatch.setattr(_reg, "get_registered_toolset_names", _orig)
+        # Clean up injected modules so other tests see the real environment.
+        for _mod_name, _was_present in reversed(_injected):
+            if not _was_present:
+                sys.modules.pop(_mod_name, None)
 
 
 def test_mcp_canonical_name_collision_restricts(monkeypatch):
@@ -433,17 +478,6 @@ def test_mcp_canonical_name_collision_restricts(monkeypatch):
     restored."""
     builtin = _patch_registry_and_get_builtin_names(
         monkeypatch, ["mcp-alpha", "mcp-mcp-alpha"])
-
-    if builtin is None:
-        # Registry unavailable → fail-closed RESTRICT is correct.
-        result = _apply_override(
-            ["web", "file", "terminal", "delegation"], ["mcp-alpha"],
-            {"alpha", "mcp-alpha"}, builtin_names=None)
-        assert result == ["mcp-alpha"], (
-            "unavailable registry must restrict on mcp-* canonical collision "
-            "(got {})".format(result)
-        )
-        return
 
     # Canonical ``mcp-alpha`` (from server ``alpha``) must be in the shadow
     # set so the bare token ``mcp-alpha`` (from server ``mcp-alpha``) collides.
@@ -474,18 +508,6 @@ def test_ordinary_server_stays_additive_with_canonical_in_shadow(monkeypatch):
     builtin = _patch_registry_and_get_builtin_names(
         monkeypatch, ["mcp-foo", "mcp-bar"])
 
-    if builtin is None:
-        # Registry unavailable → fail-closed RESTRICT.  We cannot prove
-        # ``foo`` is a bare MCP tick without the registry, so RESTRICT is
-        # the safe fallback.  The additive path is verified below when the
-        # registry is available.
-        result = _apply_override(
-            ["web", "file"], ["foo"], {"foo", "bar"}, builtin_names=None)
-        assert result == ["foo"], (
-            "unavailable registry must fail closed to RESTRICT (got {})".format(result)
-        )
-        return
-
     assert "mcp-foo" in builtin
     assert "foo" not in builtin, (
         "bare token 'foo' must NOT be in the shadow set — only canonical "
@@ -512,16 +534,6 @@ def test_plugin_canonical_mcp_prefix_collision_restricts(monkeypatch):
     builtin = _patch_registry_and_get_builtin_names(
         monkeypatch, ["mcp-browser"])
 
-    if builtin is None:
-        result = _apply_override(
-            ["web", "file"], ["mcp-browser"], {"mcp-browser"},
-            builtin_names=None)
-        assert result == ["mcp-browser"], (
-            "unavailable registry must restrict on mcp-* plugin collision "
-            "(got {})".format(result)
-        )
-        return
-
     assert "mcp-browser" in builtin, (
         "plugin canonical 'mcp-browser' must be in the shadow set "
         "(got {})".format(builtin)
@@ -532,8 +544,8 @@ def test_plugin_canonical_mcp_prefix_collision_restricts(monkeypatch):
         builtin_names=builtin)
 
     assert result == ["mcp-browser"], (
-        "plugin canonical 'mcp-browser' colliding with same-named MCP server "
-        "must RESTRICT (got {})".format(result)
+        "plugin canonical 'mcp-browser' collides with same-named MCP server "
+        "— must RESTRICT, not flip additive (got {})".format(result)
     )
 
 
