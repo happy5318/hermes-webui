@@ -71,6 +71,27 @@ def test_multiple_mcp_servers_all_added():
     assert result == ["web", "file", "my-search", "postgres"]
 
 
+def test_unchecked_mcp_servers_are_not_leaked():
+    """Ticking one MCP server must restrict the others OUT: the override is
+    additive over builtins/plugins but restrictive over MCP servers.
+
+    Regression for the Codex gate finding: the earlier additive fix merged
+    ALL defaults, so an unchecked MCP server already present in the profile
+    defaults (``beta``) leaked its tools back into the session even though
+    the user only ticked ``alpha``. Expected: builtins kept, only the
+    checked MCP server exposed.
+    """
+    defaults = ["web", "alpha", "beta"]  # web = builtin; alpha/beta = MCP servers
+    override = ["alpha"]                 # user ticked only alpha
+    mcp_servers = {"alpha", "beta"}
+
+    result = _apply_override(defaults, override, mcp_servers, builtin_names={"web", "file", "terminal", "delegation"})
+
+    assert result == ["web", "alpha"], (
+        "unchecked MCP server 'beta' leaked back in: {}".format(result)
+    )
+
+
 def test_non_mcp_override_still_restricts():
     """A power-user override that names built-in toolsets keeps the original
     restrict-to-these semantics."""

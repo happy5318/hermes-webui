@@ -6663,8 +6663,10 @@ def _apply_session_toolset_override(defaults, override, mcp_server_names,
 
     * **Additive** — the override names *only* configured MCP servers (the
       composer toolset picker ticks a server for this chat). Keep the profile
-      defaults and append the ticked servers (dedup, order-preserving), so the
-      built-in toolsets survive. The bare server name is intentional: the CLI
+      defaults for built-ins/plugins, drop every configured MCP-server
+      toolset, then append the ticked servers (dedup, order-preserving) — so
+      the built-in toolsets survive while *unchecked* MCP servers stay out.
+      The bare server name is intentional: the CLI
       resolver (`_resolve_cli_toolsets`) and `enabled_mcp_server_names` both
       emit bare names, and the registry aliases ``<server>`` → ``mcp-<server>``,
       so a bare name resolves correctly — a ``mcp-`` prefix would NOT validate.
@@ -6703,7 +6705,14 @@ def _apply_session_toolset_override(defaults, override, mcp_server_names,
         name in pure_mcp for name in override
     )
     if override_only_mcp:
-        merged = list(defaults)
+        # Additive to builtins/plugins but RESTRICTIVE over MCP servers:
+        # keep the profile defaults except every configured MCP-server
+        # toolset, then add back only the checked subset.  Merging ALL
+        # defaults would leak the unchecked servers' tools back in (e.g.
+        # defaults [web, alpha, beta] + override [alpha] must NOT yield
+        # beta), which a Codex regression gate caught as the additive
+        # fix over-correcting in the other direction.
+        merged = [d for d in defaults if d not in pure_mcp]
         seen = set(merged)
         for name in override:
             if name not in seen:
