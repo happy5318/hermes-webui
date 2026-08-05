@@ -6712,7 +6712,32 @@ def _apply_session_toolset_override(defaults, override, mcp_server_names,
         # defaults [web, alpha, beta] + override [alpha] must NOT yield
         # beta), which a Codex regression gate caught as the additive
         # fix over-correcting in the other direction.
-        merged = [d for d in defaults if d not in pure_mcp]
+        #
+        # A configured server can appear in defaults through its bare
+        # name OR its canonical ``mcp-<name>`` selector (canonical
+        # resolution bypasses alias shadowing, so ``mcp-<name>``
+        # always resolves to the MCP server even when the bare name
+        # is shadowed by a builtin).  Strip both forms for every
+        # configured server, but don't strip bare names that ARE
+        # builtins (the builtin, not the MCP alias, lives in defaults
+        # under that name).
+        mcp_strip = set()
+        for _srv in mcp_server_names:
+            if _srv not in builtin_names:
+                mcp_strip.add(_srv)
+            mcp_strip.add('mcp-' + _srv)
+        # Wildcards/composites in defaults (e.g. ``all``, ``*``)
+        # resolve to every registered toolset, including configured
+        # MCP servers the user did NOT tick.  If any configured MCP
+        # server is unchecked, we cannot safely expand the wildcard
+        # without leaking its tools — fail closed to restrictive
+        # session semantics.
+        _unchecked = mcp_server_names - set(override)
+        if _unchecked:
+            _wildcards = {'all', '*'}
+            if any(_d in _wildcards for _d in defaults):
+                return list(override)
+        merged = [d for d in defaults if d not in mcp_strip]
         seen = set(merged)
         for name in override:
             if name not in seen:

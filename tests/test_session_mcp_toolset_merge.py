@@ -663,3 +663,146 @@ def test_registry_contains_non_string_entries_fails_closed(monkeypatch):
     assert result is None, (
         f"non-string entries in registry must fail closed, got {result!r}"
     )
+
+
+# ── Canonical selector and wildcard leakage regression ─────────────────────
+# Gate certification found that stripping only the bare server name from
+# defaults lets the canonical ``mcp-<name>`` selector or a wildcard (``all`` /
+# ``*``) survive the additive merge, re-exposing unchecked MCP servers.
+
+
+def test_canonical_mcp_selector_in_defaults_is_stripped():
+    """A default that exposes an MCP server via its canonical ``mcp-<name>``
+    selector must be stripped along with the bare name, so the unchecked
+    server's tools don't leak.
+
+    Reproduces the gate finding: defaults ``['web', 'mcp-alpha']`` + selected
+    ``['beta']`` must NOT retain ``mcp-alpha`` (alpha's tools would come
+    back through the installed resolver's canonical resolution path).
+    """
+    defaults = ["web", "mcp-alpha"]
+    override = ["beta"]
+    mcp_servers = {"alpha", "beta"}
+
+    result = _apply_override(
+        defaults, override, mcp_servers,
+        builtin_names={"web", "file", "terminal", "delegation"},
+    )
+
+    assert "mcp-alpha" not in result, (
+        "canonical 'mcp-alpha' in defaults must be stripped so unchecked "
+        "alpha's tools don't leak (got {})".format(result)
+    )
+    assert "web" in result, "builtins must survive"
+    assert "beta" in result, "checked server must be present"
+
+
+def test_wildcard_all_in_defaults_fails_closed_when_mcp_unchecked():
+    """A wildcard default ``['all']`` + override ``['beta']`` with unchecked
+    server ``alpha``: the wildcard would expand to every registered toolset
+    including alpha's, so we must fail closed to restrictive semantics
+    (``['beta']``) rather than risk leaking alpha's tools.
+    """
+    defaults = ["all"]
+    override = ["beta"]
+    mcp_servers = {"alpha", "beta"}
+
+    result = _apply_override(
+        defaults, override, mcp_servers,
+        builtin_names={"web", "file", "terminal", "delegation"},
+    )
+
+    assert result == ["beta"], (
+        "wildcard 'all' with unchecked MCP server must fail closed to "
+        "restrict (got {})".format(result)
+    )
+
+
+def test_wildcard_star_in_defaults_fails_closed_when_mcp_unchecked():
+    """Same as above but with ``*`` instead of ``all``."""
+    defaults = ["*"]
+    override = ["beta"]
+    mcp_servers = {"alpha", "beta"}
+
+    result = _apply_override(
+        defaults, override, mcp_servers,
+        builtin_names={"web", "file", "terminal", "delegation"},
+    )
+
+    assert result == ["beta"], (
+        "wildcard '*' with unchecked MCP server must fail closed to "
+        "restrict (got {})".format(result)
+    )
+
+
+def test_wildcard_all_ok_when_all_mcp_checked():
+    """When ALL configured MCP servers are ticked, a wildcard default is
+    safe — no unchecked server can leak through the expansion."""
+    defaults = ["all"]
+    override = ["alpha", "beta"]
+    mcp_servers = {"alpha", "beta"}
+
+    result = _apply_override(
+        defaults, override, mcp_servers,
+        builtin_names={"web", "file", "terminal", "delegation"},
+    )
+
+    assert "alpha" in result and "beta" in result, (
+        "all-checked wildcard must retain the checked servers (got {})".format(result)
+    )
+
+
+def test_canonical_selector_not_stripped_when_no_mcp_server():
+    """A default ``mcp-foo`` with no configured MCP server named ``foo`` is a
+    user-authored canonical name that should be preserved (it's not an MCP
+    server we can strip)."""
+    defaults = ["web", "mcp-foo"]
+    override = ["alpha"]
+    mcp_servers = {"alpha"}
+
+    result = _apply_override(
+        defaults, override, mcp_servers,
+        builtin_names={"web", "file", "terminal", "delegation"},
+    )
+
+    assert "mcp-foo" in result, (
+        "canonical 'mcp-foo' with no configured server 'foo' must survive "
+        "(got {})".format(result)
+    )
+
+
+def test_canonical_selector_with_checked_server_preserved():
+    """When the server IS checked, its canonical selector in defaults must be
+    preserved (not stripped) — the override adds the bare name, and the
+    canonical is just an alias to the same server."""
+    defaults = ["web", "mcp-alpha"]
+    override = ["alpha"]
+    mcp_servers = {"alpha", "beta"}
+
+    result = _apply_override(
+        defaults, override, mcp_servers,
+        builtin_names={"web", "file", "terminal", "delegation"},
+    )
+
+    # The canonical selector should survive because alpha IS checked.
+    assert "alpha" in result, "checked server must be present"
+
+
+def test_existing_unchecked_regression_with_canonical():
+    """Combined regression: defaults with both bare and canonical forms +
+    multiple unchecked servers."""
+    defaults = ["web", "alpha", "mcp-beta"]
+    override = ["alpha"]
+    mcp_servers = {"alpha", "beta"}
+
+    result = _apply_override(
+        defaults, override, mcp_servers,
+        builtin_names={"web", "file", "terminal", "delegation"},
+    )
+
+    assert "web" in result, "builtins must survive"
+    assert "alpha" in result, "checked server must be present"
+    assert "beta" not in result, "bare beta must be stripped"
+    assert "mcp-beta" not in result, (
+        "canonical 'mcp-beta' must also be stripped (got {})".format(result)
+    )
