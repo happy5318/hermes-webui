@@ -806,3 +806,196 @@ def test_existing_unchecked_regression_with_canonical():
     assert "mcp-beta" not in result, (
         "canonical 'mcp-beta' must also be stripped (got {})".format(result)
     )
+
+
+# ── Blocking finding 1: malformed override must fail closed ────────────────
+
+
+def test_malformed_override_dict_entry_fails_closed():
+    """An unhashable persisted override entry (e.g. ``[{"stale": "shape"}]``)
+    must NOT raise TypeError inside the additive classifier and fall through
+    to the caller's broad except (which restores all profile defaults).
+
+    The helper must return the restrict fallback (string entries only) without
+    raising.
+    """
+    defaults = ["web", "file", "terminal", "alpha", "beta"]
+    override = [{"stale": "shape"}]  # unhashable dict entry
+
+    result = _apply_override(defaults, override, {"alpha", "beta"})
+
+    assert isinstance(result, list), f"must return a list, got {type(result)}"
+    # Malformed entries are filtered out; no string entries remain → empty list
+    # (restrict semantics with no valid toolset names).
+    assert result == [], (
+        f"malformed override must not restore defaults (fail-open), got {result!r}"
+    )
+
+
+def test_malformed_override_mixed_entries_fails_closed():
+    """A mix of valid string entries and malformed entries must keep only the
+    valid strings and apply restrict semantics — never restore all defaults.
+    """
+    defaults = ["web", "file", "terminal", "alpha", "beta"]
+    override = ["alpha", {"stale": "shape"}, "beta"]
+
+    result = _apply_override(defaults, override, {"alpha", "beta"})
+
+    # Malformed entry dropped → ["alpha", "beta"] returned as restrict fallback.
+    # The critical assertion: defaults are NOT restored (no fail-open).
+    assert result == ["alpha", "beta"], (
+        f"malformed override must return string-only restrict list, got {result!r}"
+    )
+    assert "web" not in result and "file" not in result, (
+        f"defaults must NOT be restored on malformed override (fail-open), got {result!r}"
+    )
+
+
+def test_non_string_mcp_server_name_fails_closed():
+    """A non-string ``mcp_servers`` key must fail closed to restrict, not
+    reach ``'mcp-' + _srv`` downstream and fail-open via the caller's except.
+    """
+    defaults = ["web", "file", "terminal", "alpha"]
+    override = ["alpha"]
+    # mcp_server_names contains a non-string entry
+    mcp_names = {"alpha", 42}
+
+    result = _apply_override(defaults, override, mcp_names)
+
+    assert result == ["alpha"], (
+        f"non-string mcp_server_names must fail closed to restrict, got {result!r}"
+    )
+
+
+# ── Blocking finding 2: recursive composite must not leak unchecked MCP ─────
+
+
+def test_recursive_composite_does_not_leak_unchecked_mcp(monkeypatch):
+    """A composite toolset in defaults whose ``includes`` transitively pulls in
+    an unchecked MCP server must be DROPPED from the merged result.
+
+    Scenario (from the Codex adversarial gate):
+      - ``gate-alpha`` and ``gate-beta`` are configured MCP servers.
+      - ``gate-composite`` is a toolset that includes ``gate-alpha``.
+      - Profile defaults: ``['web', 'gate-composite']``
+      - Session override: ``['gate-beta']``
+
+    Without the fix, ``gate-composite`` survives the name-level filter (it's
+    not a bare MCP name) and is kept in ``merged``.  When the agent resolves
+    it, ``gate-alpha`` tools leak back in — a silent authorization regression.
+
+    With the fix, ``_default_transitively_reaches_unchecked_mcp`` expands
+    ``gate-composite``, finds tools registered under ``mcp-gate-alpha``, and
+    drops it.
+    """
+    try:
+        from tools.registry import registry as _reg
+        import api.streaming as streaming
+    except ImportError:
+        return  # CI without tools.registry — skip
+
+    # Register two fake MCP servers and a composite toolset.
+    _fake_tools = {
+        "gate_alpha_tool": _reg._tools.get("gate_alpha_tool"),
+        "gate_beta_tool": _reg._tools.get("gate_beta_tool"),
+    }
+
+    class _FakeEntry:
+        def __init__(self, name, toolset):
+            self.name = name
+            self.toolset = toolset
+
+    _orig_snapshot = _reg._snapshot_entries
+
+    def _fake_snapshot():
+        real = [e for e in _orig_snapshot()]
+        real.append(_FakeEntry("gate_alpha_tool", "mcp-gate-alpha"))
+        real.append(_FakeEntry("gate_beta_tool", "mcp-gate-beta"))
+        return real
+
+    # Patch resolve_toolset to simulate gate-composite including gate-alpha
+    import toolsets as _ts_mod
+
+    _orig_resolve = _ts_mod.resolve_toolset
+
+    def _fake_resolve(name, visited=None, *, include_registry=True):
+        if name == "gate-composite":
+            # Composite includes gate-alpha → exposes its tools
+            return ["gate_alpha_tool"]
+        if name == "gate-alpha":
+            return ["gate_alpha_tool"]
+        if name == "gate-beta":
+            return ["gate_beta_tool"]
+        return _orig_resolve(name, visited, include_registry=include_registry)
+
+    monkeypatch.setattr(_reg, "_snapshot_entries", _fake_snapshot)
+    monkeypatch.setattr(_ts_mod, "resolve_toolset", _fake_resolve)
+    # Also patch the reference imported in streaming module
+    monkeypatch.setattr(streaming, "_default_transitively_reaches_unchecked_mcp",
+                        streaming._default_transitively_reaches_unchecked_mcp)
+
+    defaults = ["web", "gate-composite"]
+    override = ["gate-beta"]
+    mcp_names = {"gate-alpha", "gate-beta"}
+    # Use a minimal builtin_names that doesn't include gate-* names
+    builtin_names = {"web", "file", "terminal", "delegation"}
+
+    result = _apply_override(
+        defaults, override, mcp_names, builtin_names=builtin_names
+    )
+
+    # gate-composite must be dropped — it transitively reaches gate-alpha
+    assert "gate-composite" not in result, (
+        f"composite including unchecked MCP must be dropped, got {result!r}"
+    )
+    # web must survive (not a composite, not an MCP server)
+    assert "web" in result, (
+        f"non-composite built-in must survive, got {result!r}"
+    )
+    # gate-beta (the ticked server) must be present
+    assert "gate-beta" in result, (
+        f"ticked MCP server must be present, got {result!r}"
+    )
+    # gate-alpha (unchecked) must NOT be present
+    assert "gate-alpha" not in result, (
+        f"unchecked MCP server must not appear, got {result!r}"
+    )
+
+
+def test_composite_not_leaking_unchecked_mcp_is_kept(monkeypatch):
+    """A composite toolset that does NOT transitively reach any unchecked MCP
+    server must be KEPT in the merged result (no false positives).
+    """
+    try:
+        from tools.registry import registry as _reg
+        import api.streaming as streaming
+    except ImportError:
+        return
+
+    import toolsets as _ts_mod
+    _orig_resolve = _ts_mod.resolve_toolset
+
+    def _fake_resolve(name, visited=None, *, include_registry=True):
+        if name == "safe-composite":
+            # Includes only web (a builtin), no MCP servers
+            return _orig_resolve("web", visited, include_registry=include_registry)
+        return _orig_resolve(name, visited, include_registry=include_registry)
+
+    monkeypatch.setattr(_ts_mod, "resolve_toolset", _fake_resolve)
+
+    defaults = ["web", "safe-composite"]
+    override = ["gate-beta"]
+    mcp_names = {"gate-alpha", "gate-beta"}
+    builtin_names = {"web", "file", "terminal", "safe-composite"}
+
+    result = _apply_override(
+        defaults, override, mcp_names, builtin_names=builtin_names
+    )
+
+    # safe-composite must be kept — it doesn't reach any unchecked MCP
+    assert "safe-composite" in result, (
+        f"composite not reaching unchecked MCP must be kept, got {result!r}"
+    )
+    assert "gate-beta" in result, (
+        f"ticked MCP server must be present, got {result!r}"
+    )

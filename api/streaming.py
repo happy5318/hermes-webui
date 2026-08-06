@@ -6686,10 +6686,42 @@ def _apply_session_toolset_override(defaults, override, mcp_server_names,
     conservative RESTRICT semantics. It is never treated as additive on an
     unknown registry, because that would re-open the very collision this guard
     exists to close.
+
+    Malformed-state fail-closed: a persisted ``override`` or configured
+    ``mcp_server_names`` that contains non-string entries (e.g. a stale
+    ``[{"shape": "dict"}]``) must NOT raise ``TypeError`` inside the additive
+    classifier and fall through to the caller's broad ``except`` — that would
+    silently restore ALL profile defaults (fail-open).  Both are validated as
+    ``list[str]`` *before* any set-membership test, and any malformed value
+    falls back to RESTRICT semantics immediately.
+
+    Recursive-composite fail-closed: a default entry that is itself a composite
+    toolset (one whose ``includes`` transitively pulls in an MCP-server
+    toolset) is NOT safe to keep merely because its own name is not a bare MCP
+    server.  Resolving it would re-expose the unchecked MCP server's tools.
+    Each surviving default is expanded via ``resolve_toolset`` and any tool
+    registered under ``mcp-<server>`` where ``<server>`` is not in the override
+    causes that default to be dropped.
     """
     if not override:
         return list(defaults)
-    mcp_server_names = set(mcp_server_names or ())
+
+    # ── Malformed-override fail-closed ────────────────────────────────────
+    # Validate before any fallible classification so malformed persisted state
+    # can never restore all profile defaults via the caller's broad except.
+    if not isinstance(override, list) or not all(
+        isinstance(n, str) for n in override
+    ):
+        return [n for n in override if isinstance(n, str)]
+
+    # Validate configured MCP server names as strings before additive
+    # classification — a non-string ``mcp_servers`` key independently reaches
+    # ``'mcp-' + _srv`` downstream and has the same fail-open caller result.
+    _mcp_names_raw = mcp_server_names or ()
+    if not all(isinstance(n, str) for n in _mcp_names_raw):
+        return list(override)
+    mcp_server_names = set(_mcp_names_raw)
+
     if builtin_names is None:
         builtin_names = _builtin_toolset_names()
     # ``None`` here means the builtin registry could not be resolved → we do not
@@ -6713,7 +6745,7 @@ def _apply_session_toolset_override(defaults, override, mcp_server_names,
         # beta), which a Codex regression gate caught as the additive
         # fix over-correcting in the other direction.
         #
-        # A configured server can appear in defaults through its bare
+# A configured server can appear in defaults through its bare
         # name OR its canonical ``mcp-<name>`` selector (canonical
         # resolution bypasses alias shadowing, so ``mcp-<name>``
         # always resolves to the MCP server even when the bare name
@@ -6737,7 +6769,20 @@ def _apply_session_toolset_override(defaults, override, mcp_server_names,
             _wildcards = {'all', '*'}
             if any(_d in _wildcards for _d in defaults):
                 return list(override)
-        merged = [d for d in defaults if d not in mcp_strip]
+        # A default entry that is a *composite* toolset (one whose
+        # ``includes`` transitively references an MCP-server toolset)
+        # would survive the name-level filter but re-expose the
+        # unchecked server's tools at resolution time.  Expand each
+        # surviving default and drop any that transitively reach an
+        # MCP server not in the override.
+        unchecked_mcp = pure_mcp - set(override)
+        merged = []
+        for d in defaults:
+            if d in mcp_strip:
+                continue  # bare name or canonical mcp-<name> — filtered
+            if _default_transitively_reaches_unchecked_mcp(d, unchecked_mcp):
+                continue  # composite that pulls in an unchecked MCP server
+            merged.append(d)
         seen = set(merged)
         for name in override:
             if name not in seen:
@@ -6745,6 +6790,50 @@ def _apply_session_toolset_override(defaults, override, mcp_server_names,
                 seen.add(name)
         return merged
     return list(override)
+
+
+def _default_transitively_reaches_unchecked_mcp(default_name, unchecked_mcp):
+    """Return True if *resolving* ``default_name`` exposes tools from any MCP
+    server whose bare name is in ``unchecked_mcp``.
+
+    A composite toolset (e.g. ``gate-composite`` with ``includes: [gate-alpha]``)
+    is not itself a bare MCP-server name, so the name-level filter in
+    ``_apply_session_toolset_override`` keeps it.  But at resolution time
+    ``resolve_toolset`` expands the ``includes`` chain, and if any included
+    name is an MCP server the agent receives that server's tools — silently
+    defeating the "unchecked MCP servers stay out" contract.
+
+    This helper performs the same expansion and checks every resolved tool's
+    registered toolset.  If any tool belongs to ``mcp-<server>`` where
+    ``<server>`` is in ``unchecked_mcp``, the default is unsafe to keep.
+
+    Fail-closed: if the toolset resolver or registry is unavailable, we cannot
+    prove the default is safe, so return ``True`` (drop it).
+    """
+    if not unchecked_mcp:
+        return False
+    try:
+        from toolsets import resolve_toolset
+        from tools.registry import registry as _tool_registry
+    except Exception:
+        return True  # cannot prove safety → drop
+    try:
+        resolved_tools = resolve_toolset(default_name)
+    except Exception:
+        return True  # resolution error → drop
+    if not resolved_tools:
+        return False
+    # Build the set of mcp-<server> toolset names that are unchecked.
+    unchecked_toolset_ids = {f"mcp-{s}" for s in unchecked_mcp}
+    try:
+        tool_to_ts = _tool_registry.get_tool_to_toolset_map()
+    except Exception:
+        return True
+    for tool_name in resolved_tools:
+        ts = tool_to_ts.get(tool_name)
+        if ts and ts in unchecked_toolset_ids:
+            return True
+    return False
 
 
 def _run_agent_streaming(
