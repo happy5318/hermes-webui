@@ -967,12 +967,10 @@ def test_composite_not_leaking_unchecked_mcp_is_kept(monkeypatch):
     server must be KEPT in the merged result (no false positives).
     """
     try:
-        from tools.registry import registry as _reg
-        import api.streaming as streaming
+        import toolsets as _ts_mod
     except ImportError:
-        return
+        return  # CI without toolsets — skip
 
-    import toolsets as _ts_mod
     _orig_resolve = _ts_mod.resolve_toolset
 
     def _fake_resolve(name, visited=None, *, include_registry=True):

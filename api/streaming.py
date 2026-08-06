@@ -6745,7 +6745,7 @@ def _apply_session_toolset_override(defaults, override, mcp_server_names,
         # beta), which a Codex regression gate caught as the additive
         # fix over-correcting in the other direction.
         #
-# A configured server can appear in defaults through its bare
+        # A configured server can appear in defaults through its bare
         # name OR its canonical ``mcp-<name>`` selector (canonical
         # resolution bypasses alias shadowing, so ``mcp-<name>``
         # always resolves to the MCP server even when the bare name
@@ -6775,11 +6775,21 @@ def _apply_session_toolset_override(defaults, override, mcp_server_names,
         # unchecked server's tools at resolution time.  Expand each
         # surviving default and drop any that transitively reach an
         # MCP server not in the override.
+        #
+        # Builtin/static toolsets (web, file, …) are known-safe: their
+        # definitions are static and never include an MCP-server
+        # toolset, and resolving them requires the toolsets/registry
+        # modules that may be unavailable in CI — fail-closed on those
+        # would wrongly drop core toolsets.  Only non-builtin names
+        # (custom/plugin/registry toolsets) need the recursive check.
         unchecked_mcp = pure_mcp - set(override)
         merged = []
         for d in defaults:
             if d in mcp_strip:
                 continue  # bare name or canonical mcp-<name> — filtered
+            if d in builtin_names:
+                merged.append(d)  # static builtin — cannot reach an MCP server
+                continue
             if _default_transitively_reaches_unchecked_mcp(d, unchecked_mcp):
                 continue  # composite that pulls in an unchecked MCP server
             merged.append(d)
