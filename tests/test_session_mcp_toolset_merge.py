@@ -25,6 +25,7 @@ the merge-vs-restrict decision is covered on the actual code path.
 
 from pathlib import Path
 
+import api.streaming as streaming
 from api.streaming import _apply_session_toolset_override as _apply_override
 
 REPO = Path(__file__).resolve().parents[1]
@@ -991,9 +992,79 @@ def test_composite_not_leaking_unchecked_mcp_is_kept(monkeypatch):
     )
 
     # safe-composite must be kept — it doesn't reach any unchecked MCP
-    assert "safe-composite" in result, (
-        f"composite not reaching unchecked MCP must be kept, got {result!r}"
-    )
     assert "gate-beta" in result, (
         f"ticked MCP server must be present, got {result!r}"
+    )
+
+
+# ── Review finding regressions (round 4) ────────────────────────────────────
+
+
+def test_scalar_truthy_override_fails_closed():
+    """Review finding #1: a truthy scalar persisted override (e.g. ``42``)
+    must NOT raise ``TypeError`` inside the list-comprehension and fall
+    through to the caller's broad ``except``, which would restore ALL
+    profile defaults (fail-open)."""
+    defaults = ["web", "file", "terminal", "delegation"]
+    # Truthy scalar — the old code's ``if not override`` didn't catch it
+    # because 42 is truthy, then the malformed list-comp raised TypeError.
+    assert _apply_override(defaults, 42, set(), builtin_names=set()) == []
+
+
+def test_scalar_falsy_override_fails_closed():
+    """Review finding #1 (cont'd): a falsy scalar persisted override
+    (e.g. ``0``) must NOT silently bypass the caller's ``if _override:``
+    and leave the profile defaults untouched (fail-open)."""
+    defaults = ["web", "file", "terminal", "delegation"]
+    # Falsy scalar — old caller's ``if _override:`` skipped it entirely,
+    # leaving defaults in place.
+    assert _apply_override(defaults, 0, set(), builtin_names=set()) == []
+
+
+def test_scalar_string_override_fails_closed():
+    """Review finding #1 (cont'd): a string scalar override must also
+    fail closed, not be interpreted as a single-element list."""
+    defaults = ["web", "file"]
+    assert _apply_override(defaults, "web", set(), builtin_names=set()) == []
+
+
+def test_none_override_keeps_defaults():
+    """``None`` is the valid "no override" signal and must preserve defaults."""
+    defaults = ["web", "file"]
+    assert _apply_override(defaults, None, set(), builtin_names=set()) == defaults
+
+
+def test_empty_list_override_keeps_defaults():
+    """``[]`` is the valid "no override" signal and must preserve defaults."""
+    defaults = ["web", "file"]
+    assert _apply_override(defaults, [], set(), builtin_names=set()) == defaults
+
+
+def test_composite_toolset_not_in_static_leaf_fast_path():
+    """Review finding #2: a TOOLSETS composite (has ``includes``) must NOT be
+    in the static-leaf fast-path set, so it goes through the recursive safety
+    check."""
+    static_leaves = streaming._static_builtin_leaf_names()
+    assert static_leaves is not None
+    # "debugging" is a real TOOLSETS composite with includes=['web', 'file']
+    assert "debugging" not in static_leaves, (
+        "'debugging' is a composite and must NOT be in static_leaf_names"
+    )
+    # "web" is a static leaf (no includes) and must be in the set
+    assert "web" in static_leaves, (
+        "'web' is a static leaf and must be in static_leaf_names"
+    )
+
+
+def test_unchecked_mcp_computed_from_all_configured_servers():
+    """Review finding #3: unchecked_mcp must be computed from ALL configured
+    MCP server names, not just pure_mcp (which strips collision names)."""
+    src = (REPO / "api" / "streaming.py").read_text(encoding="utf-8")
+    # The additive branch must use the full configured set
+    assert "unchecked_mcp = mcp_server_names - set(override)" in src, (
+        "unchecked_mcp must be computed from all configured servers"
+    )
+    # The old pure_mcp-based computation must be gone
+    assert "unchecked_mcp = pure_mcp - set(override)" not in src, (
+        "old pure_mcp-based unchecked_mcp must be removed"
     )

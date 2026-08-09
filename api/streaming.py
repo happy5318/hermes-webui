@@ -6654,6 +6654,32 @@ def _builtin_toolset_names():
     return names
 
 
+def _static_builtin_leaf_names():
+    """Return the subset of builtin toolset names that are known-safe static
+    leaves (no ``includes`` chain that could transitively reach an MCP server).
+
+    These toolsets can skip the expensive recursive safety check in
+    ``_apply_session_toolset_override`` — their definitions are baked in
+    ``toolsets.TOOLSETS`` and never reference an MCP-server toolset.
+
+    Custom composites, plugins, and registry toolsets are NOT in this set;
+    they must go through ``_default_transitively_reaches_unchecked_mcp``.
+    Returns ``None`` when the registry is unavailable.
+    """
+    try:
+        import toolsets
+    except Exception:
+        return None
+    ts = getattr(toolsets, 'TOOLSETS', None)
+    if not isinstance(ts, dict):
+        return None
+    leaves = {
+        name for name, spec in ts.items()
+        if isinstance(spec, dict) and not spec.get('includes')
+    }
+    return leaves
+
+
 def _apply_session_toolset_override(defaults, override, mcp_server_names,
                                     builtin_names=None):
     """Resolve a per-session ``enabled_toolsets`` override against the profile
@@ -6668,7 +6694,7 @@ def _apply_session_toolset_override(defaults, override, mcp_server_names,
       the built-in toolsets survive while *unchecked* MCP servers stay out.
       The bare server name is intentional: the CLI
       resolver (`_resolve_cli_toolsets`) and `enabled_mcp_server_names` both
-      emit bare names, and the registry aliases ``<server>`` → ``mcp-<server>``,
+      emit bare names, and the registry aliases ``<server>` `→` ``mcp-<server>``,
       so a bare name resolves correctly — a ``mcp-`` prefix would NOT validate.
 
     * **Restrict** — the override names any non-MCP toolset (power-user
@@ -6695,6 +6721,13 @@ def _apply_session_toolset_override(defaults, override, mcp_server_names,
     ``list[str]`` *before* any set-membership test, and any malformed value
     falls back to RESTRICT semantics immediately.
 
+    Scalar-state fail-closed (review finding #1): a persisted scalar such as
+    ``42``, ``0``, or ``"web"`` must NOT be silently skipped (falsy scalars
+    bypass the caller's ``if _override:``) or cause a ``TypeError`` (truthy
+    scalars raise inside the malformed list-comprehension).  Only ``None`` and
+    ``[]`` (the existing no-override contract) may preserve defaults.  Any
+    other value is treated as invalid and yields a restrictive result.
+
     Recursive-composite fail-closed: a default entry that is itself a composite
     toolset (one whose ``includes`` transitively pulls in an MCP-server
     toolset) is NOT safe to keep merely because its own name is not a bare MCP
@@ -6703,15 +6736,21 @@ def _apply_session_toolset_override(defaults, override, mcp_server_names,
     registered under ``mcp-<server>`` where ``<server>`` is not in the override
     causes that default to be dropped.
     """
-    if not override:
+    # Absence and the intentional empty list are the only signals that mean
+    # "no override" — preserve the profile defaults.
+    if override is None or override == []:
         return list(defaults)
+
+    # Any non-list value (scalar, dict, set, …) is invalid persisted state.
+    # Fail closed to restrictive — never let the caller's broad except restore
+    # all defaults.
+    if not isinstance(override, list):
+        return []
 
     # ── Malformed-override fail-closed ────────────────────────────────────
     # Validate before any fallible classification so malformed persisted state
     # can never restore all profile defaults via the caller's broad except.
-    if not isinstance(override, list) or not all(
-        isinstance(n, str) for n in override
-    ):
+    if not all(isinstance(n, str) for n in override):
         return [n for n in override if isinstance(n, str)]
 
     # Validate configured MCP server names as strings before additive
@@ -6782,14 +6821,28 @@ def _apply_session_toolset_override(defaults, override, mcp_server_names,
         # modules that may be unavailable in CI — fail-closed on those
         # would wrongly drop core toolsets.  Only non-builtin names
         # (custom/plugin/registry toolsets) need the recursive check.
-        unchecked_mcp = pure_mcp - set(override)
+        #
+        # Review finding #2: keep the collision-shadow set (builtin_names)
+        # separate from the narrow safe-leaf set (static_leaf_names).
+        # A runtime composite is resolvable in TOOLSETS but NOT a static
+        # leaf, so it must go through the recursive safety check.
+        static_leaf_names = _static_builtin_leaf_names() or set()
+        # Review finding #3: unchecked_mcp must be computed from ALL
+        # configured MCP server names minus the selected servers, not
+        # from pure_mcp which strips collision names.  A composite
+        # that reaches the canonical selector for an unchecked colliding
+        # server (e.g. mcp-web) must still be denied.
+        unchecked_mcp = mcp_server_names - set(override)
         merged = []
         for d in defaults:
             if d in mcp_strip:
                 continue  # bare name or canonical mcp-<name> — filtered
-            if d in builtin_names:
-                merged.append(d)  # static builtin — cannot reach an MCP server
+            if d in static_leaf_names:
+                merged.append(d)  # static leaf — cannot reach an MCP server
                 continue
+            # All other names (custom composites, plugins, registry
+            # toolsets) must prove they do not transitively reach an
+            # unchecked MCP server.
             if _default_transitively_reaches_unchecked_mcp(d, unchecked_mcp):
                 continue  # composite that pulls in an unchecked MCP server
             merged.append(d)
@@ -8270,7 +8323,10 @@ def _run_agent_streaming(
                     # getattr() to read the attribute correctly.
                     # (Opus pre-release advisor finding for v0.50.257.)
                     _override = getattr(_session_meta, 'enabled_toolsets', None) if _session_meta else None
-                    if _override:
+                    # Distinguish absence (None = no override, keep defaults)
+                    # from invalid persisted state (scalar, dict, …) which
+                    # _apply_session_toolset_override will handle fail-closed.
+                    if _override is not None:
                         try:
                             _mcp_server_names = set(
                                 (_cfg.get('mcp_servers') or {}).keys()
