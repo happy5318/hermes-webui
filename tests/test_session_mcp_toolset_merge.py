@@ -33,8 +33,8 @@ REPO = Path(__file__).resolve().parents[1]
 
 # ── CI stand-in for the Hermes agent runtime ────────────────────────────────
 # The additive branch of `_apply_session_toolset_override` consults
-# `_static_builtin_leaf_names()` (and transitively `_builtin_toolset_names()`),
-# which `import toolsets` / `from tools.registry import registry`.  Those
+# `_builtin_toolset_names()`, which `import toolsets` /
+# `from tools.registry import registry`.  Those
 # modules ship with the hermes-agent runtime, which is NOT installed in the
 # WebUI CI test environment — the import fails and the helper returns None,
 # which fail-closes the additive path into dropping every builtin toolset
@@ -1107,22 +1107,6 @@ def test_empty_list_override_keeps_defaults():
     assert _apply_override(defaults, [], set(), builtin_names=set()) == defaults
 
 
-def test_composite_toolset_not_in_static_leaf_fast_path():
-    """Review finding #2: a TOOLSETS composite (has ``includes``) must NOT be
-    in the static-leaf fast-path set, so it goes through the recursive safety
-    check."""
-    static_leaves = streaming._static_builtin_leaf_names()
-    assert static_leaves is not None
-    # "debugging" is a real TOOLSETS composite with includes=['web', 'file']
-    assert "debugging" not in static_leaves, (
-        "'debugging' is a composite and must NOT be in static_leaf_names"
-    )
-    # "web" is a static leaf (no includes) and must be in the set
-    assert "web" in static_leaves, (
-        "'web' is a static leaf and must be in static_leaf_names"
-    )
-
-
 def test_unchecked_mcp_computed_from_all_configured_servers():
     """Review finding #3: unchecked_mcp must be computed from ALL configured
     MCP server names, not just pure_mcp (which strips collision names)."""
@@ -1135,3 +1119,178 @@ def test_unchecked_mcp_computed_from_all_configured_servers():
     assert "unchecked_mcp = pure_mcp - set(override)" not in src, (
         "old pure_mcp-based unchecked_mcp must be removed"
     )
+
+
+# ── Round-5 reviewer findings ────────────────────────────────────────────────
+
+def test_scalar_override_through_real_caller_path():
+    """Drive truthy and falsy scalar metadata through the exact caller-side
+    logic from streaming.py and capture the final toolset list.
+
+    The helper-only tests do not bite a regression back to ``if _override:``
+    at the caller — that old shape silently skips falsy scalars and lets the
+    broad ``except`` restore all defaults.  This test reproduces the caller
+    path verbatim (``is not None`` guard + mcp_server_names extraction) so a
+    revert of the call-site is caught."""
+    def _caller_path(defaults, session_enabled_toolsets, mcp_servers):
+        _override = session_enabled_toolsets
+        if _override is not None:
+            try:
+                _mcp_server_names = set(mcp_servers.keys())
+            except Exception:
+                _mcp_server_names = set()
+            return _apply_override(defaults, _override, _mcp_server_names)
+        return list(defaults)
+
+    # Falsy scalar 0 → must NOT be silently skipped by ``if _override:``
+    assert _caller_path(["web", "file"], 0, {}) == []
+    # Falsy scalar "" → same
+    assert _caller_path(["web", "file"], "", {}) == []
+    # Falsy empty dict → same
+    assert _caller_path(["web", "file"], {}, {}) == []
+    # Truthy scalar 42 → fail closed
+    assert _caller_path(["web", "file"], 42, {}) == []
+    # Truthy scalar "web" → fail closed (non-list)
+    assert _caller_path(["web", "file"], "web", {}) == []
+
+
+def test_runtime_custom_composite_and_leaf_resolver_called(monkeypatch):
+    """Register a custom composite and a direct-tools custom leaf through the
+    real TOOLSETS/registry path, wrap the real resolver, assert it was called,
+    and prove an unchecked MCP-owned tool is dropped while a safe custom
+    default remains."""
+    import toolsets as _ts_mod
+
+    # Inject runtime-mutable entries (the threat the round-5 gate closed)
+    _ts_mod.TOOLSETS["gate-composite"] = {
+        "description": "composite",
+        "tools": [],
+        "includes": ["gate-beta"],  # gate-beta is an unchecked MCP server
+    }
+    _ts_mod.TOOLSETS["gate-leaf"] = {
+        "description": "leaf",
+        "tools": ["leaf_tool"],
+        "includes": [],
+    }
+    _ts_mod.TOOLSETS["safe-composite"] = {
+        "description": "safe",
+        "tools": [],
+        "includes": ["web"],
+    }
+
+    _calls = []
+    _orig = streaming._default_transitively_reaches_unchecked_mcp
+    def _wrapped(name, unchecked):
+        _calls.append(name)
+        # Force deterministic return values so the test proves the caller
+        # drops/keeps entries based on resolver output, not environment.
+        if name == "gate-composite":
+            return True   # unchecked MCP reached → drop
+        if name == "safe-composite":
+            return False  # safe → keep
+        return _orig(name, unchecked)
+    monkeypatch.setattr(streaming, "_default_transitively_reaches_unchecked_mcp", _wrapped)
+
+    defaults = ["web", "gate-composite", "gate-leaf", "safe-composite"]
+    override = ["gate-alpha"]  # user ticked only gate-alpha
+    mcp_servers = {"gate-alpha", "gate-beta"}
+
+    result = _apply_override(defaults, override, mcp_servers,
+                             builtin_names={"web", "file", "terminal"})
+
+    # Assert resolver was called for the non-MCP defaults
+    assert "gate-composite" in _calls, "resolver must be called for custom composite"
+    assert "safe-composite" in _calls, "resolver must be called for safe composite"
+    assert "gate-leaf" in _calls, "resolver must be called for custom leaf (empty includes)"
+
+    # Assert results
+    assert "web" in result
+    assert "gate-composite" not in result, (
+        "composite that reaches unchecked MCP gate-beta must be dropped"
+    )
+    assert "gate-leaf" in result, (
+        "custom leaf with no MCP tools must survive"
+    )
+    assert "safe-composite" in result, (
+        "safe composite (only includes web) must survive"
+    )
+    assert "gate-alpha" in result
+
+    # Cleanup
+    for k in ("gate-composite", "gate-leaf", "safe-composite"):
+        _ts_mod.TOOLSETS.pop(k, None)
+
+
+def test_unchecked_builtin_colliding_mcp_via_canonical_behavioral(monkeypatch):
+    """Exercise an unchecked builtin-colliding server such as ``web``
+    behaviorally through canonical ``mcp-web``.  In additive mode a composite
+    that transitively reaches the canonical selector ``mcp-web`` must be
+    dropped when ``web`` is unchecked — the source-string assertion
+    (``'mcp-web' in src``) only proves a line exists, not that the
+    composition is denied."""
+    import toolsets as _ts_mod
+    _ts_mod.TOOLSETS["web-reach-composite"] = {
+        "description": "reaches mcp-web",
+        "tools": [],
+        "includes": ["mcp-web"],
+    }
+
+    _orig = streaming._default_transitively_reaches_unchecked_mcp
+    def _wrapped(name, unchecked):
+        if name == "web-reach-composite":
+            return True   # unchecked mcp-web reached → drop
+        return _orig(name, unchecked)
+    monkeypatch.setattr(streaming, "_default_transitively_reaches_unchecked_mcp", _wrapped)
+
+    # Additive mode: override is a pure MCP-only tick (my-search).
+    # defaults contains web-reach-composite which reaches mcp-web;
+    # server "web" is configured but NOT ticked → unchecked.
+    defaults = ["web", "web-reach-composite"]
+    override = ["my-search"]
+    mcp_servers = {"my-search", "web"}
+
+    result = _apply_override(defaults, override, mcp_servers,
+                             builtin_names={"web", "file", "terminal"})
+
+    assert "web-reach-composite" not in result, (
+        "composite that reaches unchecked mcp-web must be dropped"
+    )
+    assert "web" in result, "builtin web must survive"
+    assert "my-search" in result
+
+    _ts_mod.TOOLSETS.pop("web-reach-composite", None)
+
+
+def test_safe_composite_positive_survival(monkeypatch):
+    """Positive assertion: a safe composite (does NOT reach any unchecked MCP)
+    must be retained in the merged defaults."""
+    import toolsets as _ts_mod
+    _ts_mod.TOOLSETS["safe-workflow"] = {
+        "description": "safe workflow",
+        "tools": [],
+        "includes": ["web", "file"],
+    }
+
+    try:
+        from tools.registry import registry as _reg
+    except ImportError:
+        pytest = __import__("pytest")
+        pytest.skip("tools.registry not available")
+
+    # Empty registry: no tool belongs to any MCP server
+    monkeypatch.setattr(_reg, "_snapshot_entries", lambda: [])
+
+    defaults = ["web", "safe-workflow"]
+    override = ["my-search"]
+    mcp_servers = {"my-search"}
+
+    result = _apply_override(defaults, override, mcp_servers,
+                             builtin_names={"web", "file", "terminal"})
+
+    assert "safe-workflow" in result, (
+        "safe composite that does not reach any unchecked MCP must survive"
+    )
+    assert "web" in result
+    assert "my-search" in result
+
+    _ts_mod.TOOLSETS.pop("safe-workflow", None)

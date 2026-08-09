@@ -6654,31 +6654,6 @@ def _builtin_toolset_names():
     return names
 
 
-def _static_builtin_leaf_names():
-    """Return the subset of builtin toolset names that are known-safe static
-    leaves (no ``includes`` chain that could transitively reach an MCP server).
-
-    These toolsets can skip the expensive recursive safety check in
-    ``_apply_session_toolset_override`` — their definitions are baked in
-    ``toolsets.TOOLSETS`` and never reference an MCP-server toolset.
-
-    Custom composites, plugins, and registry toolsets are NOT in this set;
-    they must go through ``_default_transitively_reaches_unchecked_mcp``.
-    Returns ``None`` when the registry is unavailable.
-    """
-    try:
-        import toolsets
-    except Exception:
-        return None
-    ts = getattr(toolsets, 'TOOLSETS', None)
-    if not isinstance(ts, dict):
-        return None
-    leaves = {
-        name for name, spec in ts.items()
-        if isinstance(spec, dict) and not spec.get('includes')
-    }
-    return leaves
-
 
 def _apply_session_toolset_override(defaults, override, mcp_server_names,
                                     builtin_names=None):
@@ -6822,11 +6797,6 @@ def _apply_session_toolset_override(defaults, override, mcp_server_names,
         # would wrongly drop core toolsets.  Only non-builtin names
         # (custom/plugin/registry toolsets) need the recursive check.
         #
-        # Review finding #2: keep the collision-shadow set (builtin_names)
-        # separate from the narrow safe-leaf set (static_leaf_names).
-        # A runtime composite is resolvable in TOOLSETS but NOT a static
-        # leaf, so it must go through the recursive safety check.
-        static_leaf_names = _static_builtin_leaf_names() or set()
         # Review finding #3: unchecked_mcp must be computed from ALL
         # configured MCP server names minus the selected servers, not
         # from pure_mcp which strips collision names.  A composite
@@ -6837,12 +6807,14 @@ def _apply_session_toolset_override(defaults, override, mcp_server_names,
         for d in defaults:
             if d in mcp_strip:
                 continue  # bare name or canonical mcp-<name> — filtered
-            if d in static_leaf_names:
-                merged.append(d)  # static leaf — cannot reach an MCP server
-                continue
-            # All other names (custom composites, plugins, registry
-            # toolsets) must prove they do not transitively reach an
-            # unchecked MCP server.
+            # All non-MCP default entries must prove they do not
+            # transitively reach an unchecked MCP server.  The previous
+            # _static_builtin_leaf_names() fast-path was removed in
+            # round-5 review: it derived "static" authority from the
+            # live toolsets.TOOLSETS dict, which is runtime-mutable via
+            # create_custom_toolset().  A runtime custom leaf with an
+            # empty includes list could enter the set and bypass the
+            # ownership check, re-exposing unchecked MCP tools.
             if _default_transitively_reaches_unchecked_mcp(d, unchecked_mcp):
                 continue  # composite that pulls in an unchecked MCP server
             merged.append(d)
