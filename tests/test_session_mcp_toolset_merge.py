@@ -50,6 +50,70 @@ REPO = Path(__file__).resolve().parents[1]
 import sys
 import types as _types
 
+if "tools" not in sys.modules or "tools.registry" not in sys.modules:
+    _mock_registry = _types.SimpleNamespace()
+    # Mirror the real registry's internals: ``_snapshot_entries`` is a
+    # zero-arg method returning ToolEntry-like objects with ``name`` and
+    # ``toolset`` attributes; ``get_tool_to_toolset_map`` builds the map from
+    # it exactly like the production implementation, so tests that monkeypatch
+    # ``_snapshot_entries`` to inject fake MCP entries drive the real logic.
+    _mock_registry._tools = {}
+    _mock_registry._toolset_aliases = {}
+    # Default snapshot is the LIVE registered tools (like the real
+    # ``ToolRegistry._snapshot_entries``), so ``register()`` calls in the
+    # runtime-composed tests are visible to ownership checks without any
+    # monkeypatch.  Tests that need extra fake entries still monkeypatch
+    # ``_snapshot_entries`` and delegate to this default.
+    _mock_registry._snapshot_entries = lambda: list(_mock_registry._tools.values())
+
+    def _mock_register(name, toolset, schema, handler, check_fn=None,
+                       requires_env=None, is_async=False, description="",
+                       emoji="", max_result_size_chars=None,
+                       dynamic_schema_overrides=None, override=False):
+        """Faithful stand-in for ``ToolRegistry.register``: cross-toolset
+        shadowing is rejected unless ``override=True`` (mirrors the real
+        registry's ownership rules)."""
+        existing = _mock_registry._tools.get(name)
+        if existing is not None and existing.toolset != toolset and not override:
+            return  # rejected shadow, like the real registry
+        entry = _types.SimpleNamespace(
+            name=name, toolset=toolset, schema=schema, handler=handler,
+            check_fn=check_fn, requires_env=requires_env or [],
+            is_async=is_async, description=description, emoji=emoji,
+            max_result_size_chars=max_result_size_chars,
+            dynamic_schema_overrides=dynamic_schema_overrides,
+        )
+        _mock_registry._tools[name] = entry
+
+    def _mock_register_toolset_alias(alias, toolset):
+        _mock_registry._toolset_aliases[alias] = toolset
+
+    def _mock_get_registered_toolset_names():
+        return sorted({e.toolset for e in _mock_registry._snapshot_entries()})
+
+    def _mock_get_tool_names_for_toolset(toolset):
+        return sorted(e.name for e in _mock_registry._snapshot_entries()
+                      if e.toolset == toolset)
+
+    def _mock_get_toolset_alias_target(alias):
+        return _mock_registry._toolset_aliases.get(alias)
+
+    def _mock_get_tool_to_toolset_map():
+        return {e.name: e.toolset for e in _mock_registry._snapshot_entries()}
+
+    _mock_registry.register = _mock_register
+    _mock_registry.register_toolset_alias = _mock_register_toolset_alias
+    _mock_registry.get_registered_toolset_names = _mock_get_registered_toolset_names
+    _mock_registry.get_tool_names_for_toolset = _mock_get_tool_names_for_toolset
+    _mock_registry.get_toolset_alias_target = _mock_get_toolset_alias_target
+    _mock_registry.get_tool_to_toolset_map = _mock_get_tool_to_toolset_map
+    if "tools" not in sys.modules:
+        sys.modules["tools"] = _types.ModuleType("tools")
+    if "tools.registry" not in sys.modules:
+        _mock_registry_mod = _types.ModuleType("tools.registry")
+        _mock_registry_mod.registry = _mock_registry
+        sys.modules["tools.registry"] = _mock_registry_mod
+
 if "toolsets" not in sys.modules:
     _mock_toolsets = _types.ModuleType("toolsets")
     _mock_toolsets.TOOLSETS = {  # type: ignore[attr-defined]
@@ -63,39 +127,70 @@ if "toolsets" not in sys.modules:
         "debugging": {"description": "debugging toolkit", "tools": ["terminal"], "includes": ["web", "file"]},
     }
 
-    def _resolve_toolset(name, _visited=None, *, include_registry=True):  # type: ignore[no-untyped-def]
+    def _get_registry_alias_target(name):  # type: ignore[no-untyped-def]
+        try:
+            from tools.registry import registry as _r
+            return _r.get_toolset_alias_target(name)
+        except Exception:
+            return None
+
+    def _get_registry_tool_names(toolset):  # type: ignore[no-untyped-def]
+        try:
+            from tools.registry import registry as _r
+            return _r.get_tool_names_for_toolset(toolset)
+        except Exception:
+            return []
+
+    def _get_toolset(name, *, include_registry=True):  # type: ignore[no-untyped-def]
+        """Mirror the real ``get_toolset``: static spec merged with tools the
+        registry owns under the same name; registry/MCP-only toolsets resolve
+        through their alias target (e.g. ``beta`` → ``mcp-beta``)."""
         spec = _mock_toolsets.TOOLSETS.get(name)  # type: ignore[attr-defined]
+        if not include_registry:
+            return spec
+        alias_target = _get_registry_alias_target(name)
+        registry_toolset = alias_target or name
+        registered = _get_registry_tool_names(registry_toolset)
+        if spec:
+            merged = sorted(set(spec.get("tools") or []) | set(registered))
+            return {**spec, "tools": merged}
+        if registered:
+            return {"description": f"Plugin/MCP toolset: {name}",
+                    "tools": registered, "includes": []}
+        return None
+
+    def _resolve_toolset(name, _visited=None, *, include_registry=True):  # type: ignore[no-untyped-def]
+        if _visited is None:
+            _visited = set()
+        if name in {"all", "*"}:
+            out = set()
+            for _n in list(_mock_toolsets.TOOLSETS.keys()):  # type: ignore[attr-defined]
+                out.update(_resolve_toolset(_n, set(_visited),
+                                            include_registry=include_registry))
+            return sorted(out)
+        if name in _visited:
+            return []
+        _visited = _visited | {name}
+        spec = _get_toolset(name, include_registry=include_registry)
         if not isinstance(spec, dict):
             return [name]
         tools = list(spec.get("tools") or [])
         for inc in spec.get("includes") or []:
-            tools.extend(_resolve_toolset(inc, include_registry=include_registry))
+            tools.extend(_resolve_toolset(inc, _visited,
+                                          include_registry=include_registry))
         return tools
 
+    def _create_custom_toolset(name, description, tools=None, includes=None):  # type: ignore[no-untyped-def]
+        _mock_toolsets.TOOLSETS[name] = {  # type: ignore[attr-defined]
+            "description": description,
+            "tools": tools or [],
+            "includes": includes or [],
+        }
+
+    _mock_toolsets.get_toolset = _get_toolset
     _mock_toolsets.resolve_toolset = _resolve_toolset
+    _mock_toolsets.create_custom_toolset = _create_custom_toolset
     sys.modules["toolsets"] = _mock_toolsets
-
-if "tools" not in sys.modules or "tools.registry" not in sys.modules:
-    _mock_registry = _types.SimpleNamespace()
-    _mock_registry.get_registered_toolset_names = lambda: []
-    # Mirror the real registry's internals: ``_snapshot_entries`` is a
-    # zero-arg method returning ToolEntry-like objects with ``name`` and
-    # ``toolset`` attributes; ``get_tool_to_toolset_map`` builds the map from
-    # it exactly like the production implementation, so tests that monkeypatch
-    # ``_snapshot_entries`` to inject fake MCP entries drive the real logic.
-    _mock_registry._tools = {}
-    _mock_registry._snapshot_entries = lambda: []
-
-    def _mock_get_tool_to_toolset_map():
-        return {e.name: e.toolset for e in _mock_registry._snapshot_entries()}
-
-    _mock_registry.get_tool_to_toolset_map = _mock_get_tool_to_toolset_map
-    if "tools" not in sys.modules:
-        sys.modules["tools"] = _types.ModuleType("tools")
-    if "tools.registry" not in sys.modules:
-        _mock_registry_mod = _types.ModuleType("tools.registry")
-        _mock_registry_mod.registry = _mock_registry
-        sys.modules["tools.registry"] = _mock_registry_mod
 
 
 # ── Behavioural tests for the merge-vs-restrict decision ─────────────────────
@@ -1364,6 +1459,160 @@ def test_safe_composite_positive_survival(monkeypatch):
         assert "my-search" in result, f"ticked server must survive, got {result!r}"
         assert "gate-beta" not in result, (
             f"unchecked server must not appear, got {result!r}"
+        )
+    finally:
+        _ts_mod.TOOLSETS.clear()
+        _ts_mod.TOOLSETS.update(_saved_toolsets)
+        _reg._tools.clear()
+        _reg._tools.update(_saved_tools)
+        _reg._toolset_aliases.clear()
+        _reg._toolset_aliases.update(_saved_aliases)
+
+
+# ── Round-6 reviewer findings ────────────────────────────────────────────────
+
+
+def test_runtime_custom_composite_through_real_caller(monkeypatch, tmp_path):
+    """Production-composed acceptance: drive a safe custom composite, an
+    unsafe composite, a direct leaf, and a builtin/plugin collision through
+    the REAL ``_run_agent_streaming()`` call site, with only bounded
+    external-work seams replaced (config, model resolution, agent
+    constructor).  Capture the final ``enabled_toolsets`` the AIAgent
+    constructor receives, then resolve that result through the real
+    resolver/registry and assert the final tool list.
+
+    The previous round-6 tests called ``_apply_session_toolset_override``
+    directly with hand-built, already-separated inputs; they could stay green
+    if ``_run_agent_streaming()`` dropped or pre-sanitized the custom entry
+    before the helper.  This test closes that false-green class by asserting
+    the constructor's final ``enabled_toolsets`` AND the resolved tool list.
+    """
+    import queue
+    import sys
+    import types as _types
+
+    import toolsets as _ts_mod
+    from api import models
+    from tools.registry import registry as _reg
+
+    _saved_toolsets = dict(_ts_mod.TOOLSETS)
+    _saved_tools = dict(_reg._tools)
+    _saved_aliases = dict(_reg._toolset_aliases)
+
+    captured = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            captured["enabled_toolsets"] = kwargs.get("enabled_toolsets")
+
+        def run_conversation(self, **kwargs):
+            return {"failed": False, "messages": []}
+
+    try:
+        # Seed real registry/toolset state (runtime-composed, like production):
+        # - safe-composite: custom composite that only includes builtin web
+        # - unsafe-composite: custom composite that includes unchecked mcp-beta
+        # - gate-leaf: direct tool owned by unchecked mcp-gate-beta
+        # - gate-alpha: selected MCP server (ticked); gate-beta: unchecked
+        _ts_mod.create_custom_toolset("safe-composite", "safe workflow",
+                                      tools=[], includes=["web"])
+        _ts_mod.create_custom_toolset("unsafe-composite", "reaches beta",
+                                      tools=[], includes=["gate-beta"])
+        _ts_mod.create_custom_toolset("gate-leaf", "leaf owned by beta",
+                                      tools=["beta_only_tool"], includes=[])
+        _reg.register_toolset_alias("gate-alpha", "mcp-gate-alpha")
+        _reg.register_toolset_alias("gate-beta", "mcp-gate-beta")
+        _reg.register("alpha_tool", "mcp-gate-alpha", {"type": "object"},
+                      lambda *a, **k: "ok", override=True)
+        _reg.register("beta_only_tool", "mcp-gate-beta", {"type": "object"},
+                      lambda *a, **k: "ok", override=True)
+
+        sid = "runtime-composed"
+        stream_id = "runtime-composed-stream"
+        session_dir = tmp_path / "sessions"
+        session_dir.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
+        monkeypatch.setattr(streaming, "SESSION_DIR", session_dir)
+        session = models.Session(
+            session_id=sid,
+            title="runtime-composed",
+            workspace=str(tmp_path),
+            model="gpt-4o",
+            messages=[],
+            context_messages=[],
+        )
+        session.active_stream_id = stream_id
+        session.pending_user_message = "hi"
+        session.pending_started_at = 1.0
+        session.save()
+        models.SESSIONS[sid] = session
+        streaming.SESSIONS[sid] = session
+        streaming.STREAMS[stream_id] = queue.Queue()
+
+        fake_hermes_state = _types.ModuleType("hermes_state")
+        fake_hermes_state.SessionDB = lambda *_a, **_k: object()
+
+        def _fake_load_metadata_only(session_id):
+            meta = models.Session(session_id=session_id, model="gpt-4o")
+            # Selected MCP server ticked in the composer chip; gate-beta is
+            # configured but NOT ticked → unchecked MCP server present.
+            meta.enabled_toolsets = ["gate-alpha"]
+            return meta
+
+        with monkeypatch.context() as m:
+            m.setattr(streaming, "_get_ai_agent", lambda: FakeAgent)
+            m.setattr(streaming, "resolve_model_provider",
+                      lambda *_a, **_k: ("gpt-4o", "openai", None))
+            m.setattr("api.config.get_config", lambda *_a, **_k: {
+                "mcp_servers": {"gate-alpha": {}, "gate-beta": {}},
+            })
+            m.setattr("api.config._resolve_cli_toolsets",
+                      lambda *_a, **_k: ["web", "safe-composite",
+                                         "unsafe-composite", "gate-leaf"])
+            m.setattr(models.Session, "load_metadata_only",
+                      staticmethod(_fake_load_metadata_only))
+            m.setitem(sys.modules, "hermes_state", fake_hermes_state)
+            streaming._run_agent_streaming(
+                session_id=sid,
+                msg_text="hi",
+                model="gpt-4o",
+                workspace=str(tmp_path),
+                stream_id=stream_id,
+            )
+
+        result = captured["enabled_toolsets"]
+        assert result is not None, "AIAgent constructor never received enabled_toolsets"
+        assert "web" in result, f"builtin web must survive, got {result!r}"
+        assert "safe-composite" in result, (
+            f"safe custom composite must survive, got {result!r}"
+        )
+        assert "gate-alpha" in result, (
+            f"selected MCP server must survive, got {result!r}"
+        )
+        assert "unsafe-composite" not in result, (
+            f"composite reaching unchecked mcp-gate-beta must be dropped, got {result!r}"
+        )
+        assert "gate-leaf" not in result, (
+            f"direct leaf owned by unchecked mcp-gate-beta must be dropped, got {result!r}"
+        )
+        assert "gate-beta" not in result, (
+            f"unchecked server must not appear, got {result!r}"
+        )
+
+        # Resolve the final toolset-set through the real resolver/registry and
+        # assert the FINAL tool list: builtins + safe custom + selected server
+        # survive; every unchecked-beta-owned tool is excluded.
+        final_tools = set()
+        for name in result:
+            final_tools.update(_ts_mod.resolve_toolset(name))
+        assert "web_search" in final_tools, (
+            f"builtin web tools must resolve, got {sorted(final_tools)!r}"
+        )
+        assert "alpha_tool" in final_tools, (
+            f"selected gate-alpha tool must resolve, got {sorted(final_tools)!r}"
+        )
+        assert "beta_only_tool" not in final_tools, (
+            f"unchecked beta-owned tool must be excluded, got {sorted(final_tools)!r}"
         )
     finally:
         _ts_mod.TOOLSETS.clear()
