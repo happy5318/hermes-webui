@@ -12,10 +12,7 @@ Covers the behavior added by the session-aware-vision-routing patch:
   - _build_native_multimodal_message and _sanitize_messages_for_api
     forward the session identity through to the routing decision
 """
-import base64
-import os
 from pathlib import Path
-from tempfile import TemporaryDirectory
 
 import pytest
 
