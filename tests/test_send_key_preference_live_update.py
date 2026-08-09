@@ -19,7 +19,6 @@ without a page reload.
 """
 from __future__ import annotations
 
-import re
 from pathlib import Path
 
 import pytest
@@ -114,7 +113,6 @@ __HANDLER__
 
 
 def _build_harness_html() -> str:
-    handlers = _extract_helper_functions() + "\n" + _extract_composer_handler()
     return HARNESS_HTML.replace("__HELPERS__", _extract_helper_functions()).replace(
         "__HANDLER__", _extract_composer_handler()
     )
