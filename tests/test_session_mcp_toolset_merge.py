@@ -31,6 +31,73 @@ from api.streaming import _apply_session_toolset_override as _apply_override
 REPO = Path(__file__).resolve().parents[1]
 
 
+# ── CI stand-in for the Hermes agent runtime ────────────────────────────────
+# The additive branch of `_apply_session_toolset_override` consults
+# `_static_builtin_leaf_names()` (and transitively `_builtin_toolset_names()`),
+# which `import toolsets` / `from tools.registry import registry`.  Those
+# modules ship with the hermes-agent runtime, which is NOT installed in the
+# WebUI CI test environment — the import fails and the helper returns None,
+# which fail-closes the additive path into dropping every builtin toolset
+# ("web must survive" assertions break across all Python-version shards).
+#
+# Local dev machines pass only because hermes-agent happens to be on sys.path
+# (PYTHONPATH), so the real 59-toolset registry is imported.  Inject a
+# faithful stand-in here when the real module is absent so the tests exercise
+# the REAL production code path deterministically in CI too.  Shape mirrors
+# hermes-agent's toolsets.py: leaf specs have no non-empty ``includes``;
+# composites (e.g. "debugging") have ``includes`` and are NOT static leaves;
+# ``resolve_toolset`` expands a name to its tool list.
+import sys
+import types as _types
+
+if "toolsets" not in sys.modules:
+    _mock_toolsets = _types.ModuleType("toolsets")
+    _mock_toolsets.TOOLSETS = {  # type: ignore[attr-defined]
+        "web": {"description": "web tools", "tools": ["web_search"], "includes": []},
+        "search": {"description": "search", "tools": ["search"], "includes": []},
+        "file": {"description": "file tools", "tools": ["read_file"], "includes": []},
+        "terminal": {"description": "terminal", "tools": ["terminal"], "includes": []},
+        "delegation": {"description": "delegation", "tools": ["delegate_task"], "includes": []},
+        "vision": {"description": "vision", "tools": ["vision_analyze"], "includes": []},
+        "computer_use": {"description": "computer use", "tools": ["computer_use"], "includes": []},
+        "debugging": {"description": "debugging toolkit", "tools": ["terminal"], "includes": ["web", "file"]},
+    }
+
+    def _resolve_toolset(name, _visited=None, *, include_registry=True):  # type: ignore[no-untyped-def]
+        spec = _mock_toolsets.TOOLSETS.get(name)  # type: ignore[attr-defined]
+        if not isinstance(spec, dict):
+            return [name]
+        tools = list(spec.get("tools") or [])
+        for inc in spec.get("includes") or []:
+            tools.extend(_resolve_toolset(inc, include_registry=include_registry))
+        return tools
+
+    _mock_toolsets.resolve_toolset = _resolve_toolset
+    sys.modules["toolsets"] = _mock_toolsets
+
+if "tools" not in sys.modules or "tools.registry" not in sys.modules:
+    _mock_registry = _types.SimpleNamespace()
+    _mock_registry.get_registered_toolset_names = lambda: []
+    # Mirror the real registry's internals: ``_snapshot_entries`` is a
+    # zero-arg method returning ToolEntry-like objects with ``name`` and
+    # ``toolset`` attributes; ``get_tool_to_toolset_map`` builds the map from
+    # it exactly like the production implementation, so tests that monkeypatch
+    # ``_snapshot_entries`` to inject fake MCP entries drive the real logic.
+    _mock_registry._tools = {}
+    _mock_registry._snapshot_entries = lambda: []
+
+    def _mock_get_tool_to_toolset_map():
+        return {e.name: e.toolset for e in _mock_registry._snapshot_entries()}
+
+    _mock_registry.get_tool_to_toolset_map = _mock_get_tool_to_toolset_map
+    if "tools" not in sys.modules:
+        sys.modules["tools"] = _types.ModuleType("tools")
+    if "tools.registry" not in sys.modules:
+        _mock_registry_mod = _types.ModuleType("tools.registry")
+        _mock_registry_mod.registry = _mock_registry
+        sys.modules["tools.registry"] = _mock_registry_mod
+
+
 # ── Behavioural tests for the merge-vs-restrict decision ─────────────────────
 
 
