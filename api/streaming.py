@@ -6790,12 +6790,16 @@ def _apply_session_toolset_override(defaults, override, mcp_server_names,
         # surviving default and drop any that transitively reach an
         # MCP server not in the override.
         #
-        # Builtin/static toolsets (web, file, …) are known-safe: their
-        # definitions are static and never include an MCP-server
-        # toolset, and resolving them requires the toolsets/registry
-        # modules that may be unavailable in CI — fail-closed on those
-        # would wrongly drop core toolsets.  Only non-builtin names
-        # (custom/plugin/registry toolsets) need the recursive check.
+        # Every surviving default is checked recursively — builtins
+        # included.  Builtin/static toolsets (web, file, …) resolve to
+        # non-MCP tools so the check keeps them, but they must still go
+        # through the same resolver/registry ownership proof as custom
+        # toolsets: a tool registered into a builtin's canonical
+        # ``mcp-<name>`` owner (e.g. a plugin owning ``mcp-web``) must
+        # fail closed rather than be assumed safe by name.  The earlier
+        # name-based fast-path (``_static_builtin_leaf_names``) derived
+        # "static" authority from the runtime-mutable ``toolsets.TOOLSETS``
+        # and was removed in round-5 review for exactly that reason.
         #
         # Review finding #3: unchecked_mcp must be computed from ALL
         # configured MCP server names minus the selected servers, not
