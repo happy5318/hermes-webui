@@ -2925,11 +2925,11 @@ def _resolve_image_input_mode(cfg: dict, active_provider: str = "", active_model
 
     Args:
       active_provider: the provider selected by the current session
-        (e.g. ``"custom:newapi"``).  When provided, it beats the config/global
+        (e.g. ``"custom:mygateway"``).  When provided, it beats the config/global
         default so image routing matches the model the user actually picked.
       active_model: the model selected by the current session.
       requested_provider: the provider identity before runtime canonicalization
-        (e.g. the original ``"custom:newapi"`` when ``active_provider`` was
+        (e.g. the original ``"custom:mygateway"`` when ``active_provider`` was
         normalized to ``"custom"`` by
         ``_resolve_custom_provider_runtime_overrides``). Lets capability lookup
         select the exact ``custom_providers``/``providers`` entry.

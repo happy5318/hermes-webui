@@ -62,29 +62,31 @@ class TestResolveImageInputMode:
         """Upstream parity: with no session identity, route by global default."""
         import agent.auxiliary_client as aux
 
-        monkeypatch.setattr(aux, "_read_main_provider", lambda: "custom:newapi")
-        monkeypatch.setattr(aux, "_read_main_model", lambda: "jd-kimi-k2.6")
-        cfg = _cfg_with_provider_vision("newapi", "jd-kimi-k2.6", True)
+        monkeypatch.setattr(aux, "_read_main_provider", lambda: "custom:mygateway")
+        monkeypatch.setattr(aux, "_read_main_model", lambda: "my-vision-model")
+        cfg = _cfg_with_provider_vision("mygateway", "my-vision-model", True)
         assert _resolve_image_input_mode(cfg) == "native"
 
     def test_global_default_text_model_routes_text(self, monkeypatch):
         """Upstream parity for a text-only global default."""
         import agent.auxiliary_client as aux
 
-        monkeypatch.setattr(aux, "_read_main_provider", lambda: "custom")
-        monkeypatch.setattr(aux, "_read_main_model", lambda: "deepseek-v4-flash")
+        monkeypatch.setattr(aux, "_read_main_provider", lambda: "custom:mygateway")
+        monkeypatch.setattr(aux, "_read_main_model", lambda: "my-text-model")
         cfg = {"model": {}, "providers": {}}
-        # deepseek is unknown to models.dev -> WebUI carve-out forwards native
+        # unknown to models.dev -> WebUI carve-out forwards native
         assert _resolve_image_input_mode(cfg) in ("native", "text")
 
     def test_active_vision_model_routes_native(self):
-        cfg = _cfg_with_provider_vision("stepfunplan", "step-3.7-flash", True)
-        assert _resolve_image_input_mode(cfg, "custom", "step-3.7-flash") == "native"
+        cfg = _cfg_with_provider_vision("myvllm", "my-vision", True)
+        assert _resolve_image_input_mode(
+            cfg, "custom", "my-vision", requested_provider="myvllm"
+        ) == "native"
 
     def test_active_text_model_routes_text(self):
-        cfg = _cfg_with_provider_vision("stepfunplan", "deepseek-v4-flash", False)
+        cfg = _cfg_with_provider_vision("myvllm", "my-text-model", False)
         assert _resolve_image_input_mode(
-            cfg, "custom", "deepseek-v4-flash", requested_provider="stepfunplan"
+            cfg, "custom", "my-text-model", requested_provider="myvllm"
         ) == "text"
 
     def test_requested_provider_selects_exact_entry(self):
