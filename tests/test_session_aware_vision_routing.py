@@ -25,6 +25,26 @@ from api.streaming import (
     _sanitize_messages_for_api,
 )
 
+# The capability-based routing under test delegates to
+# ``agent.image_routing.decide_image_input_mode`` (the single source of truth).
+# In the WebUI standalone CI environment the ``hermes-agent`` package is NOT
+# installed, so that import fails and ``_resolve_image_input_mode`` falls back to
+# the historical "forward native, rely on strip-and-retry" behaviour. Tests that
+# assert a capability-derived ``text`` verdict can therefore only run where the
+# agent package is importable — guard them so they skip (not fail) on CI.
+try:  # pragma: no cover - trivial import probe
+    import agent.image_routing  # noqa: F401
+    import agent.auxiliary_client  # noqa: F401
+
+    _HAS_AGENT_ROUTING = True
+except Exception:  # pragma: no cover
+    _HAS_AGENT_ROUTING = False
+
+requires_agent_routing = pytest.mark.skipif(
+    not _HAS_AGENT_ROUTING,
+    reason="hermes-agent not installed (capability-based routing unavailable)",
+)
+
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -58,6 +78,7 @@ def _cfg_with_provider_vision(provider_name: str, model: str, vision: bool) -> d
 # ── _resolve_image_input_mode ───────────────────────────────────────────────
 
 class TestResolveImageInputMode:
+    @requires_agent_routing
     def test_no_active_params_falls_back_to_global_default(self, monkeypatch):
         """Upstream parity: with no session identity, route by global default."""
         import agent.auxiliary_client as aux
@@ -67,6 +88,7 @@ class TestResolveImageInputMode:
         cfg = _cfg_with_provider_vision("mygateway", "my-vision-model", True)
         assert _resolve_image_input_mode(cfg) == "native"
 
+    @requires_agent_routing
     def test_global_default_text_model_routes_text(self, monkeypatch):
         """Upstream parity for a text-only global default."""
         import agent.auxiliary_client as aux
@@ -83,12 +105,14 @@ class TestResolveImageInputMode:
             cfg, "custom", "my-vision", requested_provider="myvllm"
         ) == "native"
 
+    @requires_agent_routing
     def test_active_text_model_routes_text(self):
         cfg = _cfg_with_provider_vision("myvllm", "my-text-model", False)
         assert _resolve_image_input_mode(
             cfg, "custom", "my-text-model", requested_provider="myvllm"
         ) == "text"
 
+    @requires_agent_routing
     def test_requested_provider_selects_exact_entry(self):
         """requested_provider beats the unknown-model native carve-out.
 
@@ -122,6 +146,7 @@ def _normalized_attachments(img_path: Path) -> list:
 
 
 class TestBuildNativeMultimodalForwarding:
+    @requires_agent_routing
     def test_requested_provider_reaches_text_mode(self, tmp_path):
         """A text-mode verdict strips the attachments to a plain string."""
         cfg = _cfg_with_provider_vision("myvllm", "my-model", False)
@@ -153,6 +178,7 @@ class TestBuildNativeMultimodalForwarding:
 # ── _sanitize_messages_for_api forwarding ───────────────────────────────────
 
 class TestSanitizeForwarding:
+    @requires_agent_routing
     def test_text_mode_strips_historical_native_images(self):
         cfg = _cfg_with_provider_vision("myvllm", "my-model", False)
         messages = [
@@ -177,6 +203,7 @@ class TestSanitizeForwarding:
         rendered = str(clean)
         assert "image_url" not in rendered
 
+    @requires_agent_routing
     def test_canonicalized_provider_without_requested_identity_cannot_strip(self):
         """Regression for the auth-heal retry bug (#6882 / Codex CORE): once the
         provider id is canonicalized to the generic ``custom``, the per-model
