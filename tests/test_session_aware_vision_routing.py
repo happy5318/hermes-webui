@@ -177,6 +177,51 @@ class TestSanitizeForwarding:
         rendered = str(clean)
         assert "image_url" not in rendered
 
+    def test_canonicalized_provider_without_requested_identity_cannot_strip(self):
+        """Regression for the auth-heal retry bug (#6882 / Codex CORE): once the
+        provider id is canonicalized to the generic ``custom``, the per-model
+        vision capability can ONLY be found via the preserved pre-canonicalization
+        ``requested_provider``. If a heal-retry clobbers that identity, the
+        sanitizer falls back to the generic id, cannot resolve the named
+        provider's text-only capability, and wrongly KEEPS the historical image.
+
+        This asserts the two arms:
+          - identity preserved  -> images stripped (correct heal-retry behavior)
+          - identity lost        -> images kept    (the bug the fix prevents)
+        """
+        cfg = _cfg_with_provider_vision("myvllm", "my-model", False)
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "hi"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,AAAA"},
+                    },
+                ],
+            }
+        ]
+        # Identity preserved through canonicalization: text-only -> stripped.
+        preserved = _sanitize_messages_for_api(
+            [dict(m) for m in messages],
+            cfg=cfg,
+            effective_provider="custom",
+            effective_model="my-model",
+            requested_provider="myvllm",
+        )
+        assert "image_url" not in str(preserved)
+        # Identity lost (heal-retry clobbered it to the generic id): the named
+        # provider's text-only capability is unreachable, so images survive.
+        lost = _sanitize_messages_for_api(
+            [dict(m) for m in messages],
+            cfg=cfg,
+            effective_provider="custom",
+            effective_model="my-model",
+            requested_provider="custom",
+        )
+        assert "image_url" in str(lost)
+
     def test_native_mode_keeps_historical_images(self):
         cfg = _cfg_with_provider_vision("myvllm", "my-model", True)
         messages = [

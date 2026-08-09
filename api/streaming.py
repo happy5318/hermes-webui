@@ -10225,7 +10225,13 @@ def _run_agent_streaming(
                             resolved_base_url = _runtime_preferred_base_url(
                                 _heal_rt, resolved_provider, configured_base_url
                             )
-                            _session_requested_provider = resolved_provider
+                            # Preserve the session's original pre-canonicalization
+                            # provider identity (captured at first resolve) so a
+                            # named custom:slug retry can still select its exact
+                            # vision-capability entry. Only initialize when empty
+                            # (e.g. the provider was first discovered on this heal).
+                            if not _session_requested_provider:
+                                _session_requested_provider = resolved_provider
                             resolved_provider, resolved_api_key, resolved_base_url = _resolve_custom_provider_runtime_overrides(
                                 resolved_provider, resolved_api_key, resolved_base_url
                             )
@@ -11460,7 +11466,12 @@ def _run_agent_streaming(
                     resolved_base_url = _runtime_preferred_base_url(
                         _heal_rt, resolved_provider, configured_base_url
                     )
-                    _session_requested_provider = resolved_provider
+                    # Preserve the session's original pre-canonicalization provider
+                    # identity (captured at first resolve) so a named custom:slug
+                    # retry can still select its exact vision-capability entry.
+                    # Only initialize when empty.
+                    if not _session_requested_provider:
+                        _session_requested_provider = resolved_provider
                     resolved_provider, resolved_api_key, resolved_base_url = _resolve_custom_provider_runtime_overrides(
                         resolved_provider, resolved_api_key, resolved_base_url
                     )
