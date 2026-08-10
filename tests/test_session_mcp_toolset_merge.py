@@ -146,18 +146,20 @@ if "toolsets" not in sys.modules:
             return []
 
     def _get_toolset(name, *, include_registry=True):  # type: ignore[no-untyped-def]
-        """Mirror the real ``get_toolset``: static spec merged with tools the
-        registry owns under the same name; registry/MCP-only toolsets resolve
-        through their alias target (e.g. ``beta`` → ``mcp-beta``)."""
+        """Mirror the real ``get_toolset``: static spec takes precedence;
+        aliases are consulted only for non-static names.  This matches the
+        installed Agent's resolution order (static-first, alias-second)."""
         spec = _mock_toolsets.TOOLSETS.get(name)  # type: ignore[attr-defined]
         if not include_registry:
             return spec
+        # Static-first: a static spec shadows any same-named alias or registry
+        # entry, exactly like the installed Agent.
+        if spec:
+            return spec
+        # Non-static: check alias, then registry tools under the resolved name.
         alias_target = _get_registry_alias_target(name)
         registry_toolset = alias_target or name
         registered = _get_registry_tool_names(registry_toolset)
-        if spec:
-            merged = sorted(set(spec.get("tools") or []) | set(registered))
-            return {**spec, "tools": merged}
         if registered:
             return {"description": f"Plugin/MCP toolset: {name}",
                     "tools": registered, "includes": []}
@@ -1478,19 +1480,10 @@ def test_safe_composite_positive_survival(monkeypatch):
 
 def test_runtime_custom_composite_through_real_caller(monkeypatch, tmp_path):
     """Production-composed acceptance: drive a safe custom composite, an
-    unsafe composite, a direct leaf, and a builtin/plugin collision through
-    the REAL ``_run_agent_streaming()`` call site, with only bounded
-    external-work seams replaced (config, model resolution, agent
-    constructor).  Capture the final ``enabled_toolsets`` the AIAgent
-    constructor receives, then resolve that result through the real
-    resolver/registry and assert the final tool list.
-
-    The previous round-6 tests called ``_apply_session_toolset_override``
-    directly with hand-built, already-separated inputs; they could stay green
-    if ``_run_agent_streaming()`` dropped or pre-sanitized the custom entry
-    before the helper.  This test closes that false-green class by asserting
-    the constructor's final ``enabled_toolsets`` AND the resolved tool list.
-    """
+    unsafe composite, a direct leaf, and a static MCP name in defaults
+    through the REAL ``_run_agent_streaming()`` call site.  Assert the
+    final ``enabled_toolsets`` (complete list) and the resolved tool
+    list (including a unique registered tool from the safe composite)."""
     import queue
     import sys
     import types as _types
@@ -1514,12 +1507,14 @@ def test_runtime_custom_composite_through_real_caller(monkeypatch, tmp_path):
 
     try:
         # Seed real registry/toolset state (runtime-composed, like production):
-        # - safe-composite: custom composite that only includes builtin web
+        # - safe-composite: custom composite that only includes safe-inner
+        #   (a registry-only toolset with a unique tool, proving resolve works)
         # - unsafe-composite: custom composite that includes unchecked mcp-beta
         # - gate-leaf: direct tool owned by unchecked mcp-gate-beta
         # - gate-alpha: selected MCP server (ticked); gate-beta: unchecked
+        # - search: configured MCP server whose name COLLIDES with static "search"
         _ts_mod.create_custom_toolset("safe-composite", "safe workflow",
-                                      tools=[], includes=["web"])
+                                      tools=[], includes=["safe-inner"])
         _ts_mod.create_custom_toolset("unsafe-composite", "reaches beta",
                                       tools=[], includes=["gate-beta"])
         _ts_mod.create_custom_toolset("gate-leaf", "leaf owned by beta",
@@ -1529,6 +1524,11 @@ def test_runtime_custom_composite_through_real_caller(monkeypatch, tmp_path):
         _reg.register("alpha_tool", "mcp-gate-alpha", {"type": "object"},
                       lambda *a, **k: "ok", override=True)
         _reg.register("beta_only_tool", "mcp-gate-beta", {"type": "object"},
+                      lambda *a, **k: "ok", override=True)
+        _reg.register("safe_unique_tool", "safe-inner", {"type": "object"},
+                      lambda *a, **k: "ok", override=True)
+        # Collision: MCP server "search" shares name with static toolset "search"
+        _reg.register("search_mcp_tool", "mcp-search", {"type": "object"},
                       lambda *a, **k: "ok", override=True)
 
         sid = "runtime-composed"
@@ -1558,8 +1558,8 @@ def test_runtime_custom_composite_through_real_caller(monkeypatch, tmp_path):
 
         def _fake_load_metadata_only(session_id):
             meta = models.Session(session_id=session_id, model="gpt-4o")
-            # Selected MCP server ticked in the composer chip; gate-beta is
-            # configured but NOT ticked → unchecked MCP server present.
+            # Selected MCP server ticked in the composer chip; gate-beta and
+            # search are configured but NOT ticked → unchecked MCP servers present.
             meta.enabled_toolsets = ["gate-alpha"]
             return meta
 
@@ -1568,10 +1568,10 @@ def test_runtime_custom_composite_through_real_caller(monkeypatch, tmp_path):
             m.setattr(streaming, "resolve_model_provider",
                       lambda *_a, **_k: ("gpt-4o", "openai", None))
             m.setattr("api.config.get_config", lambda *_a, **_k: {
-                "mcp_servers": {"gate-alpha": {}, "gate-beta": {}},
+                "mcp_servers": {"gate-alpha": {}, "gate-beta": {}, "search": {}},
             })
             m.setattr("api.config._resolve_cli_toolsets",
-                      lambda *_a, **_k: ["web", "safe-composite",
+                      lambda *_a, **_k: ["web", "search", "safe-composite",
                                          "unsafe-composite", "gate-leaf"])
             m.setattr(models.Session, "load_metadata_only",
                       staticmethod(_fake_load_metadata_only))
@@ -1586,31 +1586,21 @@ def test_runtime_custom_composite_through_real_caller(monkeypatch, tmp_path):
 
         result = captured["enabled_toolsets"]
         assert result is not None, "AIAgent constructor never received enabled_toolsets"
-        assert "web" in result, f"builtin web must survive, got {result!r}"
-        assert "safe-composite" in result, (
-            f"safe custom composite must survive, got {result!r}"
-        )
-        assert "gate-alpha" in result, (
-            f"selected MCP server must survive, got {result!r}"
-        )
-        assert "unsafe-composite" not in result, (
-            f"composite reaching unchecked mcp-gate-beta must be dropped, got {result!r}"
-        )
-        assert "gate-leaf" not in result, (
-            f"direct leaf owned by unchecked mcp-gate-beta must be dropped, got {result!r}"
-        )
-        assert "gate-beta" not in result, (
-            f"unchecked server must not appear, got {result!r}"
+        # Assert the COMPLETE list, not just membership.
+        assert result == ["web", "search", "safe-composite", "gate-alpha"], (
+            f"unexpected enabled_toolsets: {result!r}"
         )
 
         # Resolve the final toolset-set through the real resolver/registry and
-        # assert the FINAL tool list: builtins + safe custom + selected server
-        # survive; every unchecked-beta-owned tool is excluded.
+        # assert the FINAL tool list.
         final_tools = set()
         for name in result:
             final_tools.update(_ts_mod.resolve_toolset(name))
         assert "web_search" in final_tools, (
             f"builtin web tools must resolve, got {sorted(final_tools)!r}"
+        )
+        assert "safe_unique_tool" in final_tools, (
+            f"safe-composite unique tool must resolve, got {sorted(final_tools)!r}"
         )
         assert "alpha_tool" in final_tools, (
             f"selected gate-alpha tool must resolve, got {sorted(final_tools)!r}"
