@@ -1462,9 +1462,9 @@ def test_runtime_custom_composite_and_leaf_resolver_called(monkeypatch):
         _calls = []
         _orig = streaming._default_transitively_reaches_unchecked_mcp
 
-        def _wrapped(name, unchecked):
+        def _wrapped(name, unchecked, builtin_names=None):
             _calls.append(name)
-            return _orig(name, unchecked)
+            return _orig(name, unchecked, builtin_names)
 
         monkeypatch.setattr(streaming,
                             "_default_transitively_reaches_unchecked_mcp",
@@ -1782,6 +1782,310 @@ def test_runtime_custom_composite_through_real_caller(monkeypatch, tmp_path):
         assert "search_static_owned_tool" in final_tools, (
             f"exact-static overlay canary must survive into final tools, "
             f"got {sorted(final_tools)!r}"
+        )
+    finally:
+        _ts_mod.TOOLSETS.clear()
+        _ts_mod.TOOLSETS.update(_saved_toolsets)
+        _reg._tools.clear()
+        _reg._tools.update(_saved_tools)
+        _reg._toolset_aliases.clear()
+        _reg._toolset_aliases.update(_saved_aliases)
+
+
+# ── Gate-certification regressions (round-10) ────────────────────────────────
+# hermes-sweeper gate RED on 08fafc9d reported three production defects:
+#   1. BRICK  — a configured MCP server named ``all`` (the reserved wildcard
+#               class) breaks tool resolution: the resolver treats the bare
+#               selector as a wildcard and recurses into itself until
+#               RecursionError.
+#   2. SILENT — canonical-name collisions resolve the WRONG MCP server: with
+#               servers ``alpha`` and ``mcp-alpha`` configured, selecting
+#               ``mcp-alpha`` returns the ambiguous bare token and exposes
+#               ``alpha``'s tools (``mcp-mcp-alpha`` is the true canonical).
+#   3. SILENT — an offline unchecked server can re-enter through a retained
+#               custom composite after registration: the tool-level check
+#               sees no registered tools while the server is offline and
+#               keeps the composite; registering the server later exposes
+#               its tools without a new authorization decision.
+# The production fix canonicalizes picker-derived MCP selections to a
+# verified registry target and adds a registration-state-independent
+# structural walk of composite ``includes`` chains.
+
+
+def test_server_named_all_is_canonicalized_not_wildcard(monkeypatch):
+    """A configured MCP server literally named ``all`` must be emitted as the
+    canonical ``mcp-all`` target, never as the bare wildcard ``all``.
+
+    The installed resolver treats bare ``all``/``*`` as "expand every
+    toolset" BEFORE consulting MCP aliases, so a bare ``all`` selection
+    recurses until RecursionError (gate-certified BRICK).  The additive
+    classifier must canonicalize it to ``mcp-all``, which resolves as a
+    plain toolset name.
+    """
+    import toolsets as _ts_mod
+    from tools.registry import registry as _reg
+
+    _saved_toolsets = dict(_ts_mod.TOOLSETS)
+    _saved_tools = dict(_reg._tools)
+    _saved_aliases = dict(_reg._toolset_aliases)
+
+    try:
+        _ts_mod.create_custom_toolset("all", "server literally named all",
+                                      tools=[], includes=[])
+        _reg.register_toolset_alias("all", "mcp-all")
+        _reg.register("all_tool", "mcp-all", {"type": "object"},
+                      lambda *a, **k: "ok", override=True)
+
+        defaults = ["web", "file"]
+        override = ["all"]
+        mcp_servers = {"all", "other"}
+        result = _apply_override(defaults, override, mcp_servers,
+                                 builtin_names={"web", "file", "terminal"})
+
+        assert "all" not in result, (
+            f"bare wildcard 'all' must never survive, got {result!r}"
+        )
+        assert "mcp-all" in result, (
+            f"canonical mcp-all must be emitted, got {result!r}"
+        )
+        # The canonical target must resolve to the server's tools.
+        resolved = set(_ts_mod.resolve_toolset("mcp-all"))
+        assert "all_tool" in resolved, (
+            f"mcp-all must resolve the server's tools, got {sorted(resolved)!r}"
+        )
+    finally:
+        _ts_mod.TOOLSETS.clear()
+        _ts_mod.TOOLSETS.update(_saved_toolsets)
+        _reg._tools.clear()
+        _reg._tools.update(_saved_tools)
+        _reg._toolset_aliases.clear()
+        _reg._toolset_aliases.update(_saved_aliases)
+
+
+def test_server_named_star_is_canonicalized_not_wildcard(monkeypatch):
+    """The ``*`` reserved selector collides with a server of the same name and
+    must also be canonicalized to ``mcp-*``."""
+    import toolsets as _ts_mod
+    from tools.registry import registry as _reg
+
+    _saved_toolsets = dict(_ts_mod.TOOLSETS)
+    _saved_tools = dict(_reg._tools)
+    _saved_aliases = dict(_reg._toolset_aliases)
+
+    try:
+        _ts_mod.create_custom_toolset("*", "server literally named star",
+                                      tools=[], includes=[])
+        _reg.register_toolset_alias("*", "mcp-*")
+        _reg.register("star_tool", "mcp-*", {"type": "object"},
+                      lambda *a, **k: "ok", override=True)
+
+        defaults = ["web"]
+        override = ["*"]
+        mcp_servers = {"*", "other"}
+        result = _apply_override(defaults, override, mcp_servers,
+                                 builtin_names={"web", "file", "terminal"})
+
+        assert "*" not in result, (
+            f"bare wildcard '*' must never survive, got {result!r}"
+        )
+        assert "mcp-*" in result, (
+            f"canonical mcp-* must be emitted, got {result!r}"
+        )
+    finally:
+        _ts_mod.TOOLSETS.clear()
+        _ts_mod.TOOLSETS.update(_saved_toolsets)
+        _reg._tools.clear()
+        _reg._tools.update(_saved_tools)
+        _reg._toolset_aliases.clear()
+        _reg._toolset_aliases.update(_saved_aliases)
+
+
+def test_canonical_collision_mcp_alpha_selects_right_server(monkeypatch):
+    """With servers ``alpha`` AND ``mcp-alpha`` configured, selecting
+    ``mcp-alpha`` must emit ``mcp-mcp-alpha`` (the selected server's true
+    canonical), NOT the bare ``mcp-alpha`` which collides with server
+    ``alpha``'s canonical toolset (gate-certified SILENT defect 2)."""
+    import toolsets as _ts_mod
+    from tools.registry import registry as _reg
+
+    _saved_toolsets = dict(_ts_mod.TOOLSETS)
+    _saved_tools = dict(_reg._tools)
+    _saved_aliases = dict(_reg._toolset_aliases)
+
+    try:
+        # Server "alpha" → canonical mcp-alpha
+        _ts_mod.create_custom_toolset("alpha", "server alpha", tools=[], includes=[])
+        _reg.register_toolset_alias("alpha", "mcp-alpha")
+        _reg.register("alpha_owned_tool", "mcp-alpha", {"type": "object"},
+                      lambda *a, **k: "ok", override=True)
+        # Server "mcp-alpha" → canonical mcp-mcp-alpha
+        _ts_mod.create_custom_toolset("mcp-alpha", "server mcp-alpha",
+                                      tools=[], includes=[])
+        _reg.register_toolset_alias("mcp-alpha", "mcp-mcp-alpha")
+        _reg.register("mcp_alpha_owned_tool", "mcp-mcp-alpha", {"type": "object"},
+                      lambda *a, **k: "ok", override=True)
+
+        defaults = ["web"]
+        override = ["mcp-alpha"]
+        mcp_servers = {"alpha", "mcp-alpha"}
+        result = _apply_override(defaults, override, mcp_servers,
+                                 builtin_names={"web", "file", "terminal"})
+
+        assert "mcp-alpha" not in result, (
+            f"ambiguous bare mcp-alpha must never survive, got {result!r}"
+        )
+        assert "mcp-mcp-alpha" in result, (
+            f"true canonical mcp-mcp-alpha must be emitted, got {result!r}"
+        )
+        resolved = set(_ts_mod.resolve_toolset("mcp-mcp-alpha"))
+        assert "mcp_alpha_owned_tool" in resolved, (
+            f"mcp-mcp-alpha must resolve the SELECTED server's tools, "
+            f"got {sorted(resolved)!r}"
+        )
+        # The other server's tools must not appear.
+        assert "alpha_owned_tool" not in resolved, (
+            f"wrong server's tools must not resolve, got {sorted(resolved)!r}"
+        )
+    finally:
+        _ts_mod.TOOLSETS.clear()
+        _ts_mod.TOOLSETS.update(_saved_toolsets)
+        _reg._tools.clear()
+        _reg._tools.update(_saved_tools)
+        _reg._toolset_aliases.clear()
+        _reg._toolset_aliases.update(_saved_aliases)
+
+
+def test_offline_unchecked_server_cannot_reenter_composite(monkeypatch):
+    """A composite whose ``includes`` references an unchecked MCP server must
+    be dropped EVEN WHEN that server is offline (no tools registered yet).
+
+    Gate-certified SILENT defect 3: the tool-level check sees no registered
+    tools while the server is offline and keeps the composite; registering
+    the server later would re-expose its tools without a new authorization
+    decision.  The structural includes walk is registration-state
+    independent and must reject the composite up front, and the retained
+    result must stay clean after the server registers.
+    """
+    import toolsets as _ts_mod
+    from tools.registry import registry as _reg
+
+    _saved_toolsets = dict(_ts_mod.TOOLSETS)
+    _saved_tools = dict(_reg._tools)
+    _saved_aliases = dict(_reg._toolset_aliases)
+
+    try:
+        # Composite reaches "gate-beta" — configured but NOT ticked.
+        _ts_mod.create_custom_toolset("bad-composite", "reaches gate-beta",
+                                      tools=[], includes=["gate-beta"])
+        # NOTE: gate-beta has NO alias and NO registered tools yet — offline.
+
+        defaults = ["web", "bad-composite"]
+        override = ["gate-alpha"]
+        mcp_servers = {"gate-alpha", "gate-beta"}
+        result = _apply_override(defaults, override, mcp_servers,
+                                 builtin_names={"web", "file", "terminal"})
+
+        assert "bad-composite" not in result, (
+            f"composite reaching offline unchecked server must be dropped, "
+            f"got {result!r}"
+        )
+        assert "web" in result, f"builtin web must survive, got {result!r}"
+        assert "gate-alpha" in result, (
+            f"ticked server must survive, got {result!r}"
+        )
+
+        # Late registration: the unchecked server comes online AFTER the
+        # merge decision.  The retained result must not expose its tools.
+        _reg.register_toolset_alias("gate-beta", "mcp-gate-beta")
+        _reg.register("beta_tool", "mcp-gate-beta", {"type": "object"},
+                      lambda *a, **k: "ok", override=True)
+        final_tools = set()
+        for name in result:
+            final_tools.update(_ts_mod.resolve_toolset(name))
+        assert "beta_tool" not in final_tools, (
+            f"offline server must not re-enter via retained composite, "
+            f"got {sorted(final_tools)!r}"
+        )
+    finally:
+        _ts_mod.TOOLSETS.clear()
+        _ts_mod.TOOLSETS.update(_saved_toolsets)
+        _reg._tools.clear()
+        _reg._tools.update(_saved_tools)
+        _reg._toolset_aliases.clear()
+        _reg._toolset_aliases.update(_saved_aliases)
+
+
+def test_offline_unchecked_server_canonical_reference_rejected(monkeypatch):
+    """A composite whose includes chain references an unchecked server by its
+    CANONICAL ``mcp-<server>`` selector is rejected even while offline —
+    canonical resolution bypasses alias shadowing, so the canonical name in
+    the includes chain is always an MCP reference."""
+    import toolsets as _ts_mod
+    from tools.registry import registry as _reg
+
+    _saved_toolsets = dict(_ts_mod.TOOLSETS)
+    _saved_tools = dict(_reg._tools)
+    _saved_aliases = dict(_reg._toolset_aliases)
+
+    try:
+        _ts_mod.create_custom_toolset("bad-composite", "reaches mcp-gate-beta",
+                                      tools=[], includes=["mcp-gate-beta"])
+
+        defaults = ["web", "bad-composite"]
+        override = ["gate-alpha"]
+        mcp_servers = {"gate-alpha", "gate-beta"}
+        result = _apply_override(defaults, override, mcp_servers,
+                                 builtin_names={"web", "file", "terminal"})
+
+        assert "bad-composite" not in result, (
+            f"composite reaching offline unchecked canonical must be dropped, "
+            f"got {result!r}"
+        )
+    finally:
+        _ts_mod.TOOLSETS.clear()
+        _ts_mod.TOOLSETS.update(_saved_toolsets)
+        _reg._tools.clear()
+        _reg._tools.update(_saved_tools)
+        _reg._toolset_aliases.clear()
+        _reg._toolset_aliases.update(_saved_aliases)
+
+
+def test_builtin_shadowed_bare_name_not_treated_as_mcp_reference(monkeypatch):
+    """A bare name that is BOTH a builtin toolset and a configured MCP server
+    (e.g. server ``search`` colliding with static ``search``) must NOT be
+    rejected by the structural walk — the builtin shadows the MCP alias, so
+    the default entry ``search`` is the builtin, not an MCP reference."""
+    import toolsets as _ts_mod
+    from tools.registry import registry as _reg
+
+    _saved_toolsets = dict(_ts_mod.TOOLSETS)
+    _saved_tools = dict(_reg._tools)
+    _saved_aliases = dict(_reg._toolset_aliases)
+
+    try:
+        _ts_mod.create_custom_toolset("search", "static search builtin",
+                                      tools=["search_tool"], includes=[])
+        _ts_mod.create_custom_toolset("web", "static web builtin",
+                                      tools=["web_tool"], includes=[])
+        _reg.register("search_tool", "search", {"type": "object"},
+                      lambda *a, **k: "ok", override=True)
+        _reg.register("web_tool", "web", {"type": "object"},
+                      lambda *a, **k: "ok", override=True)
+        # Server "search" is configured but unchecked; default "search" is
+        # the static builtin and must survive.
+        defaults = ["web", "search"]
+        override = ["gate-alpha"]
+        mcp_servers = {"gate-alpha", "search"}
+        result = _apply_override(defaults, override, mcp_servers,
+                                 builtin_names={"web", "search", "file", "terminal"})
+
+        assert "web" in result, f"builtin web must survive, got {result!r}"
+        assert "search" in result, (
+            f"builtin search (bare name shadowed by static) must survive, "
+            f"got {result!r}"
+        )
+        assert "gate-alpha" in result, (
+            f"ticked server must survive, got {result!r}"
         )
     finally:
         _ts_mod.TOOLSETS.clear()

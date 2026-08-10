@@ -6655,6 +6655,64 @@ def _builtin_toolset_names():
 
 
 
+def _canonicalize_picker_mcp_selection(name, mcp_server_names):
+    """Map a picker-derived MCP server selection to an unambiguous registry
+    target, or ``None`` when ownership cannot be proved (fail closed).
+
+    The composer toolset picker emits the *bare* configured server name.  A
+    bare name is ambiguous in exactly two cases:
+
+    * **Reserved wildcard selectors** (``all`` / ``*``): the installed
+      resolver treats them as "every toolset" *before* consulting MCP
+      aliases, so a server literally named ``all`` recurses into itself until
+      ``RecursionError`` (gate-certified BRICK).
+    * **Canonical collisions**: a server named ``mcp-alpha`` collides with
+      the canonical ``mcp-alpha`` toolset of a server named ``alpha``, so the
+      bare token resolves the *wrong* server's tools (gate-certified SILENT).
+
+    Both cases canonicalize to ``mcp-<name>`` (``mcp-all`` /
+    ``mcp-mcp-alpha``), which the resolver treats as a plain toolset name and
+    never as a wildcard.  Ordinary server names (``my-search``) have no
+    ambiguity and pass through unchanged — the resolver reaches them through
+    their registry alias.
+
+    Failure contract: when the name IS a configured MCP server but its
+    canonical target cannot be verified in the live registry (server not yet
+    registered, or registry unavailable), ownership cannot be proved and we
+    return ``None`` so the caller drops the selection rather than emit an
+    ambiguous token.
+    """
+    if not isinstance(name, str) or not name:
+        return None if name is None else name
+    if name not in mcp_server_names:
+        return name  # free-text toolset name — not an MCP server, keep as-is
+    if name not in {"all", "*"} and not name.startswith("mcp-"):
+        return name  # ordinary server name — bare token resolves via alias
+    canonical = f"mcp-{name}"
+    try:
+        from tools.registry import registry as _reg
+        target = _reg.get_toolset_alias_target(name)
+        if target == canonical:
+            return canonical
+        if canonical in set(_reg.get_registered_toolset_names()):
+            return canonical
+    except Exception:
+        return None  # cannot prove ownership → fail closed
+    return None
+
+
+def _canonicalize_override_targets(override, mcp_server_names):
+    """Map every override entry through :func:`_canonicalize_picker_mcp_selection`,
+    dropping entries whose ownership cannot be proved (fail closed)."""
+    out = []
+    for _n in override or []:
+        _t = _canonicalize_picker_mcp_selection(_n, mcp_server_names)
+        if _t is None:
+            continue
+        out.append(_t)
+    return out
+
+
 def _apply_session_toolset_override(defaults, override, mcp_server_names,
                                     builtin_names=None):
     """Resolve a per-session ``enabled_toolsets`` override against the profile
@@ -6819,19 +6877,35 @@ def _apply_session_toolset_override(defaults, override, mcp_server_names,
             # create_custom_toolset().  A runtime custom leaf with an
             # empty includes list could enter the set and bypass the
             # ownership check, re-exposing unchecked MCP tools.
-            if _default_transitively_reaches_unchecked_mcp(d, unchecked_mcp):
+            if _default_transitively_reaches_unchecked_mcp(
+                    d, unchecked_mcp, builtin_names):
                 continue  # composite that pulls in an unchecked MCP server
             merged.append(d)
         seen = set(merged)
         for name in override:
-            if name not in seen:
-                merged.append(name)
-                seen.add(name)
+            # Canonicalize picker-derived MCP selections to a verified,
+            # unambiguous registry target (gate-certified BRICK/SILENT):
+            # a bare server named "all"/"*" would be treated as a wildcard
+            # by the resolver (RecursionError), and a server named
+            # "mcp-alpha" collides with the canonical toolset of a server
+            # named "alpha" (wrong server's tools).  Emit the canonical
+            # "mcp-<name>" target instead; drop the selection when
+            # ownership cannot be proved (fail closed).
+            target = _canonicalize_picker_mcp_selection(name, mcp_server_names)
+            if target is None:
+                continue
+            if target not in seen:
+                merged.append(target)
+                seen.add(target)
         return merged
+    # Restrict branch: power-user free-text override.  Names here are
+    # literal toolset selections (a bare "all"/"*" is the user's explicit
+    # wildcard intent), NOT picker-derived MCP ticks — leave them untouched.
     return list(override)
 
 
-def _default_transitively_reaches_unchecked_mcp(default_name, unchecked_mcp):
+def _default_transitively_reaches_unchecked_mcp(default_name, unchecked_mcp,
+                                                builtin_names=None):
     """Return True if *resolving* ``default_name`` exposes tools from any MCP
     server whose bare name is in ``unchecked_mcp``.
 
@@ -6842,15 +6916,77 @@ def _default_transitively_reaches_unchecked_mcp(default_name, unchecked_mcp):
     name is an MCP server the agent receives that server's tools — silently
     defeating the "unchecked MCP servers stay out" contract.
 
-    This helper performs the same expansion and checks every resolved tool's
-    registered toolset.  If any tool belongs to ``mcp-<server>`` where
-    ``<server>`` is in ``unchecked_mcp``, the default is unsafe to keep.
+    Two complementary checks run here:
+
+    1. **Structural walk (gate-certified finding 3):** recursively traverse
+       the toolset definition's ``includes`` chain and reject any name that
+       is an unchecked MCP server's bare name OR its canonical
+       ``mcp-<server>`` selector.  This catches an *offline* unchecked server
+       the resolved-tools check cannot see: before the server registers its
+       tools, ``resolve_toolset`` returns nothing for it, so the tool-level
+       check alone would keep the composite — and registering the server
+       later would silently re-expose its tools without a fresh
+       authorization decision.  The structural walk is registration-state
+       independent.  Cycles are detected via a visited set.
+
+       A bare name that is also a *builtin* toolset name (e.g. a server
+       named ``web`` colliding with the static ``web`` toolset) is NOT an
+       MCP reference in the includes chain — the builtin shadows the MCP
+       alias at resolution time, exactly as elsewhere in this module.  The
+       canonical ``mcp-<name>`` selector is still checked unconditionally,
+       because canonical resolution bypasses alias shadowing.
+
+    2. **Tool-level check:** expand the name through ``resolve_toolset`` and
+       inspect every resolved tool's registered toolset.  If any tool belongs
+       to ``mcp-<server>`` where ``<server>`` is in ``unchecked_mcp``, the
+       default is unsafe to keep.  This catches a custom toolset that owns
+       unchecked-server tools *directly* (tools list, empty includes) which
+       the includes walk cannot see.
 
     Fail-closed: if the toolset resolver or registry is unavailable, we cannot
     prove the default is safe, so return ``True`` (drop it).
     """
     if not unchecked_mcp:
         return False
+    unchecked_bare = set(unchecked_mcp)
+    unchecked_canonical = {f"mcp-{s}" for s in unchecked_mcp}
+    # A bare name shadowed by a builtin toolset resolves to the builtin, not
+    # to the MCP alias — it is not an MCP reference for the includes walk.
+    if builtin_names:
+        unchecked_bare -= set(builtin_names)
+
+    # ── 1. Structural walk of the includes chain ──────────────────────────
+    # Registration-state independent: an unchecked server that has NOT
+    # registered tools yet (offline) is still rejected when a default's
+    # includes chain names it (bare or canonical), so a later
+    # registration/reconnect cannot re-enter through a retained composite.
+    try:
+        from toolsets import get_toolset
+    except Exception:
+        return True  # cannot prove safety → drop
+    visited = set()
+    stack = [default_name]
+    while stack:
+        node = stack.pop()
+        if node in visited:
+            continue  # cycle / diamond — already checked
+        visited.add(node)
+        if node in unchecked_bare or node in unchecked_canonical:
+            return True  # includes chain references an unchecked MCP server
+        try:
+            ts_def = get_toolset(node)
+        except Exception:
+            return True  # cannot prove safety → drop
+        if not ts_def:
+            # Unknown / registry-only toolset (e.g. an mcp-* canonical whose
+            # server is itself checked).  Registry-derived toolsets have no
+            # ``includes``, so there is nothing further to traverse; the
+            # name-level test above already covered the unchecked cases.
+            continue
+        for inc in ts_def.get("includes", []) or []:
+            stack.append(inc)
+
+    # ── 2. Tool-level check (existing behavior) ───────────────────────────
     try:
         from toolsets import resolve_toolset
         from tools.registry import registry as _tool_registry
@@ -6862,8 +6998,9 @@ def _default_transitively_reaches_unchecked_mcp(default_name, unchecked_mcp):
         return True  # resolution error → drop
     if not resolved_tools:
         return False
-    # Build the set of mcp-<server> toolset names that are unchecked.
-    unchecked_toolset_ids = {f"mcp-{s}" for s in unchecked_mcp}
+    # A tool registered under an unchecked server's canonical toolset proves
+    # exposure even when the name chain is opaque (direct tools list).
+    unchecked_toolset_ids = unchecked_canonical
     try:
         tool_to_ts = _tool_registry.get_tool_to_toolset_map()
     except Exception:
