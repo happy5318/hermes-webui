@@ -50,67 +50,73 @@ REPO = Path(__file__).resolve().parents[1]
 import sys
 import types as _types
 
-if "tools" not in sys.modules or "tools.registry" not in sys.modules:
-    _mock_registry = _types.SimpleNamespace()
-    # Mirror the real registry's internals: ``_snapshot_entries`` is a
-    # zero-arg method returning ToolEntry-like objects with ``name`` and
-    # ``toolset`` attributes; ``get_tool_to_toolset_map`` builds the map from
-    # it exactly like the production implementation, so tests that monkeypatch
-    # ``_snapshot_entries`` to inject fake MCP entries drive the real logic.
-    _mock_registry._tools = {}
-    _mock_registry._toolset_aliases = {}
-    # Default snapshot is the LIVE registered tools (like the real
-    # ``ToolRegistry._snapshot_entries``), so ``register()`` calls in the
-    # runtime-composed tests are visible to ownership checks without any
-    # monkeypatch.  Tests that need extra fake entries still monkeypatch
-    # ``_snapshot_entries`` and delegate to this default.
-    _mock_registry._snapshot_entries = lambda: list(_mock_registry._tools.values())
+# Snapshot prior state so stand-ins can be restored/removed after import.
+_prior_sys_modules = dict(sys.modules)
 
-    def _mock_register(name, toolset, schema, handler, check_fn=None,
-                       requires_env=None, is_async=False, description="",
-                       emoji="", max_result_size_chars=None,
-                       dynamic_schema_overrides=None, override=False):
-        """Faithful stand-in for ``ToolRegistry.register``: cross-toolset
-        shadowing is rejected unless ``override=True`` (mirrors the real
-        registry's ownership rules)."""
-        existing = _mock_registry._tools.get(name)
-        if existing is not None and existing.toolset != toolset and not override:
-            return  # rejected shadow, like the real registry
-        entry = _types.SimpleNamespace(
-            name=name, toolset=toolset, schema=schema, handler=handler,
-            check_fn=check_fn, requires_env=requires_env or [],
-            is_async=is_async, description=description, emoji=emoji,
-            max_result_size_chars=max_result_size_chars,
-            dynamic_schema_overrides=dynamic_schema_overrides,
-        )
-        _mock_registry._tools[name] = entry
 
-    def _mock_register_toolset_alias(alias, toolset):
-        _mock_registry._toolset_aliases[alias] = toolset
+# ── scoped registry stand-in ────────────────────────────────────────────────
+_mock_registry = _types.SimpleNamespace()
+_mock_registry._tools = {}
+_mock_registry._toolset_aliases = {}
+_mock_registry._snapshot_entries = lambda: list(_mock_registry._tools.values())
 
-    def _mock_get_registered_toolset_names():
-        return sorted({e.toolset for e in _mock_registry._snapshot_entries()})
 
-    def _mock_get_tool_names_for_toolset(toolset):
-        return sorted(e.name for e in _mock_registry._snapshot_entries()
-                      if e.toolset == toolset)
+def _mock_register(name, toolset, schema, handler, check_fn=None,
+                   requires_env=None, is_async=False, description="",
+                   emoji="", max_result_size_chars=None,
+                   dynamic_schema_overrides=None, override=False):
+    """Faithful stand-in for ``ToolRegistry.register``: cross-toolset
+    shadowing is rejected unless ``override=True`` (mirrors the real
+    registry's ownership rules)."""
+    existing = _mock_registry._tools.get(name)
+    if existing is not None and existing.toolset != toolset and not override:
+        return  # rejected shadow, like the real registry
+    entry = _types.SimpleNamespace(
+        name=name, toolset=toolset, schema=schema, handler=handler,
+        check_fn=check_fn, requires_env=requires_env or [],
+        is_async=is_async, description=description, emoji=emoji,
+        max_result_size_chars=max_result_size_chars,
+        dynamic_schema_overrides=dynamic_schema_overrides,
+    )
+    _mock_registry._tools[name] = entry
 
-    def _mock_get_toolset_alias_target(alias):
-        return _mock_registry._toolset_aliases.get(alias)
 
-    def _mock_get_tool_to_toolset_map():
-        return {e.name: e.toolset for e in _mock_registry._snapshot_entries()}
+def _mock_register_toolset_alias(alias, toolset):
+    _mock_registry._toolset_aliases[alias] = toolset
 
-    def _mock_get_entry(name):
-        return _mock_registry._tools.get(name)
 
-    _mock_registry.get_entry = _mock_get_entry
-    _mock_registry.register = _mock_register
-    _mock_registry.register_toolset_alias = _mock_register_toolset_alias
-    _mock_registry.get_registered_toolset_names = _mock_get_registered_toolset_names
-    _mock_registry.get_tool_names_for_toolset = _mock_get_tool_names_for_toolset
-    _mock_registry.get_toolset_alias_target = _mock_get_toolset_alias_target
-    _mock_registry.get_tool_to_toolset_map = _mock_get_tool_to_toolset_map
+def _mock_get_registered_toolset_names():
+    return sorted({e.toolset for e in _mock_registry._snapshot_entries()})
+
+
+def _mock_get_tool_names_for_toolset(toolset):
+    return sorted(e.name for e in _mock_registry._snapshot_entries()
+                  if e.toolset == toolset)
+
+
+def _mock_get_toolset_alias_target(alias):
+    return _mock_registry._toolset_aliases.get(alias)
+
+
+def _mock_get_tool_to_toolset_map():
+    return {e.name: e.toolset for e in _mock_registry._snapshot_entries()}
+
+
+def _mock_get_entry(name):
+    return _mock_registry._tools.get(name)
+
+
+_mock_registry.get_entry = _mock_get_entry
+_mock_registry.register = _mock_register
+_mock_registry.register_toolset_alias = _mock_register_toolset_alias
+_mock_registry.get_registered_toolset_names = _mock_get_registered_toolset_names
+_mock_registry.get_tool_names_for_toolset = _mock_get_tool_names_for_toolset
+_mock_registry.get_toolset_alias_target = _mock_get_toolset_alias_target
+_mock_registry.get_tool_to_toolset_map = _mock_get_tool_to_toolset_map
+
+# Only install when the real runtime is NOT already imported.
+_real_tools_present = "tools" in sys.modules and "tools.registry" in sys.modules
+if not _real_tools_present:
     if "tools" not in sys.modules:
         sys.modules["tools"] = _types.ModuleType("tools")
     if "tools.registry" not in sys.modules:
@@ -118,84 +124,101 @@ if "tools" not in sys.modules or "tools.registry" not in sys.modules:
         _mock_registry_mod.registry = _mock_registry
         sys.modules["tools.registry"] = _mock_registry_mod
 
-if "toolsets" not in sys.modules:
-    _mock_toolsets = _types.ModuleType("toolsets")
-    _mock_toolsets.TOOLSETS = {  # type: ignore[attr-defined]
-        "web": {"description": "web tools", "tools": ["web_search"], "includes": []},
-        "search": {"description": "search", "tools": ["search"], "includes": []},
-        "file": {"description": "file tools", "tools": ["read_file"], "includes": []},
-        "terminal": {"description": "terminal", "tools": ["terminal"], "includes": []},
-        "delegation": {"description": "delegation", "tools": ["delegate_task"], "includes": []},
-        "vision": {"description": "vision", "tools": ["vision_analyze"], "includes": []},
-        "computer_use": {"description": "computer use", "tools": ["computer_use"], "includes": []},
-        "debugging": {"description": "debugging toolkit", "tools": ["terminal"], "includes": ["web", "file"]},
-    }
+# ── scoped toolsets stand-in ────────────────────────────────────────────────
+_mock_toolsets = _types.ModuleType("toolsets")
+_mock_toolsets.TOOLSETS = {  # type: ignore[attr-defined]
+    "web": {"description": "web tools", "tools": ["web_search"], "includes": []},
+    "search": {"description": "search", "tools": ["search"], "includes": []},
+    "file": {"description": "file tools", "tools": ["read_file"], "includes": []},
+    "terminal": {"description": "terminal", "tools": ["terminal"], "includes": []},
+    "delegation": {"description": "delegation", "tools": ["delegate_task"], "includes": []},
+    "vision": {"description": "vision", "tools": ["vision_analyze"], "includes": []},
+    "computer_use": {"description": "computer use", "tools": ["computer_use"], "includes": []},
+    "debugging": {"description": "debugging toolkit", "tools": ["terminal"], "includes": ["web", "file"]},
+}
 
-    def _get_registry_alias_target(name):  # type: ignore[no-untyped-def]
-        try:
-            from tools.registry import registry as _r
-            return _r.get_toolset_alias_target(name)
-        except Exception:
-            return None
 
-    def _get_registry_tool_names(toolset):  # type: ignore[no-untyped-def]
-        try:
-            from tools.registry import registry as _r
-            return _r.get_tool_names_for_toolset(toolset)
-        except Exception:
-            return []
-
-    def _get_toolset(name, *, include_registry=True):  # type: ignore[no-untyped-def]
-        """Mirror the real ``get_toolset``: static spec takes precedence;
-        aliases are consulted only for non-static names.  This matches the
-        installed Agent's resolution order (static-first, alias-second)."""
-        spec = _mock_toolsets.TOOLSETS.get(name)  # type: ignore[attr-defined]
-        if not include_registry:
-            return spec
-        # Static-first: a static spec shadows any same-named alias or registry
-        # entry, exactly like the installed Agent.
-        if spec:
-            return spec
-        # Non-static: check alias, then registry tools under the resolved name.
-        alias_target = _get_registry_alias_target(name)
-        registry_toolset = alias_target or name
-        registered = _get_registry_tool_names(registry_toolset)
-        if registered:
-            return {"description": f"Plugin/MCP toolset: {name}",
-                    "tools": registered, "includes": []}
+def _get_registry_alias_target(name):  # type: ignore[no-untyped-def]
+    try:
+        from tools.registry import registry as _r
+        return _r.get_toolset_alias_target(name)
+    except Exception:
         return None
 
-    def _resolve_toolset(name, _visited=None, *, include_registry=True):  # type: ignore[no-untyped-def]
-        if _visited is None:
-            _visited = set()
-        if name in {"all", "*"}:
-            out = set()
-            for _n in list(_mock_toolsets.TOOLSETS.keys()):  # type: ignore[attr-defined]
-                out.update(_resolve_toolset(_n, set(_visited),
-                                            include_registry=include_registry))
-            return sorted(out)
-        if name in _visited:
-            return []
-        _visited = _visited | {name}
-        spec = _get_toolset(name, include_registry=include_registry)
-        if not isinstance(spec, dict):
-            return [name]
-        tools = list(spec.get("tools") or [])
-        for inc in spec.get("includes") or []:
-            tools.extend(_resolve_toolset(inc, _visited,
-                                          include_registry=include_registry))
-        return tools
 
-    def _create_custom_toolset(name, description, tools=None, includes=None):  # type: ignore[no-untyped-def]
-        _mock_toolsets.TOOLSETS[name] = {  # type: ignore[attr-defined]
-            "description": description,
-            "tools": tools or [],
-            "includes": includes or [],
-        }
+def _get_registry_tool_names(toolset):  # type: ignore[no-untyped-def]
+    try:
+        from tools.registry import registry as _r
+        return _r.get_tool_names_for_toolset(toolset)
+    except Exception:
+        return []
 
-    _mock_toolsets.get_toolset = _get_toolset
-    _mock_toolsets.resolve_toolset = _resolve_toolset
-    _mock_toolsets.create_custom_toolset = _create_custom_toolset
+
+def _get_toolset(name, *, include_registry=True):  # type: ignore[no-untyped-def]
+    """Mirror the real ``get_toolset``: static spec takes precedence and is
+    merged with registry tools registered under the exact static name.
+    Aliases are consulted only for non-static names.  This matches the
+    installed Agent's resolution order (static-first, alias-second) AND
+    its overlay contract (registry tools under a static name are merged)."""
+    spec = _mock_toolsets.TOOLSETS.get(name)  # type: ignore[attr-defined]
+    if not include_registry:
+        return spec
+    # Static-first + overlay: merge registry tools registered under the
+    # exact static name, exactly like the real ``get_toolset``.
+    if spec:
+        merged_tools = sorted(
+            set(spec.get("tools", []))
+            | set(_get_registry_tool_names(name))
+        )
+        return {"description": spec.get("description", ""),
+                "tools": merged_tools,
+                "includes": list(spec.get("includes", []))}
+    # Non-static: check alias, then registry tools under the resolved name.
+    alias_target = _get_registry_alias_target(name)
+    registry_toolset = alias_target or name
+    registered = _get_registry_tool_names(registry_toolset)
+    if registered:
+        return {"description": f"Plugin/MCP toolset: {name}",
+                "tools": registered, "includes": []}
+    return None
+
+
+def _resolve_toolset(name, _visited=None, *, include_registry=True):  # type: ignore[no-untyped-def]
+    if _visited is None:
+        _visited = set()
+    if name in {"all", "*"}:
+        out = set()
+        for _n in list(_mock_toolsets.TOOLSETS.keys()):  # type: ignore[attr-defined]
+            out.update(_resolve_toolset(_n, set(_visited),
+                                        include_registry=include_registry))
+        return sorted(out)
+    if name in _visited:
+        return []
+    _visited = _visited | {name}
+    spec = _get_toolset(name, include_registry=include_registry)
+    if not isinstance(spec, dict):
+        return [name]
+    tools = list(spec.get("tools") or [])
+    for inc in spec.get("includes") or []:
+        tools.extend(_resolve_toolset(inc, _visited,
+                                      include_registry=include_registry))
+    return tools
+
+
+def _create_custom_toolset(name, description, tools=None, includes=None):  # type: ignore[no-untyped-def]
+    _mock_toolsets.TOOLSETS[name] = {  # type: ignore[attr-defined]
+        "description": description,
+        "tools": tools or [],
+        "includes": includes or [],
+    }
+
+
+_mock_toolsets.get_toolset = _get_toolset
+_mock_toolsets.resolve_toolset = _resolve_toolset
+_mock_toolsets.create_custom_toolset = _create_custom_toolset
+
+_real_toolsets_present = "toolsets" in sys.modules
+if not _real_toolsets_present:
     sys.modules["toolsets"] = _mock_toolsets
 
 
@@ -1528,6 +1551,7 @@ def test_runtime_custom_composite_through_real_caller(monkeypatch, tmp_path):
         _reg.register("safe_unique_tool", "safe-inner", {"type": "object"},
                       lambda *a, **k: "ok", override=True)
         # Collision: MCP server "search" shares name with static toolset "search"
+        _reg.register_toolset_alias("search", "mcp-search")
         _reg.register("search_mcp_tool", "mcp-search", {"type": "object"},
                       lambda *a, **k: "ok", override=True)
 
@@ -1607,6 +1631,15 @@ def test_runtime_custom_composite_through_real_caller(monkeypatch, tmp_path):
         )
         assert "beta_only_tool" not in final_tools, (
             f"unchecked beta-owned tool must be excluded, got {sorted(final_tools)!r}"
+        )
+        # Collision asserts: static "search" tools survive; aliased MCP "search" is excluded
+        search_tools = set(_ts_mod.resolve_toolset("search"))
+        assert search_tools.issubset(final_tools), (
+            f"static search tools {sorted(search_tools)} must survive collision, "
+            f"got {sorted(final_tools)!r}"
+        )
+        assert "search_mcp_tool" not in final_tools, (
+            f"colliding MCP search tool must be excluded, got {sorted(final_tools)!r}"
         )
     finally:
         _ts_mod.TOOLSETS.clear()
