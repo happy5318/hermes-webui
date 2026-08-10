@@ -101,6 +101,10 @@ if "tools" not in sys.modules or "tools.registry" not in sys.modules:
     def _mock_get_tool_to_toolset_map():
         return {e.name: e.toolset for e in _mock_registry._snapshot_entries()}
 
+    def _mock_get_entry(name):
+        return _mock_registry._tools.get(name)
+
+    _mock_registry.get_entry = _mock_get_entry
     _mock_registry.register = _mock_register
     _mock_registry.register_toolset_alias = _mock_register_toolset_alias
     _mock_registry.get_registered_toolset_names = _mock_get_registered_toolset_names
