@@ -23,7 +23,10 @@ These tests exercise the REAL helper used by the streaming worker
 the merge-vs-restrict decision is covered on the actual code path.
 """
 
+import importlib
 from pathlib import Path
+
+import pytest
 
 import api.streaming as streaming
 from api.streaming import _apply_session_toolset_override as _apply_override
@@ -50,8 +53,8 @@ REPO = Path(__file__).resolve().parents[1]
 import sys
 import types as _types
 
-# Snapshot prior state so stand-ins can be restored/removed after import.
-_prior_sys_modules = dict(sys.modules)
+# Sentinel for "attribute was absent" in the fixture's snapshot logic.
+_MISSING = object()
 
 
 # ── scoped registry stand-in ────────────────────────────────────────────────
@@ -114,15 +117,113 @@ _mock_registry.get_tool_names_for_toolset = _mock_get_tool_names_for_toolset
 _mock_registry.get_toolset_alias_target = _mock_get_toolset_alias_target
 _mock_registry.get_tool_to_toolset_map = _mock_get_tool_to_toolset_map
 
-# Only install when the real runtime is NOT already imported.
-_real_tools_present = "tools" in sys.modules and "tools.registry" in sys.modules
-if not _real_tools_present:
-    if "tools" not in sys.modules:
-        sys.modules["tools"] = _types.ModuleType("tools")
-    if "tools.registry" not in sys.modules:
-        _mock_registry_mod = _types.ModuleType("tools.registry")
-        _mock_registry_mod.registry = _mock_registry
-        sys.modules["tools.registry"] = _mock_registry_mod
+# ── scoped agent-less stand-in fixture ───────────────────────────────────────
+# Round-8 review finding 2: the previous version installed `tools`,
+# `tools.registry`, and `toolsets` stand-ins at MODULE IMPORT time with no
+# fixture/context-manager teardown, so the fake modules stayed process-global
+# for the rest of the pytest shard (and the now-deleted `_prior_sys_modules`
+# snapshot was never consumed).  It also decided availability by membership
+# (`"tools" in sys.modules`), which treats an importable-but-not-yet-imported
+# real runtime as unavailable and shadows it with a fake.
+#
+# This autouse fixture:
+#   1. attempts the REAL imports first,
+#   2. injects stand-ins only on genuine import failure,
+#   3. snapshots the exact prior presence/object identity of the three module
+#      entries plus the parent package's `registry` attribute,
+#   4. restores/deletes ONLY what the fixture changed after `yield`,
+#   5. asserts (teardown) that no fake remains after scope exit.
+
+
+@pytest.fixture(autouse=True)
+def _agentless_runtime_standins():
+    """Install `tools` / `tools.registry` / `toolsets` stand-ins ONLY when the
+    real hermes-agent runtime cannot be imported, scoped to the current test,
+    and restore the exact prior state afterwards.
+
+    The additive branch of `_apply_session_toolset_override` consults
+    `_builtin_toolset_names()`, which does ``import toolsets`` /
+    ``from tools.registry import registry``.  Those modules ship with the
+    hermes-agent runtime, which is NOT installed in the WebUI CI test
+    environment — the import fails and the helper returns None, which
+    fail-closes the additive path into dropping every builtin toolset
+    ("web must survive" assertions would break on every CI shard).
+    """
+    # 1/2. Attempt real imports FIRST — only a genuine failure may inject.
+    try:
+        importlib.import_module("toolsets")
+        _real_toolsets = True
+    except Exception:
+        _real_toolsets = False
+    try:
+        importlib.import_module("tools.registry")
+        _real_registry = True
+    except Exception:
+        _real_registry = False
+
+    # 3. Snapshot prior presence/object identity of everything we may touch:
+    #    the three module entries plus the parent package's `registry` attr.
+    _tools_mod = sys.modules.get("tools")
+    _prior = {
+        "tools": sys.modules.get("tools"),
+        "tools.registry": sys.modules.get("tools.registry"),
+        "toolsets": sys.modules.get("toolsets"),
+        "tools.registry_attr": (
+            getattr(_tools_mod, "registry", _MISSING)
+            if _tools_mod is not None else _MISSING
+        ),
+    }
+    # (module_key, prior_value, injected_object) — injected_object recorded so
+    # the teardown assertion can prove the exact fake is gone.
+    _changed = []
+
+    try:
+        # 2. Inject ONLY on genuine import failure.
+        if not _real_toolsets and "toolsets" not in sys.modules:
+            sys.modules["toolsets"] = _mock_toolsets
+            _changed.append(("toolsets", _prior["toolsets"], _mock_toolsets))
+        if not _real_registry:
+            if "tools" not in sys.modules:
+                _tools_fake = _types.ModuleType("tools")
+                sys.modules["tools"] = _tools_fake
+                _changed.append(("tools", _prior["tools"], _tools_fake))
+            if "tools.registry" not in sys.modules:
+                _mock_registry_mod = _types.ModuleType("tools.registry")
+                _mock_registry_mod.registry = _mock_registry  # type: ignore[attr-defined]
+                sys.modules["tools.registry"] = _mock_registry_mod
+                _changed.append(("tools.registry", _prior["tools.registry"],
+                                 _mock_registry_mod))
+        yield
+    finally:
+        # 4. Restore/delete ONLY what this fixture changed.  Entries that
+        #    existed before (real or injected by somebody else) are untouched.
+        for _key, _prior_val, _injected_obj in reversed(_changed):
+            if _prior_val is None:
+                sys.modules.pop(_key, None)
+            else:
+                sys.modules[_key] = _prior_val
+        # If the parent package predated us, restore its registry attribute
+        # (we never set it, but restore defensively to the snapshot).
+        _parent = sys.modules.get("tools")
+        _prior_attr = _prior["tools.registry_attr"]
+        if _parent is not None:
+            if _prior_attr is not _MISSING:
+                _parent.registry = _prior_attr  # type: ignore[attr-defined]
+            elif hasattr(_parent, "registry") and _prior["tools"] is None:
+                # We created the parent; drop the attr we never set.
+                delattr(_parent, "registry")
+        # 5. Teardown assertion: no fake remains after scope exit.  Every
+        #    object this fixture injected must no longer be in sys.modules;
+        #    anything that was already there must still be there, unchanged.
+        for _key, _prior_val, _injected_obj in _changed:
+            _entry = sys.modules.get(_key)
+            assert _entry is not _injected_obj, (
+                f"stand-in fixture must remove injected {_key} after scope exit"
+            )
+            if _prior_val is not None:
+                assert _entry is _prior_val, (
+                    f"stand-in fixture must restore pre-existing {_key} unchanged"
+                )
 
 # ── scoped toolsets stand-in ────────────────────────────────────────────────
 _mock_toolsets = _types.ModuleType("toolsets")
@@ -216,10 +317,6 @@ def _create_custom_toolset(name, description, tools=None, includes=None):  # typ
 _mock_toolsets.get_toolset = _get_toolset
 _mock_toolsets.resolve_toolset = _resolve_toolset
 _mock_toolsets.create_custom_toolset = _create_custom_toolset
-
-_real_toolsets_present = "toolsets" in sys.modules
-if not _real_toolsets_present:
-    sys.modules["toolsets"] = _mock_toolsets
 
 
 # ── Behavioural tests for the merge-vs-restrict decision ─────────────────────
@@ -1554,6 +1651,36 @@ def test_runtime_custom_composite_through_real_caller(monkeypatch, tmp_path):
         _reg.register_toolset_alias("search", "mcp-search")
         _reg.register("search_mcp_tool", "mcp-search", {"type": "object"},
                       lambda *a, **k: "ok", override=True)
+        # Exact-static overlay canary (round-8 finding 3): a unique tool
+        # registered under the exact static owner "search" (NOT the aliased
+        # mcp-search) must survive resolution, proving the installed
+        # static-first-overlay merge order is real.  Reverting the stand-in
+        # to a static-only return must make this assertion fail.
+        _reg.register("search_static_owned_tool", "search", {"type": "object"},
+                      lambda *a, **k: "ok", override=True)
+
+        # ── Round-8 finding 1: the collision seed must be assertion-relevant ──
+        # These checks run BEFORE driving the caller and prove the collision
+        # setup is actually installed.  Deleting or no-oping the
+        # `search -> mcp-search` alias registration below must turn the test
+        # RED — the final `search_mcp_tool not in final_tools` assertion alone
+        # is too easy to satisfy when the seed is absent.
+        _alias_target = _reg.get_toolset_alias_target("search")
+        assert _alias_target == "mcp-search", (
+            f"collision seed must alias search -> mcp-search, got {_alias_target!r}"
+        )
+        _mcp_search_tools = set(_reg.get_tool_names_for_toolset("mcp-search"))
+        assert "search_mcp_tool" in _mcp_search_tools, (
+            f"canonical mcp-search must own the unique MCP canary, got {sorted(_mcp_search_tools)!r}"
+        )
+        # Non-static alias positive control: `gate-alpha` is NOT a static
+        # toolset, so resolving it must take the alias -> mcp-gate-alpha path
+        # and surface alpha_tool.  This proves the alias activation path is
+        # genuinely live (not just the static-first branch being exercised).
+        _gate_alpha_resolved = set(_ts_mod.resolve_toolset("gate-alpha"))
+        assert "alpha_tool" in _gate_alpha_resolved, (
+            f"non-static alias gate-alpha must resolve alpha_tool, got {sorted(_gate_alpha_resolved)!r}"
+        )
 
         sid = "runtime-composed"
         stream_id = "runtime-composed-stream"
@@ -1632,7 +1759,8 @@ def test_runtime_custom_composite_through_real_caller(monkeypatch, tmp_path):
         assert "beta_only_tool" not in final_tools, (
             f"unchecked beta-owned tool must be excluded, got {sorted(final_tools)!r}"
         )
-        # Collision asserts: static "search" tools survive; aliased MCP "search" is excluded
+        # Collision asserts: static "search" tools survive; aliased MCP
+        # "search" is excluded.
         search_tools = set(_ts_mod.resolve_toolset("search"))
         assert search_tools.issubset(final_tools), (
             f"static search tools {sorted(search_tools)} must survive collision, "
@@ -1640,6 +1768,20 @@ def test_runtime_custom_composite_through_real_caller(monkeypatch, tmp_path):
         )
         assert "search_mcp_tool" not in final_tools, (
             f"colliding MCP search tool must be excluded, got {sorted(final_tools)!r}"
+        )
+        # Round-8 finding 3: the exact-static overlay canary — a unique tool
+        # registered under the static owner "search" (not the aliased
+        # mcp-search) — must survive into the resolved tool set.  This proves
+        # the installed static-first-overlay merge order is genuinely active;
+        # a stand-in that returns static-only (no registry overlay) would fail
+        # here.
+        assert "search_static_owned_tool" in search_tools, (
+            f"exact-static overlay must merge registry tools under 'search', "
+            f"got {sorted(search_tools)!r}"
+        )
+        assert "search_static_owned_tool" in final_tools, (
+            f"exact-static overlay canary must survive into final tools, "
+            f"got {sorted(final_tools)!r}"
         )
     finally:
         _ts_mod.TOOLSETS.clear()
