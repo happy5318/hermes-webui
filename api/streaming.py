@@ -8002,8 +8002,10 @@ def _canonicalize_picker_mcp_selection(name, mcp_server_names):
         target = _reg.get_toolset_alias_target(name)
         if target == canonical:
             return canonical
-        if canonical in set(_reg.get_registered_toolset_names()):
-            return canonical
+        # A registered canonical name that is present in the registry but is NOT
+        # owned by this configured server (its alias edge does not resolve here)
+        # must NOT be emitted — ownership is unproven, and returning it would
+        # silently select the wrong server's tools.
     except Exception:
         return None  # cannot prove ownership → fail closed
     return None
@@ -8155,7 +8157,12 @@ def _apply_session_toolset_override(defaults, override, mcp_server_names,
     # know which names are shadowed by a builtin, so we cannot safely classify
     # any override name as a pure MCP tick. Fail closed to restrict.
     if builtin_names is None:
-        return list(override)
+        # Registry unavailable — cannot verify MCP ownership for any selector.
+        # Drop only dangerous selectors that silently expand to many unchecked
+        # tools (gate-certified SILENT: offline server named "all" → 91 tools).
+        # Bare names are safe to keep: either builtin-shadowed (resolver picks
+        # the builtin) or an intentional restrictive user selection.
+        return [n for n in override if n not in {'all', '*'} and not n.startswith('mcp-')]
     builtin_names = set(builtin_names)
 
     # ── Owned-canonical exclusion (round-11 gate fix) ────────────────────
@@ -8192,7 +8199,7 @@ def _apply_session_toolset_override(defaults, override, mcp_server_names,
         override_targets = _canonicalize_override_targets(
             override, mcp_server_names)
         if override_targets is None:
-            return list(override)
+            return []  # cannot prove ownership → fully restrictive fail-closed
         # Additive to builtins/plugins but RESTRICTIVE over MCP servers:
         # keep the profile defaults except every configured MCP-server
         # toolset, then add back only the checked subset.  Merging ALL
