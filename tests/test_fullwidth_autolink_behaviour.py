@@ -115,7 +115,7 @@ class TestAutolinkOuterParagraphPass:
     @pytest.mark.parametrize("mark", CJK_TRAILING_MARKS)
     def test_cjk_trailing_mark_stripped_and_visible_after_anchor(self, driver_path, mark):
         out = _render(driver_path, f"See https://example.com{mark}")
-        assert f'href="https://example.com"' in out, (
+        assert 'href="https://example.com"' in out, (
             f"CJK mark {mark!r} must not enter href. Got: {out!r}"
         )
         assert f'href="https://example.com{mark}"' not in out, (
@@ -128,7 +128,7 @@ class TestAutolinkOuterParagraphPass:
     @pytest.mark.parametrize("mark", ASCII_TRAILING_MARKS)
     def test_ascii_trailing_mark_stripped_and_visible_after_anchor(self, driver_path, mark):
         out = _render(driver_path, f"See https://example.com{mark}")
-        assert f'href="https://example.com"' in out, (
+        assert 'href="https://example.com"' in out, (
             f"ASCII mark {mark!r} must not enter href. Got: {out!r}"
         )
         assert f'href="https://example.com{mark}"' not in out
@@ -170,7 +170,7 @@ class TestAutolinkInlinePass:
     @pytest.mark.parametrize("mark", CJK_TRAILING_MARKS)
     def test_list_item_cjk_mark_stripped(self, driver_path, mark):
         out = _render(driver_path, f"- See https://example.com{mark}")
-        assert f'href="https://example.com"' in out, (
+        assert 'href="https://example.com"' in out, (
             f"Inline pass leaked CJK mark {mark!r} into href. Got: {out!r}"
         )
         assert f'href="https://example.com{mark}"' not in out
@@ -179,7 +179,7 @@ class TestAutolinkInlinePass:
     @pytest.mark.parametrize("mark", CJK_TRAILING_MARKS)
     def test_blockquote_cjk_mark_stripped(self, driver_path, mark):
         out = _render(driver_path, f"> See https://example.com{mark}")
-        assert f'href="https://example.com"' in out, (
+        assert 'href="https://example.com"' in out, (
             f"Inline pass leaked CJK mark {mark!r} into href. Got: {out!r}"
         )
         assert f'href="https://example.com{mark}"' not in out
