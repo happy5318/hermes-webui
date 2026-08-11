@@ -774,28 +774,91 @@ def _patch_registry_and_get_builtin_names(monkeypatch, registered_names):
                 sys.modules.pop(_mod_name, None)
 
 
-def test_mcp_canonical_name_collision_restricts(monkeypatch):
-    """When MCP servers ``alpha`` and ``mcp-alpha`` coexist, the bare token
-    ``mcp-alpha`` (submitted by the picker for the second server) collides with
-    the *canonical* name ``mcp-alpha`` (owned by the first server).  The
-    override must restrict — not flip additive, which would restore defaults
-    and let the runtime resolver match server ``alpha`` instead of the
-    intended ``mcp-alpha``.
+def test_mcp_canonical_name_collision_selects_owned_server(monkeypatch):
+    """When MCP servers ``alpha`` and ``mcp-alpha`` coexist, the picker
+    token ``mcp-alpha`` (server ``mcp-alpha``'s bare name) collides with the
+    *canonical* name ``mcp-alpha`` (owned by server ``alpha``).  The
+    override must ADDITIVELY emit the selected server's TRUE canonical
+    ``mcp-mcp-alpha`` (proven via the live alias edge ``mcp-alpha ->
+    mcp-mcp-alpha``) — never bare ``mcp-alpha``, which the runtime resolver
+    would match to server ``alpha`` (gate-certified SILENT).
 
-    The shadow set is obtained from the real ``_builtin_toolset_names()``
-    (monkeypatched registry), not hand-constructed, so the test exercises the
-    actual enumeration path and would fail if the old ``mcp-*`` filtering were
-    restored."""
+    Production-composed: ``builtin_names`` is NOT injected.  The real
+    ``_builtin_toolset_names()`` collector runs, so ``mcp-alpha`` and
+    ``mcp-mcp-alpha`` are both present in the broad registered-name shadow
+    set — the round-11 fix must exclude OWNED canonicals (alias-edge
+    proven) before the MCP-only test, or the token is wrongly restricted.
+    """
+    import toolsets as _ts_mod
+    from tools.registry import registry as _reg
+
+    _saved_toolsets = dict(_ts_mod.TOOLSETS)
+    _saved_tools = dict(_reg._tools)
+    _saved_aliases = dict(_reg._toolset_aliases)
+
+    try:
+        # Server "alpha" → canonical mcp-alpha
+        _ts_mod.create_custom_toolset("alpha", "server alpha",
+                                      tools=[], includes=[])
+        _reg.register_toolset_alias("alpha", "mcp-alpha")
+        _reg.register("alpha_owned_tool", "mcp-alpha", {"type": "object"},
+                      lambda *a, **k: "ok", override=True)
+        # Server "mcp-alpha" → canonical mcp-mcp-alpha
+        _ts_mod.create_custom_toolset("mcp-alpha", "server mcp-alpha",
+                                      tools=[], includes=[])
+        _reg.register_toolset_alias("mcp-alpha", "mcp-mcp-alpha")
+        _reg.register("mcp_alpha_owned_tool", "mcp-mcp-alpha",
+                      {"type": "object"},
+                      lambda *a, **k: "ok", override=True)
+
+        # Seed-assertion relevance: prove the collision edges are live
+        # BEFORE driving the classifier (round-8 rule).
+        assert _reg.get_toolset_alias_target("alpha") == "mcp-alpha"
+        assert _reg.get_toolset_alias_target("mcp-alpha") == "mcp-mcp-alpha"
+
+        result = _apply_override(
+            ["web", "file", "terminal", "delegation"], ["mcp-alpha"],
+            {"alpha", "mcp-alpha"}, builtin_names=None)
+
+        assert "mcp-alpha" not in result, (
+            f"ambiguous bare 'mcp-alpha' must never survive, got {result!r}"
+        )
+        assert "mcp-mcp-alpha" in result, (
+            f"selected server's true canonical must be emitted, got {result!r}"
+        )
+        assert "web" in result, f"builtin web must survive, got {result!r}"
+        resolved = set(_ts_mod.resolve_toolset("mcp-mcp-alpha"))
+        assert "mcp_alpha_owned_tool" in resolved, (
+            f"mcp-mcp-alpha must resolve the SELECTED server's tools, "
+            f"got {sorted(resolved)!r}"
+        )
+        assert "alpha_owned_tool" not in resolved, (
+            f"wrong server's tools must not resolve, got {sorted(resolved)!r}"
+        )
+    finally:
+        _ts_mod.TOOLSETS.clear()
+        _ts_mod.TOOLSETS.update(_saved_toolsets)
+        _reg._tools.clear()
+        _reg._tools.update(_saved_tools)
+        _reg._toolset_aliases.clear()
+        _reg._toolset_aliases.update(_saved_aliases)
+
+
+def test_canonical_collision_without_alias_edge_fails_closed(monkeypatch):
+    """Negative control: when the registry exposes a canonical name (e.g.
+    ``mcp-alpha``) but NO live alias edge proves it is owned by a configured
+    MCP server, ownership cannot be proved → the broad shadow set keeps it
+    and the override fails closed to restrict.  This is the fail-closed
+    contract: an unprovable canonical must never flip additive and leak the
+    wrong server's tools.
+
+    Uses the real ``_builtin_toolset_names()`` (monkeypatched registry),
+    not a hand-constructed shadow set."""
     builtin = _patch_registry_and_get_builtin_names(
         monkeypatch, ["mcp-alpha", "mcp-mcp-alpha"])
 
-    # Canonical ``mcp-alpha`` (from server ``alpha``) must be in the shadow
-    # set so the bare token ``mcp-alpha`` (from server ``mcp-alpha``) collides.
     assert "mcp-alpha" in builtin, (
         "canonical 'mcp-alpha' must be in the shadow set (got {})".format(builtin)
-    )
-    assert "mcp-mcp-alpha" in builtin, (
-        "canonical 'mcp-mcp-alpha' must be in the shadow set"
     )
 
     result = _apply_override(
@@ -803,8 +866,8 @@ def test_mcp_canonical_name_collision_restricts(monkeypatch):
         {"alpha", "mcp-alpha"}, builtin_names=builtin)
 
     assert result == ["mcp-alpha"], (
-        "bare token 'mcp-alpha' collides with canonical 'mcp-alpha' from "
-        "server 'alpha' — must RESTRICT, not flip additive (got {})".format(result)
+        "no alias edge → ownership unprovable → must RESTRICT, "
+        "got {!r}".format(result)
     )
 
 
@@ -1904,7 +1967,14 @@ def test_canonical_collision_mcp_alpha_selects_right_server(monkeypatch):
     """With servers ``alpha`` AND ``mcp-alpha`` configured, selecting
     ``mcp-alpha`` must emit ``mcp-mcp-alpha`` (the selected server's true
     canonical), NOT the bare ``mcp-alpha`` which collides with server
-    ``alpha``'s canonical toolset (gate-certified SILENT defect 2)."""
+    ``alpha``'s canonical toolset (gate-certified SILENT defect 2).
+
+    Production-composed: ``builtin_names`` is NOT injected — the real
+    ``_builtin_toolset_names()`` collector runs, so the broad shadow set
+    contains BOTH ``mcp-alpha`` and ``mcp-mcp-alpha``.  The round-11
+    owned-canonical exclusion must remove them (alias-edge proven) before
+    the MCP-only test, or ``mcp-alpha`` would be wrongly restricted and the
+    canonicalizer branch never reached (the round-10 blocker)."""
     import toolsets as _ts_mod
     from tools.registry import registry as _reg
 
@@ -1925,11 +1995,16 @@ def test_canonical_collision_mcp_alpha_selects_right_server(monkeypatch):
         _reg.register("mcp_alpha_owned_tool", "mcp-mcp-alpha", {"type": "object"},
                       lambda *a, **k: "ok", override=True)
 
+        # Seed-assertion relevance (round-8 rule): prove the alias edges are
+        # live BEFORE driving the classifier.
+        assert _reg.get_toolset_alias_target("alpha") == "mcp-alpha"
+        assert _reg.get_toolset_alias_target("mcp-alpha") == "mcp-mcp-alpha"
+
         defaults = ["web"]
         override = ["mcp-alpha"]
         mcp_servers = {"alpha", "mcp-alpha"}
         result = _apply_override(defaults, override, mcp_servers,
-                                 builtin_names={"web", "file", "terminal"})
+                                 builtin_names=None)
 
         assert "mcp-alpha" not in result, (
             f"ambiguous bare mcp-alpha must never survive, got {result!r}"
@@ -1937,6 +2012,7 @@ def test_canonical_collision_mcp_alpha_selects_right_server(monkeypatch):
         assert "mcp-mcp-alpha" in result, (
             f"true canonical mcp-mcp-alpha must be emitted, got {result!r}"
         )
+        assert "web" in result, f"builtin web must survive, got {result!r}"
         resolved = set(_ts_mod.resolve_toolset("mcp-mcp-alpha"))
         assert "mcp_alpha_owned_tool" in resolved, (
             f"mcp-mcp-alpha must resolve the SELECTED server's tools, "

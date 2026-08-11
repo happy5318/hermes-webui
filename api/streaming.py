@@ -6701,15 +6701,49 @@ def _canonicalize_picker_mcp_selection(name, mcp_server_names):
     return None
 
 
+def _registry_alias_target(name):
+    """Return the alias target for *name* from the live registry, or ``None``
+    when the registry is unavailable (cannot prove ownership → fail closed).
+
+    Used to distinguish a registered canonical that is OWNED by a configured
+    MCP server (``get_toolset_alias_target`` resolves it) from a genuine
+    static/plugin name that merely shares the ``mcp-`` prefix.  Only the
+    latter shadows an MCP alias; the former is the server's own registry
+    identity and must not discard the server's bare picker token.
+    """
+    try:
+        from tools.registry import registry as _reg
+        return _reg.get_toolset_alias_target(name)
+    except Exception:
+        return None
+
+
 def _canonicalize_override_targets(override, mcp_server_names):
-    """Map every override entry through :func:`_canonicalize_picker_mcp_selection`,
-    dropping entries whose ownership cannot be proved (fail closed)."""
+    """Map every configured-MCP-server override entry to an unambiguous
+    registry target via the live alias/ownership edges.
+
+    A picker-derived MCP selection (a name in ``mcp_server_names``) is
+    canonicalized through ``_canonicalize_picker_mcp_selection`` so that
+    MCP-vs-MCP canonical collisions (e.g. server ``mcp-alpha`` whose bare
+    token equals server ``alpha``'s canonical ``mcp-alpha``) are resolved
+    to the selected server's true target (``mcp-mcp-alpha``) *before* the
+    broad registered-name shadow set can discard them.
+
+    Returns ``None`` when any configured-MCP-server selection's ownership
+    cannot be proved (registry unavailable / no alias edge) — the caller
+    must fail closed to restrictive semantics rather than silently drop
+    the selection.  Non-MCP (free-text) names pass through unchanged; the
+    caller decides restrict semantics for them.
+    """
     out = []
     for _n in override or []:
-        _t = _canonicalize_picker_mcp_selection(_n, mcp_server_names)
-        if _t is None:
-            continue
-        out.append(_t)
+        if _n in mcp_server_names:
+            _t = _canonicalize_picker_mcp_selection(_n, mcp_server_names)
+            if _t is None:
+                return None  # cannot prove ownership → fail closed
+            out.append(_t)
+        else:
+            out.append(_n)  # free-text / non-MCP — caller decides
     return out
 
 
@@ -6768,6 +6802,19 @@ def _apply_session_toolset_override(defaults, override, mcp_server_names,
     Each surviving default is expanded via ``resolve_toolset`` and any tool
     registered under ``mcp-<server>`` where ``<server>`` is not in the override
     causes that default to be dropped.
+
+    Owned-canonical exclusion (round-11 gate fix): ``_builtin_toolset_names()``
+    unions every registered canonical name, including ``mcp-<server>`` entries.
+    A registered canonical that is OWNED by a configured MCP server (proven via
+    its live alias edge ``get_toolset_alias_target``) is the server's own
+    registry name, NOT a static/plugin shadow.  Keeping it in the shadow set
+    makes server ``mcp-alpha``'s bare picker token collide with server
+    ``alpha``'s canonical ``mcp-alpha``: ``pure_mcp`` drops the token, the
+    additive branch is skipped, and the canonicalizer never runs — so the
+    resolver picks the WRONG server's tools.  Owned canonicals are excluded
+    from the shadow set before the MCP-only test; true static/plugin shadows
+    (e.g. a plugin literally named ``mcp-browser``) stay restrictive because
+    their names have no alias edge back to a configured server.
     """
     # Absence and the intentional empty list are the only signals that mean
     # "no override" — preserve the profile defaults.
@@ -6802,13 +6849,42 @@ def _apply_session_toolset_override(defaults, override, mcp_server_names,
     if builtin_names is None:
         return list(override)
     builtin_names = set(builtin_names)
-    # Only names that are MCP servers AND not shadowed by a builtin count as a
-    # pure "enable this server" tick.
-    pure_mcp = mcp_server_names - builtin_names
+
+    # ── Owned-canonical exclusion (round-11 gate fix) ────────────────────
+    # ``_builtin_toolset_names()`` unions every REGISTERED canonical name,
+    # including ``mcp-<server>`` entries.  A registered canonical that is
+    # OWNED by a configured MCP server (proven via its live alias edge) is
+    # the server's own registry identity, NOT a static/plugin shadow.
+    # Keeping it in the shadow set makes server ``mcp-alpha``'s bare picker
+    # token collide with server ``alpha``'s canonical ``mcp-alpha``:
+    # ``pure_mcp`` drops the token, the additive branch is skipped, and the
+    # canonicalizer never runs — so the resolver picks the WRONG server's
+    # tools (gate-certified SILENT).  Exclude owned canonicals from the
+    # shadow set before the MCP-only test; true static/plugin shadows (e.g.
+    # a plugin literally named ``mcp-browser``) stay restrictive because
+    # their names have no alias edge back to a configured server.
+    owned_canonicals = set()
+    for _srv in mcp_server_names:
+        _t = _registry_alias_target(_srv)
+        if _t:
+            owned_canonicals.add(_t)
+    true_shadow = builtin_names - owned_canonicals
+    # Only names that are MCP servers AND not shadowed by a true
+    # static/plugin builtin count as a pure "enable this server" tick.
+    pure_mcp = mcp_server_names - true_shadow
     override_only_mcp = bool(pure_mcp) and all(
         name in pure_mcp for name in override
     )
     if override_only_mcp:
+        # Canonicalize every override entry ONCE, before the merge.  A None
+        # result means a configured-MCP-server selection's ownership cannot
+        # be proved (registry unavailable / no alias edge) — fail closed to
+        # restrict rather than emit an ambiguous token that could resolve
+        # the wrong server's tools.
+        override_targets = _canonicalize_override_targets(
+            override, mcp_server_names)
+        if override_targets is None:
+            return list(override)
         # Additive to builtins/plugins but RESTRICTIVE over MCP servers:
         # keep the profile defaults except every configured MCP-server
         # toolset, then add back only the checked subset.  Merging ALL
@@ -6827,7 +6903,7 @@ def _apply_session_toolset_override(defaults, override, mcp_server_names,
         # under that name).
         mcp_strip = set()
         for _srv in mcp_server_names:
-            if _srv not in builtin_names:
+            if _srv not in true_shadow:
                 mcp_strip.add(_srv)
             mcp_strip.add('mcp-' + _srv)
         # Wildcards/composites in defaults (e.g. ``all``, ``*``)
@@ -6878,25 +6954,25 @@ def _apply_session_toolset_override(defaults, override, mcp_server_names,
             # empty includes list could enter the set and bypass the
             # ownership check, re-exposing unchecked MCP tools.
             if _default_transitively_reaches_unchecked_mcp(
-                    d, unchecked_mcp, builtin_names):
+                    d, unchecked_mcp, true_shadow):
                 continue  # composite that pulls in an unchecked MCP server
             merged.append(d)
         seen = set(merged)
-        for name in override:
+        for name in override_targets:
             # Canonicalize picker-derived MCP selections to a verified,
             # unambiguous registry target (gate-certified BRICK/SILENT):
             # a bare server named "all"/"*" would be treated as a wildcard
             # by the resolver (RecursionError), and a server named
             # "mcp-alpha" collides with the canonical toolset of a server
             # named "alpha" (wrong server's tools).  Emit the canonical
-            # "mcp-<name>" target instead; drop the selection when
-            # ownership cannot be proved (fail closed).
-            target = _canonicalize_picker_mcp_selection(name, mcp_server_names)
-            if target is None:
+            # "mcp-<name>" target instead; a None from the canonicalizer
+            # means ownership cannot be proved → fail closed (drop the
+            # selection rather than emit an ambiguous token).
+            if name is None:
                 continue
-            if target not in seen:
-                merged.append(target)
-                seen.add(target)
+            if name not in seen:
+                merged.append(name)
+                seen.add(name)
         return merged
     # Restrict branch: power-user free-text override.  Names here are
     # literal toolset selections (a bare "all"/"*" is the user's explicit
