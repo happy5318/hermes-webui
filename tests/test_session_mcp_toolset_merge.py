@@ -1121,6 +1121,80 @@ def test_wildcard_all_ok_when_all_mcp_checked():
     )
 
 
+def test_wildcard_default_with_selected_server_named_all(monkeypatch):
+    """Combined regression (round-15): profile defaults contain the wildcard
+    ``all`` AND the user ticks a configured server literally named ``all``
+    while an unchecked sibling server exists.
+
+    The wildcard-default early return must emit the VERIFIED canonical
+    target ``mcp-all`` (from canonicalization), never the raw override
+    ``all``: the resolver expands raw ``all`` to every registered toolset,
+    silently re-exposing the unchecked sibling's tools (gate-certified
+    SILENT).  Round-14 changed this path from ``list(override)`` to
+    ``list(override_targets)`` — this test is RED against the raw-return
+    form.
+    """
+    import toolsets as _ts_mod
+    from tools.registry import registry as _reg
+
+    _saved_toolsets = dict(_ts_mod.TOOLSETS)
+    _saved_tools = dict(_reg._tools)
+    _saved_aliases = dict(_reg._toolset_aliases)
+
+    try:
+        # Server literally named "all" → canonical mcp-all.
+        _ts_mod.create_custom_toolset("all", "server literally named all",
+                                      tools=[], includes=[])
+        _reg.register_toolset_alias("all", "mcp-all")
+        _reg.register("all_tool", "mcp-all", {"type": "object"},
+                      lambda *a, **k: "ok", override=True)
+        # Unchecked sibling server "other" → canonical mcp-other.
+        _ts_mod.create_custom_toolset("other", "unchecked sibling",
+                                      tools=[], includes=[])
+        _reg.register_toolset_alias("other", "mcp-other")
+        _reg.register("other_tool", "mcp-other", {"type": "object"},
+                      lambda *a, **k: "ok", override=True)
+
+        # Seed-assertion relevance: prove the alias edges are live.
+        assert _reg.get_toolset_alias_target("all") == "mcp-all"
+        assert _reg.get_toolset_alias_target("other") == "mcp-other"
+
+        defaults = ["all"]  # wildcard default present
+        override = ["all"]  # tick the server named all
+        mcp_servers = {"all", "other"}
+        result = _apply_override(
+            defaults, override, mcp_servers,
+            builtin_names={"web", "file", "terminal"},
+        )
+
+        # The raw wildcard must never survive — the verified canonical is
+        # emitted instead.
+        assert "all" not in result, (
+            f"raw wildcard 'all' must never survive, got {result!r}"
+        )
+        assert "mcp-all" in result, (
+            f"verified canonical mcp-all must be emitted, got {result!r}"
+        )
+        # Resolve every returned selector: only the ticked server's tools
+        # may appear; the unchecked sibling must stay out.
+        final_tools = set()
+        for name in result:
+            final_tools.update(_ts_mod.resolve_toolset(name))
+        assert "all_tool" in final_tools, (
+            f"ticked server's tools must resolve, got {sorted(final_tools)!r}"
+        )
+        assert "other_tool" not in final_tools, (
+            f"unchecked sibling's tools must not resolve, got {sorted(final_tools)!r}"
+        )
+    finally:
+        _ts_mod.TOOLSETS.clear()
+        _ts_mod.TOOLSETS.update(_saved_toolsets)
+        _reg._tools.clear()
+        _reg._tools.update(_saved_tools)
+        _reg._toolset_aliases.clear()
+        _reg._toolset_aliases.update(_saved_aliases)
+
+
 def test_canonical_selector_not_stripped_when_no_mcp_server():
     """A default ``mcp-foo`` with no configured MCP server named ``foo`` is a
     user-authored canonical name that should be preserved (it's not an MCP
@@ -1207,21 +1281,26 @@ def test_malformed_override_mixed_entries_fails_closed():
     restore all defaults.
 
     Round-14 fix: malformed override drops wildcards and mcp-* selectors.
+    Round-15 fix: assert the EXACT restrictive output again — the previous
+    ``"web" in result or "alpha" in result`` disjunct also passes the
+    fail-open output containing every profile default, so the assertion
+    could not catch a regression that restored defaults.
     """
     defaults = ["web", "file", "terminal", "alpha", "beta"]
     override = ["alpha", {"stale": "shape"}, "beta"]
 
     result = _apply_override(defaults, override, {"alpha", "beta"})
 
-    # Malformed entry dropped; alpha/beta are MCP servers → additive branch
-    # But they get canonicalized, so result should be builtins + canonicalized
-    # In this test context without registry, they pass through as bare names
-    # since pure_mcp test passes and canonicalization happens.
-    # The critical assertion: defaults are NOT restored (no fail-open).
-    assert "web" in result or "alpha" in result, (
-        f"valid entries should be processed, got {result!r}"
+    # The malformed branch sanitizes in place and returns BEFORE any
+    # additive/restrict classification (api/streaming.py), so the valid
+    # strings survive untouched and nothing else is added.
+    assert result == ["alpha", "beta"], (
+        f"malformed override must return the exact string-only list, got {result!r}"
     )
-    assert {"stale": "shape"} not in result, "malformed entries must be filtered"
+    # Profile BUILTIN defaults must NOT be restored (no fail-open).
+    assert "web" not in result and "file" not in result and "terminal" not in result, (
+        f"defaults must NOT be restored on malformed override (fail-open), got {result!r}"
+    )
     # No dangerous selectors (all, *, mcp-*) should survive
     assert "all" not in result and "*" not in result, (
         f"dangerous selectors must be dropped, got {result!r}"
@@ -2258,30 +2337,121 @@ def test_malformed_mcp_server_names_returns_empty():
 
 
 def test_exact_alias_match_required_for_ownership(monkeypatch):
-    """An alias target that does NOT exactly match 'mcp-{server}' is NOT
-    ownership proof — mismatched alias must not remove from shadow set.
+    """A mismatched alias target is NOT ownership proof: the falsely claimed
+    canonical must remain a real shadow, and every selector the merge
+    returns must resolve none of the wrong owner's tools.
+
+    Coupled canonical-collision shape (round-11 fix-spec): servers ``alpha``
+    and ``mcp-alpha`` are both configured; server ``mcp-alpha``'s picker
+    token collides with server ``alpha``'s canonical ``mcp-alpha``.  A
+    plugin owns the canonical ``mcp-wrong`` (``wrong_tool``, no alias edge)
+    and a third server is literally named ``mcp-wrong``, so the mismatched
+    probe target IS present in the broad shadow set.
+
+    The ownership probe for server ``mcp-alpha`` falsely returns
+    ``mcp-wrong`` (its true edge is ``mcp-mcp-alpha``).  The OLD
+    truthy-target code accepted that false edge as ownership proof and
+    removed the plugin's ``mcp-wrong`` canonical from the shadow set —
+    which let BOTH mcp-* ticks flow into the additive branch and resolve.
+    The exact-match check keeps ``mcp-wrong`` a real shadow, so server
+    ``mcp-wrong``'s tick no longer counts as pure MCP and the mixed
+    override falls to the restrict branch, where the ambiguous picker
+    token must be dropped (round-15 restrict fix) instead of re-interpreted
+    as server ``alpha``'s canonical.  Net effect: no returned selector may
+    resolve the wrong-owner tools (``wrong_tool``, ``alpha_tool``) or the
+    ambiguously-owned ticks (``mcp_alpha_tool``, ``mcp_wrong_tool``).
 
     Round-14 fix: require _t == f"mcp-{_srv}" for ownership.
+    Round-15 fix: resolve every returned selector and prove the wrong-owner
+    tools are absent (the restrict branch must drop a picker token that is
+    itself a configured server's bare name).
     """
-    # Simulate a mismatched alias: alpha -> mcp-wrong (not mcp-alpha)
-    def _fake_alias_target(name):
-        if name == "alpha":
-            return "mcp-wrong"  # mismatched
-        return None
+    import toolsets as _ts_mod
+    from tools.registry import registry as _reg
 
-    monkeypatch.setattr(
-        "api.streaming._registry_alias_target", _fake_alias_target
-    )
+    _saved_toolsets = dict(_ts_mod.TOOLSETS)
+    _saved_tools = dict(_reg._tools)
+    _saved_aliases = dict(_reg._toolset_aliases)
 
-    defaults = ["web", "file", "terminal"]
-    override = ["alpha"]
-    mcp_names = {"alpha"}
-    builtin = {"web", "file", "terminal", "mcp-alpha"}  # mcp-alpha in shadow
+    try:
+        # Server "alpha" → canonical mcp-alpha (alpha_tool).
+        _ts_mod.create_custom_toolset("alpha", "server alpha",
+                                      tools=[], includes=[])
+        _reg.register_toolset_alias("alpha", "mcp-alpha")
+        _reg.register("alpha_tool", "mcp-alpha", {"type": "object"},
+                      lambda *a, **k: "ok", override=True)
+        # Server "mcp-alpha" → canonical mcp-mcp-alpha (mcp_alpha_tool).
+        _ts_mod.create_custom_toolset("mcp-alpha", "server mcp-alpha",
+                                      tools=[], includes=[])
+        _reg.register_toolset_alias("mcp-alpha", "mcp-mcp-alpha")
+        _reg.register("mcp_alpha_tool", "mcp-mcp-alpha", {"type": "object"},
+                      lambda *a, **k: "ok", override=True)
+        # Server "mcp-wrong" → canonical mcp-mcp-wrong (mcp_wrong_tool).
+        _ts_mod.create_custom_toolset("mcp-wrong", "server mcp-wrong",
+                                      tools=[], includes=[])
+        _reg.register_toolset_alias("mcp-wrong", "mcp-mcp-wrong")
+        _reg.register("mcp_wrong_tool", "mcp-mcp-wrong", {"type": "object"},
+                      lambda *a, **k: "ok", override=True)
+        # Plugin canonical "mcp-wrong" — registered, NO alias edge.  This is
+        # the mismatched target: it collides with server mcp-wrong's bare
+        # picker token and lives in the broad shadow set.
+        _reg.register("wrong_tool", "mcp-wrong", {"type": "object"},
+                      lambda *a, **k: "ok", override=True)
 
-    result = _apply_override(defaults, override, mcp_names, builtin_names=builtin)
+        # Seed-assertion relevance (round-8 rule): prove the collision edges
+        # are live BEFORE driving the classifier.
+        assert _reg.get_toolset_alias_target("alpha") == "mcp-alpha"
+        assert _reg.get_toolset_alias_target("mcp-alpha") == "mcp-mcp-alpha"
+        assert _reg.get_toolset_alias_target("mcp-wrong") == "mcp-mcp-wrong"
 
-    # With mismatched alias, alpha stays in pure_mcp → additive branch → canonicalized
-    # But canonicalization returns [] because alias target is wrong
-    # So result should be just builtins after stripping MCP
-    assert "mcp-alpha" not in result, "mcp-alpha should not be in shadow for alpha"
+        # MISMATCHED ownership probe: server mcp-alpha's edge falsely claims
+        # the plugin's canonical "mcp-wrong" (true target is mcp-mcp-alpha).
+        _real_probe = streaming._registry_alias_target
+
+        def _fake_alias_target(name):
+            if name == "mcp-alpha":
+                return "mcp-wrong"  # mismatched — not ownership proof
+            return _real_probe(name)
+
+        monkeypatch.setattr(
+            "api.streaming._registry_alias_target", _fake_alias_target
+        )
+
+        defaults = ["web"]
+        override = ["mcp-alpha", "mcp-wrong"]
+        mcp_servers = {"alpha", "mcp-alpha", "mcp-wrong"}
+        result = _apply_override(defaults, override, mcp_servers,
+                                 builtin_names=None)
+
+        # The mismatched target must remain a real shadow: the plugin
+        # canonical must never be emitted raw by the merge.
+        assert "mcp-wrong" not in result, (
+            f"mismatched target must stay in the shadow set, got {result!r}"
+        )
+        # Resolve every returned selector: the wrong owner's tools must be
+        # absent.  Old truthy-target code let the false proof flow both
+        # ticks through the additive branch; the current code must fail
+        # closed.
+        final_tools = set()
+        for name in result:
+            final_tools.update(_ts_mod.resolve_toolset(name))
+        assert "wrong_tool" not in final_tools, (
+            f"plugin (wrong-owner) tool must not resolve, got {sorted(final_tools)!r}"
+        )
+        assert "alpha_tool" not in final_tools, (
+            f"unselected server alpha's tools must not resolve, got {sorted(final_tools)!r}"
+        )
+        assert "mcp_alpha_tool" not in final_tools, (
+            f"ambiguously-owned tick mcp-alpha must fail closed, got {sorted(final_tools)!r}"
+        )
+        assert "mcp_wrong_tool" not in final_tools, (
+            f"ambiguously-owned tick mcp-wrong must fail closed, got {sorted(final_tools)!r}"
+        )
+    finally:
+        _ts_mod.TOOLSETS.clear()
+        _ts_mod.TOOLSETS.update(_saved_toolsets)
+        _reg._tools.clear()
+        _reg._tools.update(_saved_tools)
+        _reg._toolset_aliases.clear()
+        _reg._toolset_aliases.update(_saved_aliases)
 

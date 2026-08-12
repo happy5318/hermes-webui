@@ -8325,6 +8325,15 @@ def _apply_session_toolset_override(defaults, override, mcp_server_names,
             # in the restrict branch — the user can use explicit names.
             continue
         if name.startswith('mcp-'):
+            # Round-15 fix: if the FULL selector is itself a configured
+            # server's bare picker token (e.g. server "mcp-alpha" vs server
+            # "alpha"'s canonical "mcp-alpha"), the entry is ambiguous
+            # between the picker token and the canonical selector.  Without
+            # picker context we cannot prove which was meant, and emitting
+            # the canonical interpretation would resolve the WRONG server's
+            # tools (gate-certified SILENT).  Fail closed: drop it.
+            if name in mcp_server_names:
+                continue
             # Canonical selector: must prove it belongs to a configured
             # server via the exact alias edge.  Without proof, the resolver
             # may pick the wrong server (gate-certified SILENT).
