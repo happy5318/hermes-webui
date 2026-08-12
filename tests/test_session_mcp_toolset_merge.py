@@ -848,12 +848,16 @@ def test_canonical_collision_without_alias_edge_fails_closed(monkeypatch):
     """Negative control: when the registry exposes a canonical name (e.g.
     ``mcp-alpha``) but NO live alias edge proves it is owned by a configured
     MCP server, ownership cannot be proved → the broad shadow set keeps it
-    and the override fails closed to restrict.  This is the fail-closed
-    contract: an unprovable canonical must never flip additive and leak the
-    wrong server's tools.
+    and the override fails closed to FULLY RESTRICT (empty list).
+
+    Round-13 fix: the restrict branch now drops mcp-* selectors whose
+    ownership cannot be proved, preventing wrong-server exposure.
+    Returning the raw selector would let the resolver pick server alpha
+    when the user intended server mcp-alpha — a gate-certified SILENT failure.
 
     Uses the real ``_builtin_toolset_names()`` (monkeypatched registry),
     not a hand-constructed shadow set."""
+
     builtin = _patch_registry_and_get_builtin_names(
         monkeypatch, ["mcp-alpha", "mcp-mcp-alpha"])
 
@@ -865,9 +869,13 @@ def test_canonical_collision_without_alias_edge_fails_closed(monkeypatch):
         ["web", "file", "terminal", "delegation"], ["mcp-alpha"],
         {"alpha", "mcp-alpha"}, builtin_names=builtin)
 
-    assert result == ["mcp-alpha"], (
-        "no alias edge → ownership unprovable → must RESTRICT, "
-        "got {!r}".format(result)
+    # Round-13 fix: no alias edge for 'alpha' → mcp-alpha means ownership
+    # of canonical 'mcp-alpha' cannot be proved → must drop it entirely.
+    # Returning bare 'mcp-alpha' would resolve to server alpha's tools,
+    # not the intended server mcp-alpha's tools.
+    assert result == [], (
+        "no alias edge → ownership unprovable → must DROP the selector "
+        "and return empty list (got {!r})".format(result)
     )
 
 
@@ -902,8 +910,14 @@ def test_plugin_canonical_mcp_prefix_collision_restricts(monkeypatch):
     ``mcp-*`` names from the shadow set, so a plugin ``mcp-browser`` could
     silently flip additive.
 
+    Round-13 fix: the restrict branch drops mcp-* selectors whose ownership
+    cannot be proved.  A plugin's canonical has no MCP alias edge, so the
+    selector must be dropped entirely — returning it would resolve to the
+    plugin's tools, not the intended MCP server's tools.
+
     Uses the real ``_builtin_toolset_names()`` (monkeypatched registry), not
     hand-constructed shadow set."""
+
     builtin = _patch_registry_and_get_builtin_names(
         monkeypatch, ["mcp-browser"])
 
@@ -916,9 +930,12 @@ def test_plugin_canonical_mcp_prefix_collision_restricts(monkeypatch):
         ["web", "file"], ["mcp-browser"], {"mcp-browser"},
         builtin_names=builtin)
 
-    assert result == ["mcp-browser"], (
-        "plugin canonical 'mcp-browser' collides with same-named MCP server "
-        "— must RESTRICT, not flip additive (got {})".format(result)
+    # Round-13 fix: plugin canonical 'mcp-browser' has no MCP alias edge,
+    # so ownership cannot be proved → must DROP entirely.
+    assert result == [], (
+        "plugin canonical 'mcp-browser' has no alias edge → ownership "
+        "unprovable → must DROP the selector and return empty list "
+        "(got {})".format(result)
     )
 
 

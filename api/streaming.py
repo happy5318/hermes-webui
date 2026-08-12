@@ -8291,8 +8291,40 @@ def _apply_session_toolset_override(defaults, override, mcp_server_names,
         return merged
     # Restrict branch: power-user free-text override.  Names here are
     # literal toolset selections (a bare "all"/"*" is the user's explicit
-    # wildcard intent), NOT picker-derived MCP ticks — leave them untouched.
-    return list(override)
+    # wildcard intent), NOT picker-derived MCP ticks.
+    #
+    # Round-13 gate fix: picker-derived selectors with intrinsic resolver
+    # ambiguity (mcp-*) may have been routed here because a missing alias
+    # edge kept them in the shadow set (pure_mcp excluded them).  Such
+    # selectors cannot be safely emitted without proving ownership —
+    # the resolver would pick the wrong server's tools.  Fail closed:
+    # drop any mcp-* selector whose exact alias edge is unprovable.
+    # Wildcards (all, *) in a picker-derived context also require proof
+    # of ownership for EVERY configured MCP server; without registry
+    # access we cannot expand them safely → drop them too.
+    safe_override = []
+    for name in override:
+        if name in {'all', '*'}:
+            # Wildcard: only safe if we can verify no unchecked MCP server
+            # would be included.  This requires registry access which we
+            # may not have.  Fail closed by dropping wildcards entirely
+            # in the restrict branch — the user can use explicit names.
+            continue
+        if name.startswith('mcp-'):
+            # Canonical selector: must prove it belongs to a configured
+            # server via the exact alias edge.  Without proof, the resolver
+            # may pick the wrong server (gate-certified SILENT).
+            _srv_name = name[4:]  # strip 'mcp-' prefix
+            if _srv_name in mcp_server_names:
+                _target = _registry_alias_target(_srv_name)
+                if _target == name:
+                    safe_override.append(name)
+                # else: ownership unprovable → drop (fail closed)
+            # else: not a configured MCP server's canonical → drop
+            continue
+        # Bare name or non-mcp-* selector: pass through unchanged
+        safe_override.append(name)
+    return safe_override
 
 
 def _default_transitively_reaches_unchecked_mcp(default_name, unchecked_mcp,
