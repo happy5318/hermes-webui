@@ -8140,15 +8140,24 @@ def _apply_session_toolset_override(defaults, override, mcp_server_names,
     # ── Malformed-override fail-closed ────────────────────────────────────
     # Validate before any fallible classification so malformed persisted state
     # can never restore all profile defaults via the caller's broad except.
+    # Round-14 fix: drop ALL dangerous selectors from malformed override,
+    # not just non-strings. A malformed ['all', {'bad': 1}] must NOT yield
+    # ['all'] which the resolver expands to every toolset (gate-certified).
     if not all(isinstance(n, str) for n in override):
-        return [n for n in override if isinstance(n, str)]
+        _valid = [n for n in override if isinstance(n, str)]
+        # Sanitize: drop wildcards and unverified mcp-* selectors
+        _valid = [n for n in _valid if n not in {'all', '*'} and not n.startswith('mcp-')]
+        return _valid
 
     # Validate configured MCP server names as strings before additive
     # classification — a non-string ``mcp_servers`` key independently reaches
     # ``'mcp-' + _srv`` downstream and has the same fail-open caller result.
+    # Round-14 fix: return empty list instead of raw override — the raw
+    # override may contain dangerous selectors (all, *, mcp-*) that bypass
+    # the sanitizer (gate-certified).
     _mcp_names_raw = mcp_server_names or ()
     if not all(isinstance(n, str) for n in _mcp_names_raw):
-        return list(override)
+        return []  # cannot safely classify → fully restrictive
     mcp_server_names = set(_mcp_names_raw)
 
     if builtin_names is None:
@@ -8178,10 +8187,12 @@ def _apply_session_toolset_override(defaults, override, mcp_server_names,
     # shadow set before the MCP-only test; true static/plugin shadows (e.g.
     # a plugin literally named ``mcp-browser``) stay restrictive because
     # their names have no alias edge back to a configured server.
+    # Round-14 fix: require EXACT alias match `_t == f"mcp-{_srv}"`.
+    # A mismatched alias target is NOT ownership proof (gate-certified).
     owned_canonicals = set()
     for _srv in mcp_server_names:
         _t = _registry_alias_target(_srv)
-        if _t:
+        if _t == f"mcp-{_srv}":  # exact match required for ownership proof
             owned_canonicals.add(_t)
     true_shadow = builtin_names - owned_canonicals
     # Only names that are MCP servers AND not shadowed by a true
@@ -8227,11 +8238,14 @@ def _apply_session_toolset_override(defaults, override, mcp_server_names,
         # server is unchecked, we cannot safely expand the wildcard
         # without leaking its tools — fail closed to restrictive
         # session semantics.
+        # Round-14 fix: return verified canonical targets, not raw override.
+        # A configured server named "all" could have its selector changed
+        # from canonical back to raw wildcard if we return list(override).
         _unchecked = mcp_server_names - set(override)
         if _unchecked:
             _wildcards = {'all', '*'}
             if any(_d in _wildcards for _d in defaults):
-                return list(override)
+                return list(override_targets)  # use verified canonical targets
         # A default entry that is a *composite* toolset (one whose
         # ``includes`` transitively references an MCP-server toolset)
         # would survive the name-level filter but re-expose the
