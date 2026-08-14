@@ -8062,7 +8062,33 @@ def _builtin_toolset_names():
     return names
 
 
-def _profile_owned_static_toolsets(builtin_names, mcp_server_names):
+def _authored_builtin_toolset_names():
+    """Return the AUTHORED static builtin toolset names (``toolsets.TOOLSETS``
+    keys) — the immutable builtins a profile context is allowed to expose.
+
+    This is the *authorization* source for wildcard expansion.  Only toolsets
+    that are authored definitions (static builtins + current-process custom
+    toolsets) count as profile-owned static toolsets.  Process-global
+    REGISTRY names — registered MCP canonicals, foreign plugin toolsets —
+    are NEVER included: registry membership is not profile ownership
+    (Round-18 finding 1).  An alias-less foreign ``mcp-foreign`` entry or a
+    foreign non-MCP plugin registered in the shared registry must never
+    enter a wildcard expansion for another profile.
+
+    Returns ``None`` when ``toolsets`` is unavailable (fail closed — an
+    unknown builtin universe cannot prove what is profile-owned).
+    """
+    try:
+        import toolsets as _ts
+        _defs = getattr(_ts, "TOOLSETS", None)
+        if not isinstance(_defs, dict):
+            return None
+        return {str(k) for k in _defs.keys()} - {"all", "*"}
+    except Exception:
+        return None
+
+
+def _profile_owned_static_toolsets(defaults, mcp_server_names, builtin_names=None):
     """Return the set of static/builtin/plugin toolsets that are AUTHORIZED
     for the current profile context.
 
@@ -8070,69 +8096,56 @@ def _profile_owned_static_toolsets(builtin_names, mcp_server_names):
     registry) from AUTHORIZATION (which toolsets belong to the current profile
     and are safe to expose).
 
-    The process-global registry includes:
-      - Static builtin toolsets (web, file, terminal, etc.)
-      - Plugin toolsets registered by the current profile
-      - Canonical names for MCP servers from ALL profiles (mcp-* entries)
+    AUTHORIZATION is derived from the profile's OWN configuration, never from
+    the process-global registry inventory:
 
-    For capability isolation, we must distinguish:
-      - Owned canonicals: mcp-<server> where <server> is configured in the
-        current profile (these are the server's own registry identity, not
-        static/plugin shadows) - EXCLUDED (will be added via explicit MCP selection)
-      - Foreign MCP canonicals: mcp-<server> where <server> is NOT configured
-        but HAS an alias edge to a server - EXCLUDED (belongs to other profile)
-      - Static/plugin mcp-* toolsets: names starting with mcp- but have NO
-        alias edge to any MCP server - INCLUDED (these are genuine static/plugin
-        toolsets that merely share the prefix)
+      - explicit non-MCP, non-wildcard entries in ``defaults`` (the profile's
+        resolved platform toolset list — ``_resolve_cli_toolsets(cfg)``)
+        are profile-authorized static/plugin toolsets;
+      - when ``defaults`` carries a wildcard (``all``/``*`` — "everything in
+        my profile context"), the expansion universe is the authored builtin
+        set: ``builtin_names`` when the caller supplies a profile-scoped set
+        (tests / callers with a config-derived list), else
+        ``_authored_builtin_toolset_names()`` (static ``TOOLSETS`` keys).
+        Process-global registered names are never consulted.
 
-    Returns None when builtin_names is None (registry unavailable) -
-    cannot determine authorization without the inventory.
+    Foreign MCP canonicals (``mcp-<server>`` for servers configured in OTHER
+    profiles) and foreign non-MCP plugins are excluded by construction:
+    they are neither explicit ``defaults`` entries nor authored builtin
+    definitions.
 
-    Round-18 gate fix: separates inventory from authorization to prevent
-    wildcard defaults and free-text wildcards from exposing foreign MCP tools.
+    Returns a ``frozenset`` of authorized static/plugin toolset names, or
+    ``None`` when authorization cannot be established (registry/toolsets
+    unavailable AND no caller-supplied set) — fail closed.
     """
-    if builtin_names is None:
+    if not isinstance(defaults, (list, tuple, set)):
         return None
-    if not isinstance(builtin_names, (set, list, tuple)):
-        return None
-    if mcp_server_names is None:
-        mcp_server_names = set()
-    elif not isinstance(mcp_server_names, (set, list, tuple)):
-        return None
-    else:
-        mcp_server_names = set(mcp_server_names)
+    _wildcards = {"all", "*"}
+    mcp_refs = set(mcp_server_names) if isinstance(mcp_server_names, (set, list, tuple)) else set()
+    mcp_refs |= {f"mcp-{s}" for s in mcp_refs if isinstance(s, str)}
 
-    # Start with the full inventory
-    profile_owned = set(builtin_names) if not isinstance(builtin_names, set) else builtin_names.copy()
+    # Explicit non-MCP, non-wildcard defaults entries are profile-authorized.
+    owned = {
+        d for d in defaults
+        if isinstance(d, str) and d not in _wildcards and d not in mcp_refs
+    }
 
-    # Exclude owned canonicals (current profile's MCP servers' registry names)
-    # These are NOT static/plugin shadows - they ARE the MCP server itself
-    owned_canonicals = set()
-    for _srv in mcp_server_names:
-        _t = _registry_alias_target(_srv)
-        if _t == f"mcp-{_srv}":  # exact match required for ownership proof
-            owned_canonicals.add(_t)
+    # Wildcard present → expand from the authored builtin universe only.
+    if any(isinstance(d, str) and d in _wildcards for d in defaults):
+        if builtin_names is not None:
+            if not isinstance(builtin_names, (set, list, tuple)):
+                return None
+            owned |= {
+                b for b in builtin_names
+                if isinstance(b, str) and b not in _wildcards and b not in mcp_refs
+            }
+        else:
+            _authored = _authored_builtin_toolset_names()
+            if _authored is None:
+                return None  # cannot establish authorization → fail closed
+            owned |= _authored
 
-    # For each mcp-* entry, determine if it's:
-    # 1. Owned canonical (current profile's MCP) -> EXCLUDE (handled via explicit selection)
-    # 2. Foreign MCP canonical (has alias edge but not our server) -> EXCLUDE
-    # 3. Static/plugin toolset (no alias edge) -> INCLUDE
-    for _name in list(profile_owned):
-        if _name.startswith('mcp-'):
-            if _name in owned_canonicals:
-                # Owned by current profile - exclude, will be added via MCP selection
-                profile_owned.discard(_name)
-            else:
-                # Check if it has an alias edge to any server
-                _srv_name = _name[4:]  # strip 'mcp-' prefix
-                _alias_target = _registry_alias_target(_srv_name)
-                if _alias_target == _name:
-                    # Has alias edge = MCP server canonical (foreign)
-                    # EXCLUDE - belongs to other profile
-                    profile_owned.discard(_name)
-                # else: no alias edge = static/plugin toolset -> INCLUDE
-
-    return profile_owned
+    return frozenset(owned)
 
 
 
@@ -8185,9 +8198,57 @@ def _canonicalize_picker_mcp_selection(name, mcp_server_names):
     return None
 
 
+# Sentinel: an alias lookup FAILED (registry unavailable / raised).  This is
+# distinct from ``None`` — a successful lookup with no alias.  Treating a
+# failed lookup as "no alias edge" would let an unavailable authority prove
+# that an ``mcp-*`` name is a static/plugin toolset (fail-open), which the
+# Round-18 gate certified: ``_registry_alias_target()`` collapsed failures
+# to ``None`` and the caller inferred "static/plugin" from it.  Callers must
+# fail closed on this sentinel.
+_ALIAS_LOOKUP_UNKNOWN = object()
+
+
+def _registry_generation():
+    """Return the live registry's generation counter, or ``None`` when the
+    registry is unavailable or does not expose a generation.
+
+    The generation is bumped by the registry on every mutation (register /
+    deregister / alias registration / MCP refresh).  A profile-scoped
+    authorization decision must fail closed when the registry mutates
+    mid-decision: the authority snapshot it consulted may already be stale
+    (Round-19 gate finding — "generation movement must fail closed").
+    """
+    try:
+        from tools.registry import registry as _reg
+        return getattr(_reg, "_generation", None)
+    except Exception:
+        return None
+
+
+def _registry_generation_changed(gen_at_entry):
+    """Return True when the registry mutated since *gen_at_entry*.
+
+    ``None`` (no registry / no generation tracking) means there is no
+    authority to go stale — return False so existing tests and
+    registry-less environments are unaffected.  A moved generation (or a
+    registry that became unavailable mid-decision) returns True → caller
+    fails closed.
+    """
+    if gen_at_entry is None:
+        return False
+    return _registry_generation() != gen_at_entry
+
+
 def _registry_alias_target(name):
-    """Return the alias target for *name* from the live registry, or ``None``
-    when the registry is unavailable (cannot prove ownership → fail closed).
+    """Return the alias target for *name* from the live registry.
+
+    Returns:
+      - ``str`` — the alias target (``get_toolset_alias_target`` resolved),
+      - ``None`` — the lookup SUCCEEDED but *name* has no alias edge,
+      - ``_ALIAS_LOOKUP_UNKNOWN`` — the lookup FAILED (registry unavailable
+        or raised).  This is an "I don't know" signal, distinct from a
+        genuine no-alias result: an unavailable authority cannot prove that
+        an ``mcp-*`` name is a static/plugin toolset.
 
     Used to distinguish a registered canonical that is OWNED by a configured
     MCP server (``get_toolset_alias_target`` resolves it) from a genuine
@@ -8199,7 +8260,7 @@ def _registry_alias_target(name):
         from tools.registry import registry as _reg
         return _reg.get_toolset_alias_target(name)
     except Exception:
-        return None
+        return _ALIAS_LOOKUP_UNKNOWN
 
 
 def _canonicalize_override_targets(override, mcp_server_names):
@@ -8305,6 +8366,15 @@ def _apply_session_toolset_override(defaults, override, mcp_server_names,
     if override is None or override == []:
         return list(defaults)
 
+    # Round-19 gate fix: capture the registry generation at entry.  Every
+    # alias/ownership decision below consults the live registry; if the
+    # registry mutates mid-decision (a server registers, an alias moves),
+    # the authorization snapshot we reasoned from is stale and the result
+    # must fail closed (Round-18 finding: "generation movement must fail
+    # closed").  The check is a no-op when the registry is unavailable or
+    # does not expose a generation.
+    _gen_at_entry = _registry_generation()
+
     # Any non-list value (scalar, dict, set, …) is invalid persisted state.
     # Fail closed to restrictive — never let the caller's broad except restore
     # all defaults.
@@ -8334,6 +8404,29 @@ def _apply_session_toolset_override(defaults, override, mcp_server_names,
         return []  # cannot safely classify → fully restrictive
     mcp_server_names = set(_mcp_names_raw)
 
+    # Distinguish the two roles of ``builtin_names``:
+    #
+    #   * SHADOW / COLLISION role — ``_builtin_toolset_names()`` unions the
+    #     static ``TOOLSETS`` keys with every name registered in the
+    #     process-global registry.  This is the correct source for deciding
+    #     whether a name is shadowed by a builtin/plugin at resolution time
+    #     (additive-vs-restrict classification, ``mcp_strip``, composite
+    #     walk).  It is INVENTORY, not authorization.
+    #
+    #   * AUTHORIZATION role — what a wildcard may expand to.  This must
+    #     come from the profile's OWN configuration, never from the
+    #     process-global registry inventory.  Round-18 gate finding: the
+    #     previous code fed the registry inventory into the authorization
+    #     set, so an alias-less foreign ``mcp-foreign`` entry and a foreign
+    #     non-MCP plugin remained "profile owned" and their tools became
+    #     callable through both wildcard lanes.
+    #
+    # A caller-provided ``builtin_names`` argument (tests / callers with a
+    # config-derived list) is treated as the profile-scoped authorization
+    # set; when absent, ``_profile_owned_static_toolsets`` falls back to
+    # the authored builtin definitions (``toolsets.TOOLSETS`` keys) — never
+    # to the registry inventory.
+    _caller_builtin_names = builtin_names
     if builtin_names is None:
         builtin_names = _builtin_toolset_names()
     # ``None`` here means the builtin registry could not be resolved → we do not
@@ -8427,13 +8520,29 @@ def _apply_session_toolset_override(defaults, override, mcp_server_names,
             # Round-18 gate fix: wildcard defaults MUST go through the full
             # check chain (mcp_strip, composite check) rather than early return.
             # Replace wildcards with profile-owned static toolsets, then continue.
-            profile_owned = _profile_owned_static_toolsets(builtin_names, mcp_server_names)
+            #
+            # Round-19 gate fix: authorization is derived from the PROFILE's
+            # own configuration (explicit `defaults` entries + authored
+            # builtin definitions), NEVER from the process-global registry
+            # inventory.  The previous implementation started from every
+            # registered toolset name and removed only some mcp-* entries,
+            # so an alias-less foreign `mcp-foreign` or a foreign non-MCP
+            # plugin remained "profile owned" and leaked through wildcard
+            # expansion (gate-certified: real resolver made their tools
+            # callable under the current profile).  `_caller_builtin_names`
+            # is the caller-provided profile-scoped authorization set (or
+            # None → authored TOOLSETS keys); the registry-derived
+            # `builtin_names` shadow is used ONLY for collision detection.
+            profile_owned = _profile_owned_static_toolsets(
+                defaults, mcp_server_names, _caller_builtin_names)
             if profile_owned is None:
                 # Cannot determine profile authorization → fail closed
                 return []
-            # Replace wildcards in defaults with profile-owned toolsets
-            # These will go through the same mcp_strip and composite checks below
-            defaults = [d for d in defaults if d not in _wildcards] + list(profile_owned)
+            # Replace wildcards in defaults with profile-owned toolsets.
+            # These will go through the same mcp_strip and composite checks
+            # below.  Sorted for a stable, deterministic output order
+            # (Round-19 gate requirement: exact output order/count).
+            defaults = [d for d in defaults if d not in _wildcards] + sorted(profile_owned)
         # A default entry that is a *composite* toolset (one whose
         # ``includes`` transitively references an MCP-server toolset)
         # would survive the name-level filter but re-expose the
@@ -8490,6 +8599,12 @@ def _apply_session_toolset_override(defaults, override, mcp_server_names,
             if name not in seen:
                 merged.append(name)
                 seen.add(name)
+        # Round-19 gate fix: if the registry mutated while we were deciding
+        # (a server registered, an alias moved), the ownership proofs above
+        # are stale — fail closed rather than return a result reasoned from
+        # an outdated authority snapshot.
+        if _registry_generation_changed(_gen_at_entry):
+            return []
         return merged
     # Restrict branch: power-user free-text override.  Names here are
     # literal toolset selections (a bare "all"/"*" is the user's explicit
@@ -8528,7 +8643,17 @@ def _apply_session_toolset_override(defaults, override, mcp_server_names,
             # The process-global registry contains foreign MCP canonicals from
             # other profiles; true_shadow includes them and would expose them.
             # Use profile_owned to exclude foreign MCP tools.
-            _profile_owned = _profile_owned_static_toolsets(builtin_names, mcp_server_names)
+            #
+            # Round-19 gate fix: profile ownership is derived from the
+            # profile's OWN configuration (explicit `defaults` entries +
+            # authored builtin definitions), never from the process-global
+            # registry inventory — an alias-less foreign `mcp-foreign` or a
+            # foreign non-MCP plugin must not survive the expansion.
+            # `_caller_builtin_names` is the profile-scoped authorization
+            # set (or None → authored TOOLSETS keys); the registry-derived
+            # `builtin_names` shadow is used ONLY for collision detection.
+            _profile_owned = _profile_owned_static_toolsets(
+                defaults, mcp_server_names, _caller_builtin_names)
             if _profile_owned is None:
                 # Cannot determine profile authorization → drop wildcard
                 continue
@@ -8562,16 +8687,34 @@ def _apply_session_toolset_override(defaults, override, mcp_server_names,
             # the canonical of one must be checked for static/plugin provenance.
             # If it has an alias edge matching itself, it's a foreign MCP canonical.
             # If no alias edge, it's a static/plugin toolset (e.g. mcp-custom-probe).
+            #
+            # Round-19 gate fix: an alias LOOKUP FAILURE (registry unavailable
+            # / raised) must NOT be treated as "no alias edge = static/plugin".
+            # The previous implementation collapsed the failure to None and
+            # the caller inferred static/plugin provenance from it — an
+            # unavailable authority fails OPEN (gate-certified).  A failed
+            # lookup cannot prove anything, so the selector is dropped
+            # (fail closed).
             _alias_target = _registry_alias_target(_srv_name)
+            if _alias_target is _ALIAS_LOOKUP_UNKNOWN:
+                # Alias lookup FAILED → provenance unprovable → drop
+                continue
             if _alias_target == name:
                 # Has alias edge = foreign MCP canonical from another profile
                 # Drop it - fail closed
                 continue
-            # No alias edge = static/plugin toolset with mcp- prefix
-            # Allow it to pass through
+            # Successful lookup with NO alias edge = static/plugin toolset
+            # with mcp- prefix.  Allow it to pass through — and stop here so
+            # the unconditional append below cannot emit it a second time
+            # (Round-19 gate finding: duplicate selector in the result).
             safe_override.append(name)
+            continue
         # Bare name or non-mcp-* selector: pass through unchanged
         safe_override.append(name)
+    # Round-19 gate fix: registry mutated mid-decision → the alias/ownership
+    # proofs above are stale → fail closed.
+    if _registry_generation_changed(_gen_at_entry):
+        return []
     return safe_override
 
 

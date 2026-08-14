@@ -3061,3 +3061,449 @@ def test_static_mcp_prefix_plugin_distinguished_from_foreign_mcp():
         _reg._tools.update(_saved_tools)
         _reg._toolset_aliases.clear()
         _reg._toolset_aliases.update(_saved_aliases)
+
+
+# ── Round-19: authorization derives from profile config, not registry ──────
+# The Round-18 gate certified that `_profile_owned_static_toolsets()` derived
+# "profile owned" from the process-global registry inventory: it started from
+# every registered toolset name and removed only SOME mcp-* entries (those
+# with an alias edge).  An ALIAS-LESS foreign `mcp-foreign` entry and a
+# foreign non-MCP plugin therefore remained "profile owned", and through
+# BOTH wildcard lanes (wildcard default + free-text wildcard) the real
+# resolver made their tools callable under the current profile.
+#
+# Round-19 fix: authorization now derives from the profile's OWN
+# configuration — explicit non-MCP `defaults` entries plus the authored
+# builtin definitions (`toolsets.TOOLSETS` keys) — NEVER from the
+# process-global registry inventory.  The tests below drive the real
+# resolver/registry composition and assert exact survivors + exclusions.
+
+
+def test_aliasless_foreign_mcp_absent_from_wildcard_default(monkeypatch):
+    """An ALIAS-LESS foreign ``mcp-foreign`` entry (tool registered under
+    ``mcp-foreign``, NO alias edge) must NOT survive a wildcard profile
+    default expansion.
+
+    The old code kept it as "static/plugin" because it had no alias edge
+    (``_alias_target == _name`` was False); the new code derives the
+    expansion from profile config + authored builtins only, so an entry
+    that is neither a configured server nor an authored builtin cannot
+    enter the result.
+    """
+    import toolsets as _ts_mod
+    from tools.registry import registry as _reg
+
+    _saved_toolsets = dict(_ts_mod.TOOLSETS)
+    _saved_tools = dict(_reg._tools)
+    _saved_aliases = dict(_reg._toolset_aliases)
+
+    try:
+        # Configured server alpha → canonical mcp-alpha.  NOTE: no static
+        # TOOLSETS entry for "alpha" — the resolver must reach it through
+        # its registry alias, exactly like the real runtime.
+        _reg.register_toolset_alias("alpha", "mcp-alpha")
+        _reg.register("alpha_tool", "mcp-alpha", {"type": "object"},
+                      lambda *a, **k: "ok", override=True)
+        # FOREIGN, ALIAS-LESS: tools registered under mcp-foreign with NO
+        # alias edge — the old code classified this as a static/plugin
+        # toolset and leaked it through the wildcard-default lane.
+        _reg.register("foreign_tool", "mcp-foreign", {"type": "object"},
+                      lambda *a, **k: "ok", override=True)
+        assert _reg.get_toolset_alias_target("alpha") == "mcp-alpha"
+        assert _reg.get_toolset_alias_target("foreign") is None
+
+        defaults = ["all"]  # wildcard profile default
+        override = ["alpha"]  # all configured servers ticked
+        mcp_servers = {"alpha"}
+        result = _apply_override(
+            defaults, override, mcp_servers,
+            builtin_names={"web", "file", "terminal", "delegation"},
+        )
+
+        # Raw wildcard never survives; selected server + profile builtins do.
+        assert "all" not in result, f"wildcard must be expanded, got {result!r}"
+        assert "web" in result and "file" in result, (
+            f"profile builtins must survive, got {result!r}"
+        )
+        # The alias-less foreign canonical must NOT be present.
+        assert "mcp-foreign" not in result, (
+            f"alias-less foreign mcp-foreign must be absent, got {result!r}"
+        )
+        # Resolve through the real resolver: foreign tool must not resolve.
+        final_tools = set()
+        for name in result:
+            final_tools.update(_ts_mod.resolve_toolset(name))
+        assert "alpha_tool" in final_tools, (
+            f"selected server tools must resolve, got {sorted(final_tools)!r}"
+        )
+        assert "foreign_tool" not in final_tools, (
+            f"alias-less foreign tool must NOT resolve, got {sorted(final_tools)!r}"
+        )
+    finally:
+        _ts_mod.TOOLSETS.clear()
+        _ts_mod.TOOLSETS.update(_saved_toolsets)
+        _reg._tools.clear()
+        _reg._tools.update(_saved_tools)
+        _reg._toolset_aliases.clear()
+        _reg._toolset_aliases.update(_saved_aliases)
+
+
+def test_aliasless_foreign_mcp_absent_from_free_text_wildcard(monkeypatch):
+    """The SAME alias-less foreign ``mcp-foreign`` entry must also stay out
+    of the free-text wildcard lane (restrict branch, override ``all``)."""
+    import toolsets as _ts_mod
+    from tools.registry import registry as _reg
+
+    _saved_toolsets = dict(_ts_mod.TOOLSETS)
+    _saved_tools = dict(_reg._tools)
+    _saved_aliases = dict(_reg._toolset_aliases)
+
+    try:
+        # Configured server alpha → canonical mcp-alpha (alias only, like
+        # the real runtime — no static TOOLSETS entry).
+        _reg.register_toolset_alias("alpha", "mcp-alpha")
+        _reg.register("alpha_tool", "mcp-alpha", {"type": "object"},
+                      lambda *a, **k: "ok", override=True)
+        _reg.register("foreign_tool", "mcp-foreign", {"type": "object"},
+                      lambda *a, **k: "ok", override=True)
+        assert _reg.get_toolset_alias_target("foreign") is None
+
+        result = _apply_override(
+            ["web", "file"],  # defaults
+            ["all"],  # free-text wildcard → restrict lane expansion
+            {"alpha"},
+            builtin_names={"web", "file", "terminal", "delegation"},
+        )
+
+        assert "mcp-foreign" not in result, (
+            f"alias-less foreign mcp-foreign must be absent, got {result!r}"
+        )
+        final_tools = set()
+        for name in result:
+            final_tools.update(_ts_mod.resolve_toolset(name))
+        assert "foreign_tool" not in final_tools, (
+            f"alias-less foreign tool must NOT resolve, got {sorted(final_tools)!r}"
+        )
+        assert "alpha_tool" in final_tools, (
+            f"configured server tools must resolve, got {sorted(final_tools)!r}"
+        )
+    finally:
+        _ts_mod.TOOLSETS.clear()
+        _ts_mod.TOOLSETS.update(_saved_toolsets)
+        _reg._tools.clear()
+        _reg._tools.update(_saved_tools)
+        _reg._toolset_aliases.clear()
+        _reg._toolset_aliases.update(_saved_aliases)
+
+
+def test_foreign_non_mcp_plugin_absent_from_wildcard_lanes(monkeypatch):
+    """A FOREIGN NON-MCP plugin toolset (registered in the process-global
+    registry, NOT a configured server, NOT an authored builtin) must stay
+    out of both wildcard lanes.
+
+    The old code started the profile-owned set from EVERY registered toolset
+    name, so a foreign plugin's toolset name survived the mcp-* filter and
+    leaked through wildcard expansion.
+    """
+    import toolsets as _ts_mod
+    from tools.registry import registry as _reg
+
+    _saved_toolsets = dict(_ts_mod.TOOLSETS)
+    _saved_tools = dict(_reg._tools)
+    _saved_aliases = dict(_reg._toolset_aliases)
+
+    try:
+        _ts_mod.create_custom_toolset("alpha", "server alpha", tools=[], includes=[])
+        _reg.register_toolset_alias("alpha", "mcp-alpha")
+        _reg.register("alpha_tool", "mcp-alpha", {"type": "object"},
+                      lambda *a, **k: "ok", override=True)
+        # FOREIGN non-MCP plugin: a toolset that is NOT an MCP canonical and
+        # NOT an authored builtin — registered by another profile's plugin.
+        _reg.register("plugin_foreign_tool", "foreign-plugin",
+                      {"type": "object"},
+                      lambda *a, **k: "ok", override=True)
+
+        # Wildcard default lane.
+        result_default = _apply_override(
+            ["all"], ["alpha"], {"alpha"},
+            builtin_names={"web", "file", "terminal", "delegation"},
+        )
+        # Free-text wildcard lane.
+        result_free = _apply_override(
+            ["web", "file"], ["all"], {"alpha"},
+            builtin_names={"web", "file", "terminal", "delegation"},
+        )
+
+        for _tag, result in (("wildcard-default", result_default),
+                             ("free-text-wildcard", result_free)):
+            assert "foreign-plugin" not in result, (
+                f"[{_tag}] foreign non-MCP plugin must be absent, got {result!r}"
+            )
+            final_tools = set()
+            for name in result:
+                final_tools.update(_ts_mod.resolve_toolset(name))
+            assert "plugin_foreign_tool" not in final_tools, (
+                f"[{_tag}] foreign plugin tool must NOT resolve, "
+                f"got {sorted(final_tools)!r}"
+            )
+    finally:
+        _ts_mod.TOOLSETS.clear()
+        _ts_mod.TOOLSETS.update(_saved_toolsets)
+        _reg._tools.clear()
+        _reg._tools.update(_saved_tools)
+        _reg._toolset_aliases.clear()
+        _reg._toolset_aliases.update(_saved_aliases)
+
+
+def test_alias_lookup_failure_fails_closed(monkeypatch):
+    """An alias lookup FAILURE (registry unavailable / raises) must NOT be
+    treated as "no alias edge = static/plugin toolset".
+
+    Round-18 finding: ``_registry_alias_target()`` collapsed failures to
+    ``None`` and the restrict branch inferred static/plugin provenance from
+    it — an unavailable authority failed OPEN.  Now a failed lookup returns
+    ``_ALIAS_LOOKUP_UNKNOWN`` and the selector is dropped.
+
+    The registry method itself is monkeypatched to raise — the production
+    wrapper ``_registry_alias_target`` converts that to the sentinel, and
+    the caller must fail closed on it.
+    """
+    from tools.registry import registry as _reg
+
+    _orig = _reg.get_toolset_alias_target
+
+    def _boom(name):
+        raise RuntimeError("registry unavailable")
+
+    monkeypatch.setattr(_reg, "get_toolset_alias_target", _boom)
+    try:
+        result = _apply_override(
+            ["web", "file"],
+            ["mcp-custom-probe"],  # would be static/plugin if lookup worked
+            {"alpha"},
+            builtin_names={"web", "file", "terminal", "mcp-custom-probe"},
+        )
+    finally:
+        monkeypatch.setattr(_reg, "get_toolset_alias_target", _orig)
+
+    assert "mcp-custom-probe" not in result, (
+        f"alias lookup failure must fail closed (drop selector), got {result!r}"
+    )
+    assert "web" not in result, (
+        f"restrict lane must not restore defaults on lookup failure, got {result!r}"
+    )
+
+
+def test_alias_lookup_failure_fails_closed_canonical_of_configured(monkeypatch):
+    """Alias lookup failure on the canonical of a CONFIGURED server must also
+    fail closed (drop the canonical), not pass it through."""
+    from tools.registry import registry as _reg
+
+    _orig = _reg.get_toolset_alias_target
+
+    def _boom(name):
+        raise RuntimeError("registry unavailable")
+
+    monkeypatch.setattr(_reg, "get_toolset_alias_target", _boom)
+    try:
+        result = _apply_override(
+            ["web", "file"],
+            ["mcp-alpha"],  # canonical of configured server alpha
+            {"alpha"},
+            builtin_names={"web", "file", "terminal"},
+        )
+    finally:
+        monkeypatch.setattr(_reg, "get_toolset_alias_target", _orig)
+
+    assert "mcp-alpha" not in result, (
+        f"canonical of configured server must fail closed on lookup failure, "
+        f"got {result!r}"
+    )
+
+
+def test_restrict_mcp_static_passthrough_no_duplicate(monkeypatch):
+    """Round-19 finding: the restrictive exact-selector branch used to
+    append an accepted alias-less ``mcp-*`` selector and then fall through
+    to the unconditional append — producing a duplicate.  The pass-through
+    must emit the selector exactly once."""
+    import toolsets as _ts_mod
+    from tools.registry import registry as _reg
+
+    _saved_toolsets = dict(_ts_mod.TOOLSETS)
+    _saved_tools = dict(_reg._tools)
+    _saved_aliases = dict(_reg._toolset_aliases)
+
+    try:
+        _ts_mod.create_custom_toolset("mcp-custom-probe", "probe toolset",
+                                      tools=["probe_tool"], includes=[])
+        _reg.register("probe_tool", "mcp-custom-probe", {"type": "object"},
+                      lambda *a, **k: "ok", override=True)
+
+        result = _apply_override(
+            ["web", "file"],
+            ["mcp-custom-probe"],  # static/plugin, no alias edge
+            {"alpha"},  # unrelated configured server
+            builtin_names={"web", "file", "terminal", "mcp-custom-probe"},
+        )
+
+        assert result.count("mcp-custom-probe") == 1, (
+            f"mcp-* static passthrough must appear exactly once, got {result!r}"
+        )
+        # And it must resolve to its own tool (no double-append corruption).
+        resolved = set(_ts_mod.resolve_toolset("mcp-custom-probe"))
+        assert "probe_tool" in resolved, (
+            f"probe tool must resolve, got {sorted(resolved)!r}"
+        )
+    finally:
+        _ts_mod.TOOLSETS.clear()
+        _ts_mod.TOOLSETS.update(_saved_toolsets)
+        _reg._tools.clear()
+        _reg._tools.update(_saved_tools)
+        _reg._toolset_aliases.clear()
+        _reg._toolset_aliases.update(_saved_aliases)
+
+
+def test_registry_generation_movement_fails_closed(monkeypatch):
+    """Round-19 finding: if the registry mutates mid-decision (its generation
+    moves), the ownership proofs already gathered are stale — the result must
+    fail closed (empty) rather than return tools reasoned from an outdated
+    authority snapshot."""
+    import api.streaming as streaming
+
+    _real_gen = streaming._registry_generation
+    _state = {"calls": 0}
+
+    def _moving_generation():
+        _state["calls"] += 1
+        # First call (entry snapshot) returns 1; a later call (mid-decision
+        # or exit) returns 2 — the registry "mutated" in between.
+        return 2 if _state["calls"] > 1 else 1
+
+    monkeypatch.setattr(streaming, "_registry_generation", _moving_generation)
+    try:
+        result = _apply_override(
+            ["web", "file"],
+            ["alpha"],
+            {"alpha"},
+            builtin_names={"web", "file", "terminal"},
+        )
+    finally:
+        monkeypatch.setattr(streaming, "_registry_generation", _real_gen)
+
+    assert result == [], (
+        f"generation movement must fail closed to empty, got {result!r}"
+    )
+
+
+def test_restrict_generation_movement_fails_closed(monkeypatch):
+    """The restrict lane must also fail closed when the registry generation
+    moves mid-decision."""
+    import api.streaming as streaming
+
+    _real_gen = streaming._registry_generation
+    _state = {"calls": 0}
+
+    def _moving_generation():
+        _state["calls"] += 1
+        return 2 if _state["calls"] > 1 else 1
+
+    monkeypatch.setattr(streaming, "_registry_generation", _moving_generation)
+    try:
+        result = _apply_override(
+            ["web", "file"],
+            ["terminal"],  # restrict lane (non-MCP override)
+            {"alpha"},
+            builtin_names={"web", "file", "terminal"},
+        )
+    finally:
+        monkeypatch.setattr(streaming, "_registry_generation", _real_gen)
+
+    assert result == [], (
+        f"restrict lane generation movement must fail closed, got {result!r}"
+    )
+
+
+def test_production_call_authority_not_from_registry_inventory(monkeypatch):
+    """Production-shaped regression (Round-19 finding 1, exact repro): the
+    real call site invokes ``_apply_session_toolset_override(defaults,
+    override, mcp_servers)`` with ``builtin_names=None``.  The helper then
+    derives its shadow set from the process-global registry inventory —
+    which includes EVERY registered toolset name, including a foreign
+    ``mcp-foreign`` canonical and a foreign non-MCP plugin registered by
+    another profile.  The wildcard-expansion AUTHORIZATION set must be the
+    profile's own config (explicit defaults + authored ``TOOLSETS`` keys),
+    NOT that registry inventory: an alias-less foreign ``mcp-foreign``
+    (no alias edge) must not resolve under the current profile.
+
+    The old code fed the registry inventory into the authorization set, so
+    ``mcp-foreign`` (alias-less → classified "static/plugin") survived the
+    wildcard-default lane and the real resolver made ``foreign_tool``
+    callable (gate-certified).  This test drives the real resolver through
+    the production call shape.
+    """
+    import toolsets as _ts_mod
+    from tools.registry import registry as _reg
+
+    _saved_toolsets = dict(_ts_mod.TOOLSETS)
+    _saved_tools = dict(_reg._tools)
+    _saved_aliases = dict(_reg._toolset_aliases)
+
+    try:
+        _reg.register_toolset_alias("alpha", "mcp-alpha")
+        _reg.register("alpha_tool", "mcp-alpha", {"type": "object"},
+                      lambda *a, **k: "ok", override=True)
+        # FOREIGN, ALIAS-LESS: registered tools under mcp-foreign, NO alias
+        # edge — the old classifier called this "static/plugin" and leaked
+        # it.  It IS part of the registry inventory (get_registered_toolset_names
+        # returns every toolset name present in the registry).
+        _reg.register("foreign_tool", "mcp-foreign", {"type": "object"},
+                      lambda *a, **k: "ok", override=True)
+        # FOREIGN non-MCP plugin toolset in the registry inventory.
+        _reg.register("plugin_foreign_tool", "foreign-plugin",
+                      {"type": "object"},
+                      lambda *a, **k: "ok", override=True)
+
+        # Seed-assertion: the foreign entries ARE in the registry inventory
+        # (so the old code would have leaked them), and the authored builtin
+        # set excludes them (the new authority source).
+        _inv = streaming._builtin_toolset_names()
+        assert _inv is not None and "mcp-foreign" in _inv, (
+            f"seed: mcp-foreign must be in registry inventory, got "
+            f"{sorted(_inv) if _inv else None}"
+        )
+        _auth = streaming._authored_builtin_toolset_names()
+        assert _auth is not None and "mcp-foreign" not in _auth, (
+            f"seed: mcp-foreign must NOT be authored, got "
+            f"{sorted(_auth) if _auth else None}"
+        )
+
+        # Production call shape: NO builtin_names argument.
+        result = _apply_override(["all"], ["alpha"], {"alpha"})
+
+        assert "all" not in result, f"wildcard must be expanded, got {result!r}"
+        assert "mcp-foreign" not in result, (
+            f"alias-less foreign mcp-foreign must be absent from wildcard "
+            f"expansion, got {result!r}"
+        )
+        assert "foreign-plugin" not in result, (
+            f"foreign non-MCP plugin must be absent, got {result!r}"
+        )
+        final_tools = set()
+        for name in result:
+            final_tools.update(_ts_mod.resolve_toolset(name))
+        assert "alpha_tool" in final_tools, (
+            f"selected server tools must resolve, got {sorted(final_tools)!r}"
+        )
+        assert "foreign_tool" not in final_tools, (
+            f"alias-less foreign tool must NOT resolve, got {sorted(final_tools)!r}"
+        )
+        assert "plugin_foreign_tool" not in final_tools, (
+            f"foreign plugin tool must NOT resolve, got {sorted(final_tools)!r}"
+        )
+    finally:
+        _ts_mod.TOOLSETS.clear()
+        _ts_mod.TOOLSETS.update(_saved_toolsets)
+        _reg._tools.clear()
+        _reg._tools.update(_saved_tools)
+        _reg._toolset_aliases.clear()
+        _reg._toolset_aliases.update(_saved_aliases)
