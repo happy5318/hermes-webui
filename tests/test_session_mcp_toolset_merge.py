@@ -2884,9 +2884,9 @@ def test_two_profiles_same_registry_isolation(monkeypatch):
         final_a = set()
         for name in result_a:
             final_a.update(_ts_mod.resolve_toolset(name))
-        assert "alpha_tool" in final_a, f"alpha must resolve in profile A"
-        assert "beta_tool" not in final_a, f"beta must NOT resolve in profile A"
-        assert "gamma_tool" not in final_a, f"gamma must NOT resolve in profile A"
+        assert "alpha_tool" in final_a, "alpha must resolve in profile A"
+        assert "beta_tool" not in final_a, "beta must NOT resolve in profile A"
+        assert "gamma_tool" not in final_a, "gamma must NOT resolve in profile A"
 
         # Profile B must NOT have alpha or gamma
         assert "mcp-alpha" not in result_b and "mcp-gamma" not in result_b, (
@@ -2895,9 +2895,9 @@ def test_two_profiles_same_registry_isolation(monkeypatch):
         final_b = set()
         for name in result_b:
             final_b.update(_ts_mod.resolve_toolset(name))
-        assert "beta_tool" in final_b, f"beta must resolve in profile B"
-        assert "alpha_tool" not in final_b, f"alpha must NOT resolve in profile B"
-        assert "gamma_tool" not in final_b, f"gamma must NOT resolve in profile B"
+        assert "beta_tool" in final_b, "beta must resolve in profile B"
+        assert "alpha_tool" not in final_b, "alpha must NOT resolve in profile B"
+        assert "gamma_tool" not in final_b, "gamma must NOT resolve in profile B"
 
     finally:
         _ts_mod.TOOLSETS.clear()
