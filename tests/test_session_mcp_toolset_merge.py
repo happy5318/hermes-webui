@@ -939,6 +939,147 @@ def test_plugin_canonical_mcp_prefix_collision_restricts(monkeypatch):
     )
 
 
+def test_free_text_all_wildcard_preserved_in_restrict(monkeypatch):
+    """Gate finding #2 probe (b): a deliberate free-text override of ``all``
+    (the UI and API both accept it, and the installed resolver expands it to
+    every toolset) must be PRESERVED in the restrict branch — dropping it
+    yields an explicit EMPTY allowlist: the user asked for everything and got
+    nothing.
+
+    The wildcard is only dropped when it also collides with a configured
+    same-named MCP server (a server literally named ``all``), because then
+    the bare token is genuinely ambiguous between the wildcard and the
+    server's picker token.
+    """
+    import toolsets as _ts_mod
+    from tools.registry import registry as _reg
+
+    _saved_toolsets = dict(_ts_mod.TOOLSETS)
+    _saved_tools = dict(_reg._tools)
+    _saved_aliases = dict(_reg._toolset_aliases)
+
+    try:
+        # A configured server NOT named "all" — free-text "all" must survive.
+        _ts_mod.create_custom_toolset("alpha", "server alpha",
+                                      tools=[], includes=[])
+        _reg.register_toolset_alias("alpha", "mcp-alpha")
+        _reg.register("alpha_tool", "mcp-alpha", {"type": "object"},
+                      lambda *a, **k: "ok", override=True)
+
+        defaults = ["web", "file"]
+        override = ["all"]  # free-text wildcard intent
+        mcp_servers = {"alpha"}
+        result = _apply_override(
+            defaults, override, mcp_servers,
+            builtin_names={"web", "file", "terminal"},
+        )
+
+        assert result == ["all"], (
+            f"free-text 'all' must be preserved in restrict mode, got {result!r}"
+        )
+        # Resolving it must yield the full toolset, not an empty list.
+        resolved = set(_ts_mod.resolve_toolset("all"))
+        assert "web_search" in resolved and "read_file" in resolved, (
+            f"'all' must expand to the full toolset, got {sorted(resolved)!r}"
+        )
+    finally:
+        _ts_mod.TOOLSETS.clear()
+        _ts_mod.TOOLSETS.update(_saved_toolsets)
+        _reg._tools.clear()
+        _reg._tools.update(_saved_tools)
+        _reg._toolset_aliases.clear()
+        _reg._toolset_aliases.update(_saved_aliases)
+
+
+def test_free_text_star_wildcard_preserved_in_restrict(monkeypatch):
+    """Same as above but with ``*`` instead of ``all``."""
+    defaults = ["web", "file"]
+    override = ["*"]
+    mcp_servers = {"alpha"}
+
+    result = _apply_override(
+        defaults, override, mcp_servers,
+        builtin_names={"web", "file", "terminal"},
+    )
+
+    assert result == ["*"], (
+        f"free-text '*' must be preserved in restrict mode, got {result!r}"
+    )
+
+
+def test_free_text_all_dropped_when_collides_with_server_named_all():
+    """The wildcard is dropped ONLY in the genuinely-ambiguous case: a
+    configured MCP server literally named ``all``.  Then the bare token
+    could be the wildcard OR the server's picker token, so fail closed."""
+    defaults = ["web", "file"]
+    override = ["all"]
+    mcp_servers = {"all", "alpha"}  # server literally named "all"
+
+    result = _apply_override(
+        defaults, override, mcp_servers,
+        builtin_names={"web", "file", "terminal"},
+    )
+
+    assert result == [], (
+        "bare 'all' colliding with a configured server named 'all' is "
+        "ambiguous → must drop (got {})".format(result)
+    )
+
+
+def test_registered_mcp_prefix_toolset_passes_through(monkeypatch):
+    """Gate finding #3 probe (c): a valid REGISTERED/static toolset whose
+    name begins with ``mcp-`` but which does NOT correspond to a configured
+    MCP server (e.g. ``mcp-custom-probe``) must be preserved in the restrict
+    branch — master passes it through, and dropping it silently discards a
+    valid toolset.
+    """
+    import toolsets as _ts_mod
+    from tools.registry import registry as _reg
+
+    _saved_toolsets = dict(_ts_mod.TOOLSETS)
+    _saved_tools = dict(_reg._tools)
+    _saved_aliases = dict(_reg._toolset_aliases)
+
+    try:
+        # Registered static toolset named "mcp-custom-probe", NO configured
+        # MCP server named "custom-probe" — it is a genuine toolset.
+        _ts_mod.create_custom_toolset("mcp-custom-probe",
+                                      "registered mcp-* toolset",
+                                      tools=["probe_tool"], includes=[])
+        _reg.register("probe_tool", "mcp-custom-probe", {"type": "object"},
+                      lambda *a, **k: "ok", override=True)
+        # Configured server alpha — unrelated to the probe.
+        _ts_mod.create_custom_toolset("alpha", "server alpha",
+                                      tools=[], includes=[])
+        _reg.register_toolset_alias("alpha", "mcp-alpha")
+        _reg.register("alpha_tool", "mcp-alpha", {"type": "object"},
+                      lambda *a, **k: "ok", override=True)
+
+        defaults = ["web", "file"]
+        override = ["mcp-custom-probe"]
+        mcp_servers = {"alpha"}
+        result = _apply_override(
+            defaults, override, mcp_servers,
+            builtin_names={"web", "file", "terminal", "mcp-custom-probe"},
+        )
+
+        assert "mcp-custom-probe" in result, (
+            f"registered mcp-* toolset must pass through, got {result!r}"
+        )
+        # It must resolve to its own tools.
+        resolved = set(_ts_mod.resolve_toolset("mcp-custom-probe"))
+        assert "probe_tool" in resolved, (
+            f"mcp-custom-probe must resolve its tool, got {sorted(resolved)!r}"
+        )
+    finally:
+        _ts_mod.TOOLSETS.clear()
+        _ts_mod.TOOLSETS.update(_saved_toolsets)
+        _reg._tools.clear()
+        _reg._tools.update(_saved_tools)
+        _reg._toolset_aliases.clear()
+        _reg._toolset_aliases.update(_saved_aliases)
+
+
 # ── Malformed registry return shapes must fail closed ──────────────────────
 
 
@@ -1106,7 +1247,13 @@ def test_wildcard_star_in_defaults_fails_closed_when_mcp_unchecked():
 
 def test_wildcard_all_ok_when_all_mcp_checked():
     """When ALL configured MCP servers are ticked, a wildcard default is
-    safe — no unchecked server can leak through the expansion."""
+    STILL not safe to retain — it expands at resolution time to every
+    registered toolset, including registry entries from OUTSIDE the current
+    config (gate finding #1: with ``alpha`` selected, an unconfigured
+    ``mcp-foreign`` tool became callable).  The additive branch must return
+    the verified explicit ``override_targets`` whenever defaults contain a
+    wildcard, regardless of whether ``_unchecked`` is empty.
+    """
     defaults = ["all"]
     override = ["alpha", "beta"]
     mcp_servers = {"alpha", "beta"}
@@ -1116,9 +1263,78 @@ def test_wildcard_all_ok_when_all_mcp_checked():
         builtin_names={"web", "file", "terminal", "delegation"},
     )
 
-    assert "alpha" in result and "beta" in result, (
-        "all-checked wildcard must retain the checked servers (got {})".format(result)
+    assert "all" not in result, (
+        "raw wildcard 'all' must never survive an additive override, "
+        "even when every configured server is ticked (got {})".format(result)
     )
+    assert "alpha" in result and "beta" in result, (
+        "all-checked override must retain the checked servers (got {})".format(result)
+    )
+
+
+def test_wildcard_default_all_servers_selected_no_foreign_leak(monkeypatch):
+    """Gate finding #1 probe (a): with a wildcard profile default AND every
+    configured MCP server ticked, the final resolved tool list must NOT
+    contain tools from a server that is NOT in the current config.
+
+    The registry holds a foreign ``mcp-foreign`` toolset.  Retaining the
+    wildcard default would expand it across the whole live registry at
+    resolution time and expose ``foreign_tool``; the fix must return only
+    the verified canonical targets.
+    """
+    import toolsets as _ts_mod
+    from tools.registry import registry as _reg
+
+    _saved_toolsets = dict(_ts_mod.TOOLSETS)
+    _saved_tools = dict(_reg._tools)
+    _saved_aliases = dict(_reg._toolset_aliases)
+
+    try:
+        # Configured servers alpha/beta → canonical mcp-alpha / mcp-beta.
+        # NOTE: no TOOLSETS entry for the bare names — the resolver must
+        # reach them through their registry alias (like the real runtime).
+        for _name in ("alpha", "beta"):
+            _reg.register_toolset_alias(_name, f"mcp-{_name}")
+            _reg.register(f"{_name}_tool", f"mcp-{_name}", {"type": "object"},
+                          lambda *a, **k: "ok", override=True)
+        # FOREIGN: registered in the live registry but NOT configured.
+        _reg.register("foreign_tool", "mcp-foreign", {"type": "object"},
+                      lambda *a, **k: "ok", override=True)
+
+        assert _reg.get_toolset_alias_target("alpha") == "mcp-alpha"
+        assert _reg.get_toolset_alias_target("beta") == "mcp-beta"
+
+        defaults = ["all"]  # wildcard profile default
+        override = ["alpha", "beta"]  # every configured server ticked
+        mcp_servers = {"alpha", "beta"}
+        result = _apply_override(
+            defaults, override, mcp_servers,
+            builtin_names={"web", "file", "terminal"},
+        )
+
+        # The raw wildcard must never survive.
+        assert "all" not in result, (
+            f"wildcard default must not survive, got {result!r}"
+        )
+        # Resolve every returned selector: only the ticked servers' tools
+        # may appear; the unconfigured foreign server must stay out.
+        final_tools = set()
+        for name in result:
+            final_tools.update(_ts_mod.resolve_toolset(name))
+        assert "alpha_tool" in final_tools and "beta_tool" in final_tools, (
+            f"ticked servers' tools must resolve, got {sorted(final_tools)!r}"
+        )
+        assert "foreign_tool" not in final_tools, (
+            f"unconfigured foreign server's tools must NOT resolve, "
+            f"got {sorted(final_tools)!r}"
+        )
+    finally:
+        _ts_mod.TOOLSETS.clear()
+        _ts_mod.TOOLSETS.update(_saved_toolsets)
+        _reg._tools.clear()
+        _reg._tools.update(_saved_tools)
+        _reg._toolset_aliases.clear()
+        _reg._toolset_aliases.update(_saved_aliases)
 
 
 def test_wildcard_default_with_selected_server_named_all(monkeypatch):

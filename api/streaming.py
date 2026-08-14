@@ -8332,20 +8332,22 @@ def _apply_session_toolset_override(defaults, override, mcp_server_names,
             if _srv not in true_shadow:
                 mcp_strip.add(_srv)
             mcp_strip.add('mcp-' + _srv)
-        # Wildcards/composites in defaults (e.g. ``all``, ``*``)
-        # resolve to every registered toolset, including configured
-        # MCP servers the user did NOT tick.  If any configured MCP
-        # server is unchecked, we cannot safely expand the wildcard
-        # without leaking its tools — fail closed to restrictive
-        # session semantics.
-        # Round-14 fix: return verified canonical targets, not raw override.
-        # A configured server named "all" could have its selector changed
-        # from canonical back to raw wildcard if we return list(override).
-        _unchecked = mcp_server_names - set(override)
-        if _unchecked:
-            _wildcards = {'all', '*'}
-            if any(_d in _wildcards for _d in defaults):
-                return list(override_targets)  # use verified canonical targets
+        # Wildcards in defaults (``all`` / ``*``) resolve to EVERY
+        # registered toolset at resolution time — including registry
+        # entries from OUTSIDE the current config.  Even when every
+        # configured server is ticked (``_unchecked`` empty), the wildcard
+        # default survives the name-level filter and the resolver later
+        # expands it across the whole live registry, exposing unselected —
+        # or entirely unconfigured — servers' tools (gate-certified SILENT
+        # over-grant: with ``alpha`` selected, an unconfigured
+        # ``mcp-foreign`` tool became callable).  Never retain a wildcard
+        # profile default during an additive session override — return the
+        # verified explicit ``override_targets`` whenever ``defaults``
+        # contains ``all`` or ``*``, regardless of whether ``_unchecked``
+        # is empty.
+        _wildcards = {'all', '*'}
+        if any(_d in _wildcards for _d in defaults):
+            return list(override_targets)  # use verified canonical targets
         # A default entry that is a *composite* toolset (one whose
         # ``includes`` transitively references an MCP-server toolset)
         # would survive the name-level filter but re-expose the
@@ -8419,10 +8421,19 @@ def _apply_session_toolset_override(defaults, override, mcp_server_names,
     safe_override = []
     for name in override:
         if name in {'all', '*'}:
-            # Wildcard: only safe if we can verify no unchecked MCP server
-            # would be included.  This requires registry access which we
-            # may not have.  Fail closed by dropping wildcards entirely
-            # in the restrict branch — the user can use explicit names.
+            # Free-text wildcard = the user's EXPLICIT "everything" intent.
+            # The UI and API both accept ``all``/``*`` and the installed
+            # resolver expands each to the full toolset (~94 tools).
+            # Dropping it yields an explicit EMPTY allowlist — the user
+            # asked for everything and got nothing (gate finding #2).
+            # Preserve the wildcard UNLESS it also collides with a
+            # configured same-named MCP server (a server literally named
+            # ``all``/``*``): then the bare token is ambiguous between the
+            # wildcard and the server's picker token, and only that
+            # genuinely-ambiguous case is dropped.
+            if name in mcp_server_names:
+                continue
+            safe_override.append(name)
             continue
         if name.startswith('mcp-'):
             # Round-15 fix: if the FULL selector is itself a configured
@@ -8443,7 +8454,17 @@ def _apply_session_toolset_override(defaults, override, mcp_server_names,
                 if _target == name:
                     safe_override.append(name)
                 # else: ownership unprovable → drop (fail closed)
-            # else: not a configured MCP server's canonical → drop
+                continue
+            # Round-16 fix: a name that is NEITHER a configured server's
+            # bare token NOR the canonical of one (``_srv_name`` not
+            # configured) is a genuine registered/static toolset that
+            # merely begins with ``mcp-`` (e.g. ``mcp-custom-probe``).
+            # Master passes such entries through; dropping them silently
+            # discards a valid toolset (gate finding #3).  Preserve it
+            # when proven present in the builtin shadow set, fail closed
+            # otherwise.
+            if name in true_shadow:
+                safe_override.append(name)
             continue
         # Bare name or non-mcp-* selector: pass through unchanged
         safe_override.append(name)
