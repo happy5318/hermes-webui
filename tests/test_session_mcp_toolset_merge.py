@@ -950,6 +950,13 @@ def test_free_text_all_wildcard_preserved_in_restrict(monkeypatch):
     same-named MCP server (a server literally named ``all``), because then
     the bare token is genuinely ambiguous between the wildcard and the
     server's picker token.
+
+    Round-17 review fix: The wildcard in restrict mode must expand to ALL
+    REGISTERED tools EXCEPT those from unconfigured MCP servers. The function
+    expands `all`/`*` to explicit selectors (all builtins/plugins + all
+    configured MCP servers), NOT the raw wildcard token. This prevents the
+    resolver from later expanding it across the whole process-global registry
+    and exposing foreign tools.
     """
     import toolsets as _ts_mod
     from tools.registry import registry as _reg
@@ -959,11 +966,15 @@ def test_free_text_all_wildcard_preserved_in_restrict(monkeypatch):
     _saved_aliases = dict(_reg._toolset_aliases)
 
     try:
-        # A configured server NOT named "all" — free-text "all" must survive.
+        # A configured server NOT named "all" — free-text "all" must be expanded.
         _ts_mod.create_custom_toolset("alpha", "server alpha",
                                       tools=[], includes=[])
         _reg.register_toolset_alias("alpha", "mcp-alpha")
         _reg.register("alpha_tool", "mcp-alpha", {"type": "object"},
+                      lambda *a, **k: "ok", override=True)
+        # FOREIGN: registered in the live registry but NOT configured.
+        # The wildcard expansion must NOT include this tool.
+        _reg.register("foreign_tool", "mcp-foreign", {"type": "object"},
                       lambda *a, **k: "ok", override=True)
 
         defaults = ["web", "file"]
@@ -974,13 +985,33 @@ def test_free_text_all_wildcard_preserved_in_restrict(monkeypatch):
             builtin_names={"web", "file", "terminal"},
         )
 
-        assert result == ["all"], (
-            f"free-text 'all' must be preserved in restrict mode, got {result!r}"
+        # Round-17 fix: wildcard is EXPANDED to explicit selectors, not kept as "all".
+        # The raw wildcard token is not returned because the resolver would later
+        # expand it across the whole registry (including foreign tools).
+        assert "all" not in result, (
+            f"wildcard must be expanded, not kept as raw token. Got {result!r}"
         )
-        # Resolving it must yield the full toolset, not an empty list.
-        resolved = set(_ts_mod.resolve_toolset("all"))
-        assert "web_search" in resolved and "read_file" in resolved, (
-            f"'all' must expand to the full toolset, got {sorted(resolved)!r}"
+        # The expanded result must include builtins and configured MCP servers.
+        assert "web" in result and "file" in result, (
+            f"builtin toolsets must be in expanded result, got {result!r}"
+        )
+        assert "mcp-alpha" in result, (
+            f"configured MCP server must be in expanded result, got {result!r}"
+        )
+        # Resolve every selector: foreign must NOT be exposed.
+        final_tools = set()
+        for name in result:
+            final_tools.update(_ts_mod.resolve_toolset(name))
+        assert "web_search" in final_tools and "read_file" in final_tools, (
+            f"builtin tools must resolve, got {sorted(final_tools)!r}"
+        )
+        assert "alpha_tool" in final_tools, (
+            f"configured MCP server's tools must resolve, got {sorted(final_tools)!r}"
+        )
+        # Round-17 fix: assert foreign MCP tool is NOT exposed.
+        assert "foreign_tool" not in final_tools, (
+            f"wildcard expansion must NOT expose foreign MCP tools "
+            f"(unconfigured servers). Got {sorted(final_tools)!r}"
         )
     finally:
         _ts_mod.TOOLSETS.clear()
@@ -1002,8 +1033,12 @@ def test_free_text_star_wildcard_preserved_in_restrict(monkeypatch):
         builtin_names={"web", "file", "terminal"},
     )
 
-    assert result == ["*"], (
-        f"free-text '*' must be preserved in restrict mode, got {result!r}"
+    # Wildcard is expanded, not kept as raw "*"
+    assert "*" not in result, (
+        f"wildcard must be expanded, not kept as raw token. Got {result!r}"
+    )
+    assert "web" in result and "file" in result, (
+        f"builtin toolsets must be in expanded result, got {result!r}"
     )
 
 
@@ -1281,6 +1316,10 @@ def test_wildcard_default_all_servers_selected_no_foreign_leak(monkeypatch):
     wildcard default would expand it across the whole live registry at
     resolution time and expose ``foreign_tool``; the fix must return only
     the verified canonical targets.
+
+    Round-17 review fix: must also assert safe-survivor tools (web_search,
+    read_file) are present in the final resolved toolset — the profile
+    defaults contain builtins that must survive the additive merge.
     """
     import toolsets as _ts_mod
     from tools.registry import registry as _reg
@@ -1304,7 +1343,9 @@ def test_wildcard_default_all_servers_selected_no_foreign_leak(monkeypatch):
         assert _reg.get_toolset_alias_target("alpha") == "mcp-alpha"
         assert _reg.get_toolset_alias_target("beta") == "mcp-beta"
 
-        defaults = ["all"]  # wildcard profile default
+        # Profile defaults include wildcards AND builtin toolsets.
+        # The builtins (web, file) must survive the additive merge.
+        defaults = ["web", "file", "all"]  # wildcard profile default + builtins
         override = ["alpha", "beta"]  # every configured server ticked
         mcp_servers = {"alpha", "beta"}
         result = _apply_override(
@@ -1316,14 +1357,24 @@ def test_wildcard_default_all_servers_selected_no_foreign_leak(monkeypatch):
         assert "all" not in result, (
             f"wildcard default must not survive, got {result!r}"
         )
+        # The builtin defaults must survive the additive merge.
+        assert "web" in result and "file" in result, (
+            f"builtin defaults must survive additive merge, got {result!r}"
+        )
         # Resolve every returned selector: only the ticked servers' tools
         # may appear; the unconfigured foreign server must stay out.
         final_tools = set()
         for name in result:
             final_tools.update(_ts_mod.resolve_toolset(name))
+        # Safe-survivor builtin tools must resolve.
+        assert "web_search" in final_tools and "read_file" in final_tools, (
+            f"safe-survivor builtin tools must resolve, got {sorted(final_tools)!r}"
+        )
+        # Ticked MCP servers' tools must resolve.
         assert "alpha_tool" in final_tools and "beta_tool" in final_tools, (
             f"ticked servers' tools must resolve, got {sorted(final_tools)!r}"
         )
+        # Foreign must be excluded.
         assert "foreign_tool" not in final_tools, (
             f"unconfigured foreign server's tools must NOT resolve, "
             f"got {sorted(final_tools)!r}"
@@ -2663,6 +2714,191 @@ def test_exact_alias_match_required_for_ownership(monkeypatch):
         assert "mcp_wrong_tool" not in final_tools, (
             f"ambiguously-owned tick mcp-wrong must fail closed, got {sorted(final_tools)!r}"
         )
+    finally:
+        _ts_mod.TOOLSETS.clear()
+        _ts_mod.TOOLSETS.update(_saved_toolsets)
+        _reg._tools.clear()
+        _reg._tools.update(_saved_tools)
+        _reg._toolset_aliases.clear()
+        _reg._toolset_aliases.update(_saved_aliases)
+
+
+# ── Round-17 additional regression tests ───────────────────────────────────────
+
+
+def test_unconfigured_mcp_foreign_canonical_absent_from_result(monkeypatch):
+    """Round-17 scenario 3: an unconfigured MCP server's canonical selector
+    (e.g. ``mcp-foreign``) is present in the global registry but must NOT
+    appear in the final toolset result.
+
+    The profile only configures ``alpha``; the ``foreign`` server is in the
+    registry but NOT configured. The selector ``mcp-foreign`` must be absent.
+    """
+    import toolsets as _ts_mod
+    from tools.registry import registry as _reg
+
+    _saved_toolsets = dict(_ts_mod.TOOLSETS)
+    _saved_tools = dict(_reg._tools)
+    _saved_aliases = dict(_reg._toolset_aliases)
+
+    try:
+        # Configured server alpha
+        _reg.register_toolset_alias("alpha", "mcp-alpha")
+        _reg.register("alpha_tool", "mcp-alpha", {"type": "object"},
+                      lambda *a, **k: "ok", override=True)
+        # Unconfigured foreign server in global registry
+        _reg.register("foreign_tool", "mcp-foreign", {"type": "object"},
+                      lambda *a, **k: "ok", override=True)
+
+        defaults = ["web", "file"]
+        override = ["alpha"]  # tick alpha only
+        mcp_servers = {"alpha"}  # only alpha is configured
+        result = _apply_override(
+            defaults, override, mcp_servers,
+            builtin_names={"web", "file", "terminal"},
+        )
+
+        # mcp-foreign must NOT appear
+        assert "mcp-foreign" not in result, (
+            f"unconfigured MCP server canonical must be absent, got {result!r}"
+        )
+        # Resolve: foreign_tool must not be callable
+        final_tools = set()
+        for name in result:
+            final_tools.update(_ts_mod.resolve_toolset(name))
+        assert "foreign_tool" not in final_tools, (
+            f"foreign server tools must not resolve, got {sorted(final_tools)!r}"
+        )
+    finally:
+        _ts_mod.TOOLSETS.clear()
+        _ts_mod.TOOLSETS.update(_saved_toolsets)
+        _reg._tools.clear()
+        _reg._tools.update(_saved_tools)
+        _reg._toolset_aliases.clear()
+        _reg._toolset_aliases.update(_saved_aliases)
+
+
+def test_immutable_static_mcp_prefix_survives_with_provenance(monkeypatch):
+    """Round-17 scenario 4: a genuinely immutable static/plugin toolset whose
+    name begins with ``mcp-`` must survive ONLY with real provenance authority
+    (presence in the builtin shadow set), not just because the name looks like
+    an MCP server.
+
+    This verifies the `true_shadow` check in the restrict branch correctly
+    distinguishes between real static/plugin toolsets and MCP server selectors.
+    """
+    import toolsets as _ts_mod
+    from tools.registry import registry as _reg
+
+    _saved_toolsets = dict(_ts_mod.TOOLSETS)
+    _saved_tools = dict(_reg._tools)
+    _saved_aliases = dict(_reg._toolset_aliases)
+
+    try:
+        # A genuine static toolset named "mcp-browser" (e.g. a plugin)
+        _ts_mod.create_custom_toolset("mcp-browser", "browser plugin",
+                                      tools=["browser_navigate"], includes=[])
+        _reg.register("browser_navigate", "mcp-browser", {"type": "object"},
+                      lambda *a, **k: "ok", override=True)
+        # NO alias edge — this is NOT an MCP server, it's a static toolset
+
+        # A configured MCP server alpha
+        _reg.register_toolset_alias("alpha", "mcp-alpha")
+        _reg.register("alpha_tool", "mcp-alpha", {"type": "object"},
+                      lambda *a, **k: "ok", override=True)
+
+        defaults = ["web", "file"]
+        override = ["mcp-browser"]  # user selects the static toolset
+        mcp_servers = {"alpha"}  # only alpha is a configured MCP server
+        result = _apply_override(
+            defaults, override, mcp_servers,
+            builtin_names={"web", "file", "terminal", "mcp-browser"},  # proven in shadow
+        )
+
+        # mcp-browser must survive (it's in true_shadow)
+        assert "mcp-browser" in result, (
+            f"static mcp-* toolset with provenance must survive, got {result!r}"
+        )
+        # It resolves to its own tools
+        final_tools = set()
+        for name in result:
+            final_tools.update(_ts_mod.resolve_toolset(name))
+        assert "browser_navigate" in final_tools, (
+            f"static mcp-browser tool must resolve, got {sorted(final_tools)!r}"
+        )
+    finally:
+        _ts_mod.TOOLSETS.clear()
+        _ts_mod.TOOLSETS.update(_saved_toolsets)
+        _reg._tools.clear()
+        _reg._tools.update(_saved_tools)
+        _reg._toolset_aliases.clear()
+        _reg._toolset_aliases.update(_saved_aliases)
+
+
+def test_two_profiles_same_registry_isolation(monkeypatch):
+    """Round-17 scenario 5: two profile/session configs sharing one process-global
+    registry — each final Agent must receive only its own MCP tools plus safe defaults.
+
+    Simulate two different session overrides against the same registry where
+    different MCP servers are configured for each "profile".
+    """
+    import toolsets as _ts_mod
+    from tools.registry import registry as _reg
+
+    _saved_toolsets = dict(_ts_mod.TOOLSETS)
+    _saved_tools = dict(_reg._tools)
+    _saved_aliases = dict(_reg._toolset_aliases)
+
+    try:
+        # Global registry has tools from multiple servers
+        _reg.register_toolset_alias("alpha", "mcp-alpha")
+        _reg.register("alpha_tool", "mcp-alpha", {"type": "object"},
+                      lambda *a, **k: "ok", override=True)
+        _reg.register_toolset_alias("beta", "mcp-beta")
+        _reg.register("beta_tool", "mcp-beta", {"type": "object"},
+                      lambda *a, **k: "ok", override=True)
+        _reg.register_toolset_alias("gamma", "mcp-gamma")
+        _reg.register("gamma_tool", "mcp-gamma", {"type": "object"},
+                      lambda *a, **k: "ok", override=True)
+
+        # Profile A: only alpha configured, tick alpha
+        result_a = _apply_override(
+            ["web", "file"],
+            ["alpha"],
+            {"alpha"},  # only alpha configured
+            builtin_names={"web", "file", "terminal"},
+        )
+
+        # Profile B: only beta configured, tick beta
+        result_b = _apply_override(
+            ["web", "file"],
+            ["beta"],
+            {"beta"},  # only beta configured
+            builtin_names={"web", "file", "terminal"},
+        )
+
+        # Profile A must NOT have beta or gamma
+        assert "mcp-beta" not in result_a and "mcp-gamma" not in result_a, (
+            f"profile A must not have other profile tools, got {result_a!r}"
+        )
+        final_a = set()
+        for name in result_a:
+            final_a.update(_ts_mod.resolve_toolset(name))
+        assert "alpha_tool" in final_a, f"alpha must resolve in profile A"
+        assert "beta_tool" not in final_a, f"beta must NOT resolve in profile A"
+        assert "gamma_tool" not in final_a, f"gamma must NOT resolve in profile A"
+
+        # Profile B must NOT have alpha or gamma
+        assert "mcp-alpha" not in result_b and "mcp-gamma" not in result_b, (
+            f"profile B must not have other profile tools, got {result_b!r}"
+        )
+        final_b = set()
+        for name in result_b:
+            final_b.update(_ts_mod.resolve_toolset(name))
+        assert "beta_tool" in final_b, f"beta must resolve in profile B"
+        assert "alpha_tool" not in final_b, f"alpha must NOT resolve in profile B"
+        assert "gamma_tool" not in final_b, f"gamma must NOT resolve in profile B"
+
     finally:
         _ts_mod.TOOLSETS.clear()
         _ts_mod.TOOLSETS.update(_saved_toolsets)

@@ -8341,13 +8341,24 @@ def _apply_session_toolset_override(defaults, override, mcp_server_names,
         # or entirely unconfigured — servers' tools (gate-certified SILENT
         # over-grant: with ``alpha`` selected, an unconfigured
         # ``mcp-foreign`` tool became callable).  Never retain a wildcard
-        # profile default during an additive session override — return the
-        # verified explicit ``override_targets`` whenever ``defaults``
-        # contains ``all`` or ``*``, regardless of whether ``_unchecked``
-        # is empty.
+        # profile default during an additive session override.
+        #
+        # Round-17 fix: drop the wildcard but KEEP the builtin defaults.
+        # The additive merge contract requires builtins to survive even
+        # when a wildcard is present. Only the wildcard token itself is
+        # unsafe; the explicit builtin names are safe.
         _wildcards = {'all', '*'}
-        if any(_d in _wildcards for _d in defaults):
-            return list(override_targets)  # use verified canonical targets
+        _has_wildcard = any(_d in _wildcards for _d in defaults)
+        if _has_wildcard:
+            # Filter out wildcards, keep builtins, add override_targets
+            _safe_defaults = [d for d in defaults if d not in _wildcards]
+            merged = list(_safe_defaults)  # builtins/plugins survive
+            seen = set(merged)
+            for name in override_targets:
+                if name is not None and name not in seen:
+                    merged.append(name)
+                    seen.add(name)
+            return merged
         # A default entry that is a *composite* toolset (one whose
         # ``includes`` transitively references an MCP-server toolset)
         # would survive the name-level filter but re-expose the
@@ -8426,14 +8437,25 @@ def _apply_session_toolset_override(defaults, override, mcp_server_names,
             # resolver expands each to the full toolset (~94 tools).
             # Dropping it yields an explicit EMPTY allowlist — the user
             # asked for everything and got nothing (gate finding #2).
-            # Preserve the wildcard UNLESS it also collides with a
-            # configured same-named MCP server (a server literally named
-            # ``all``/``*``): then the bare token is ambiguous between the
-            # wildcard and the server's picker token, and only that
-            # genuinely-ambiguous case is dropped.
+            #
+            # Round-17 fix: the wildcard MUST NOT expose tools from
+            # unconfigured MCP servers. Expand the wildcard to explicit
+            # selectors and filter out foreign MCP toolsets.
+            # The resolver's `all` expands to ALL registered toolsets,
+            # including those from other profiles/sessions sharing the
+            # process-global registry. The security semantics require:
+            # "everything in my profile context" = all builtins/plugins +
+            # all configured MCP servers, NOT every random tool in the
+            # process-global registry.
             if name in mcp_server_names:
-                continue
-            safe_override.append(name)
+                continue  # collision with server named "all"/"*"
+            # Expand wildcard to all known safe toolsets:
+            # - All builtin/plugin toolsets (in true_shadow)
+            # - All configured MCP servers (via canonical mcp-<name>)
+            _expanded = set(true_shadow)  # builtins/plugins
+            for _srv in mcp_server_names:
+                _expanded.add(f"mcp-{_srv}")  # configured MCP servers
+            safe_override.extend(sorted(_expanded))
             continue
         if name.startswith('mcp-'):
             # Round-15 fix: if the FULL selector is itself a configured
