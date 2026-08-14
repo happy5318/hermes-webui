@@ -8062,6 +8062,80 @@ def _builtin_toolset_names():
     return names
 
 
+def _profile_owned_static_toolsets(builtin_names, mcp_server_names):
+    """Return the set of static/builtin/plugin toolsets that are AUTHORIZED
+    for the current profile context.
+
+    This separates INVENTORY (all registered toolsets in the process-global
+    registry) from AUTHORIZATION (which toolsets belong to the current profile
+    and are safe to expose).
+
+    The process-global registry includes:
+      - Static builtin toolsets (web, file, terminal, etc.)
+      - Plugin toolsets registered by the current profile
+      - Canonical names for MCP servers from ALL profiles (mcp-* entries)
+
+    For capability isolation, we must distinguish:
+      - Owned canonicals: mcp-<server> where <server> is configured in the
+        current profile (these are the server's own registry identity, not
+        static/plugin shadows) - EXCLUDED (will be added via explicit MCP selection)
+      - Foreign MCP canonicals: mcp-<server> where <server> is NOT configured
+        but HAS an alias edge to a server - EXCLUDED (belongs to other profile)
+      - Static/plugin mcp-* toolsets: names starting with mcp- but have NO
+        alias edge to any MCP server - INCLUDED (these are genuine static/plugin
+        toolsets that merely share the prefix)
+
+    Returns None when builtin_names is None (registry unavailable) -
+    cannot determine authorization without the inventory.
+
+    Round-18 gate fix: separates inventory from authorization to prevent
+    wildcard defaults and free-text wildcards from exposing foreign MCP tools.
+    """
+    if builtin_names is None:
+        return None
+    if not isinstance(builtin_names, (set, list, tuple)):
+        return None
+    if mcp_server_names is None:
+        mcp_server_names = set()
+    elif not isinstance(mcp_server_names, (set, list, tuple)):
+        return None
+    else:
+        mcp_server_names = set(mcp_server_names)
+
+    # Start with the full inventory
+    profile_owned = set(builtin_names) if not isinstance(builtin_names, set) else builtin_names.copy()
+
+    # Exclude owned canonicals (current profile's MCP servers' registry names)
+    # These are NOT static/plugin shadows - they ARE the MCP server itself
+    owned_canonicals = set()
+    for _srv in mcp_server_names:
+        _t = _registry_alias_target(_srv)
+        if _t == f"mcp-{_srv}":  # exact match required for ownership proof
+            owned_canonicals.add(_t)
+
+    # For each mcp-* entry, determine if it's:
+    # 1. Owned canonical (current profile's MCP) -> EXCLUDE (handled via explicit selection)
+    # 2. Foreign MCP canonical (has alias edge but not our server) -> EXCLUDE
+    # 3. Static/plugin toolset (no alias edge) -> INCLUDE
+    for _name in list(profile_owned):
+        if _name.startswith('mcp-'):
+            if _name in owned_canonicals:
+                # Owned by current profile - exclude, will be added via MCP selection
+                profile_owned.discard(_name)
+            else:
+                # Check if it has an alias edge to any server
+                _srv_name = _name[4:]  # strip 'mcp-' prefix
+                _alias_target = _registry_alias_target(_srv_name)
+                if _alias_target == _name:
+                    # Has alias edge = MCP server canonical (foreign)
+                    # EXCLUDE - belongs to other profile
+                    profile_owned.discard(_name)
+                # else: no alias edge = static/plugin toolset -> INCLUDE
+
+    return profile_owned
+
+
+
 
 def _canonicalize_picker_mcp_selection(name, mcp_server_names):
     """Map a picker-derived MCP server selection to an unambiguous registry
@@ -8350,15 +8424,16 @@ def _apply_session_toolset_override(defaults, override, mcp_server_names,
         _wildcards = {'all', '*'}
         _has_wildcard = any(_d in _wildcards for _d in defaults)
         if _has_wildcard:
-            # Filter out wildcards, keep builtins, add override_targets
-            _safe_defaults = [d for d in defaults if d not in _wildcards]
-            merged = list(_safe_defaults)  # builtins/plugins survive
-            seen = set(merged)
-            for name in override_targets:
-                if name is not None and name not in seen:
-                    merged.append(name)
-                    seen.add(name)
-            return merged
+            # Round-18 gate fix: wildcard defaults MUST go through the full
+            # check chain (mcp_strip, composite check) rather than early return.
+            # Replace wildcards with profile-owned static toolsets, then continue.
+            profile_owned = _profile_owned_static_toolsets(builtin_names, mcp_server_names)
+            if profile_owned is None:
+                # Cannot determine profile authorization → fail closed
+                return []
+            # Replace wildcards in defaults with profile-owned toolsets
+            # These will go through the same mcp_strip and composite checks below
+            defaults = [d for d in defaults if d not in _wildcards] + list(profile_owned)
         # A default entry that is a *composite* toolset (one whose
         # ``includes`` transitively references an MCP-server toolset)
         # would survive the name-level filter but re-expose the
@@ -8449,10 +8524,15 @@ def _apply_session_toolset_override(defaults, override, mcp_server_names,
             # process-global registry.
             if name in mcp_server_names:
                 continue  # collision with server named "all"/"*"
-            # Expand wildcard to all known safe toolsets:
-            # - All builtin/plugin toolsets (in true_shadow)
-            # - All configured MCP servers (via canonical mcp-<name>)
-            _expanded = set(true_shadow)  # builtins/plugins
+            # Round-18 gate fix: expand wildcard to PROFILE-OWNED toolsets only.
+            # The process-global registry contains foreign MCP canonicals from
+            # other profiles; true_shadow includes them and would expose them.
+            # Use profile_owned to exclude foreign MCP tools.
+            _profile_owned = _profile_owned_static_toolsets(builtin_names, mcp_server_names)
+            if _profile_owned is None:
+                # Cannot determine profile authorization → drop wildcard
+                continue
+            _expanded = set(_profile_owned)  # profile-owned builtins/plugins
             for _srv in mcp_server_names:
                 _expanded.add(f"mcp-{_srv}")  # configured MCP servers
             safe_override.extend(sorted(_expanded))
@@ -8477,17 +8557,19 @@ def _apply_session_toolset_override(defaults, override, mcp_server_names,
                     safe_override.append(name)
                 # else: ownership unprovable → drop (fail closed)
                 continue
-            # Round-16 fix: a name that is NEITHER a configured server's
-            # bare token NOR the canonical of one (``_srv_name`` not
-            # configured) is a genuine registered/static toolset that
-            # merely begins with ``mcp-`` (e.g. ``mcp-custom-probe``).
-            # Master passes such entries through; dropping them silently
-            # discards a valid toolset (gate finding #3).  Preserve it
-            # when proven present in the builtin shadow set, fail closed
-            # otherwise.
-            if name in true_shadow:
-                safe_override.append(name)
-            continue
+            # Round-18 gate fix: registry membership is NOT authorization.
+            # A name that is NEITHER a configured server's bare token NOR
+            # the canonical of one must be checked for static/plugin provenance.
+            # If it has an alias edge matching itself, it's a foreign MCP canonical.
+            # If no alias edge, it's a static/plugin toolset (e.g. mcp-custom-probe).
+            _alias_target = _registry_alias_target(_srv_name)
+            if _alias_target == name:
+                # Has alias edge = foreign MCP canonical from another profile
+                # Drop it - fail closed
+                continue
+            # No alias edge = static/plugin toolset with mcp- prefix
+            # Allow it to pass through
+            safe_override.append(name)
         # Bare name or non-mcp-* selector: pass through unchanged
         safe_override.append(name)
     return safe_override

@@ -1245,8 +1245,12 @@ def test_canonical_mcp_selector_in_defaults_is_stripped():
 def test_wildcard_all_in_defaults_fails_closed_when_mcp_unchecked():
     """A wildcard default ``['all']`` + override ``['beta']`` with unchecked
     server ``alpha``: the wildcard would expand to every registered toolset
-    including alpha's, so we must fail closed to restrictive semantics
-    (``['beta']``) rather than risk leaking alpha's tools.
+    including alpha's, so we must NOT retain the raw wildcard.
+    
+    Round-17/18 semantics: drop the wildcard token but PRESERVE builtins,
+    then merge with override_targets. Result = builtins + checked MCP servers.
+    This is "fail closed" against unchecked MCP tools while preserving the
+    additive contract for builtins/plugins.
     """
     defaults = ["all"]
     override = ["beta"]
@@ -1257,10 +1261,15 @@ def test_wildcard_all_in_defaults_fails_closed_when_mcp_unchecked():
         builtin_names={"web", "file", "terminal", "delegation"},
     )
 
-    assert result == ["beta"], (
-        "wildcard 'all' with unchecked MCP server must fail closed to "
-        "restrict (got {})".format(result)
-    )
+    # Wildcard dropped, builtins preserved, beta (checked MCP) added
+    # Note: without registry alias edge, beta stays as bare name
+    assert "all" not in result, "wildcard token must not survive"
+    assert "web" in result, "builtins must survive wildcard replacement"
+    assert "file" in result
+    assert "terminal" in result
+    assert "delegation" in result
+    assert "beta" in result, "checked MCP server must be added"
+    assert "alpha" not in result, "unchecked MCP server must not leak"
 
 
 def test_wildcard_star_in_defaults_fails_closed_when_mcp_unchecked():
@@ -1274,10 +1283,14 @@ def test_wildcard_star_in_defaults_fails_closed_when_mcp_unchecked():
         builtin_names={"web", "file", "terminal", "delegation"},
     )
 
-    assert result == ["beta"], (
-        "wildcard '*' with unchecked MCP server must fail closed to "
-        "restrict (got {})".format(result)
-    )
+    # Wildcard dropped, builtins preserved, beta (checked MCP) added
+    assert "*" not in result, "wildcard token must not survive"
+    assert "web" in result, "builtins must survive wildcard replacement"
+    assert "file" in result
+    assert "terminal" in result
+    assert "delegation" in result
+    assert "beta" in result, "checked MCP server must be added"
+    assert "alpha" not in result, "unchecked MCP server must not leak"
 
 
 def test_wildcard_all_ok_when_all_mcp_checked():
@@ -2907,3 +2920,144 @@ def test_two_profiles_same_registry_isolation(monkeypatch):
         _reg._toolset_aliases.clear()
         _reg._toolset_aliases.update(_saved_aliases)
 
+
+
+# ── Round-18 capability isolation tests ─────────────────────────────────────
+
+def test_wildcard_default_expands_to_profile_owned_only():
+    """Wildcard defaults must expand to profile-owned toolsets only,
+    NOT to foreign MCP canonicals from other profiles.
+    
+    Round-18 gate fix: separates inventory from authorization.
+    """
+    import toolsets as _ts_mod
+    from tools.registry import registry as _reg
+    
+    _saved_toolsets = dict(_ts_mod.TOOLSETS)
+    _saved_tools = dict(_reg._tools)
+    _saved_aliases = dict(_reg._toolset_aliases)
+    
+    try:
+        # Global registry has foreign MCP canonical (mcp-foreign)
+        _reg.register_toolset_alias("alpha", "mcp-alpha")
+        _reg.register("alpha_tool", "mcp-alpha", {"type": "object"},
+                      lambda *a, **k: "ok", override=True)
+        _reg.register_toolset_alias("foreign", "mcp-foreign")
+        _reg.register("foreign_tool", "mcp-foreign", {"type": "object"},
+                      lambda *a, **k: "ok", override=True)
+        
+        # Current profile: only alpha configured, all servers checked
+        result = _apply_override(
+            ["web", "file"],
+            ["alpha"],  # all configured servers checked
+            {"alpha"},  # only alpha configured
+            builtin_names={"web", "file", "terminal", "delegation", "mcp-alpha", "mcp-foreign"},
+        )
+        
+        # Must NOT expose foreign MCP tools
+        assert "mcp-foreign" not in result, (
+            f"foreign MCP canonical must not appear, got {result!r}"
+        )
+        # alpha appears (bare or canonical depending on alias edge)
+        assert "alpha" in result or "mcp-alpha" in result, "configured MCP must be present"
+        
+        # Verify via resolver
+        final_tools = set()
+        for name in result:
+            final_tools.update(_ts_mod.resolve_toolset(name))
+        assert "alpha_tool" in final_tools, "alpha tools must resolve"
+        assert "foreign_tool" not in final_tools, "foreign tools must NOT resolve"
+    finally:
+        _ts_mod.TOOLSETS.clear()
+        _ts_mod.TOOLSETS.update(_saved_toolsets)
+        _reg._tools.clear()
+        _reg._tools.update(_saved_tools)
+        _reg._toolset_aliases.clear()
+        _reg._toolset_aliases.update(_saved_aliases)
+
+
+def test_free_text_wildcard_expands_to_profile_owned_only():
+    """Free-text wildcard 'all' in restrict mode must expand to
+    profile-owned toolsets only, NOT to foreign MCP canonicals.
+    
+    Round-18 gate fix: separates inventory from authorization.
+    """
+    from tools.registry import registry as _reg
+    
+    _saved_tools = dict(_reg._tools)
+    _saved_aliases = dict(_reg._toolset_aliases)
+    
+    try:
+        # Global registry has foreign MCP canonical
+        _reg.register_toolset_alias("alpha", "mcp-alpha")
+        _reg.register("alpha_tool", "mcp-alpha", {"type": "object"},
+                      lambda *a, **k: "ok", override=True)
+        _reg.register_toolset_alias("foreign", "mcp-foreign")
+        _reg.register("foreign_tool", "mcp-foreign", {"type": "object"},
+                      lambda *a, **k: "ok", override=True)
+        
+        # Free-text wildcard (restrict mode)
+        result = _apply_override(
+            ["web"],  # defaults
+            ["all"],  # free-text wildcard
+            {"alpha"},  # only alpha configured
+            builtin_names={"web", "file", "terminal", "mcp-alpha", "mcp-foreign"},
+        )
+        
+        # Must NOT expose foreign MCP tools
+        assert "mcp-foreign" not in result, (
+            f"foreign MCP canonical must not appear in wildcard expansion, got {result!r}"
+        )
+        # Must include profile-owned toolsets
+        assert "web" in result or "mcp-alpha" in result, (
+            f"profile-owned toolsets must appear, got {result!r}"
+        )
+    finally:
+        _reg._tools.clear()
+        _reg._tools.update(_saved_tools)
+        _reg._toolset_aliases.clear()
+        _reg._toolset_aliases.update(_saved_aliases)
+
+
+def test_static_mcp_prefix_plugin_distinguished_from_foreign_mcp():
+    """Static/plugin toolsets with mcp- prefix (no alias edge) must be
+    distinguished from foreign MCP canonicals (have alias edge).
+    
+    Round-18 gate fix: registry membership is NOT authorization.
+    """
+    from tools.registry import registry as _reg
+    
+    _saved_tools = dict(_reg._tools)
+    _saved_aliases = dict(_reg._toolset_aliases)
+    
+    try:
+        # Foreign MCP has alias edge
+        _reg.register_toolset_alias("foreign", "mcp-foreign")
+        _reg.register("foreign_tool", "mcp-foreign", {"type": "object"},
+                      lambda *a, **k: "ok", override=True)
+        
+        # Static/plugin mcp-* toolset has NO alias edge
+        _reg.register("custom_probe", "mcp-custom-probe", {"type": "object"},
+                      lambda *a, **k: "ok", override=True)
+        
+        # Current profile: no MCP servers configured
+        result = _apply_override(
+            ["web"],
+            ["mcp-custom-probe", "mcp-foreign"],  # free-text selectors
+            set(),  # no MCP servers configured
+            builtin_names={"web", "file", "terminal", "mcp-foreign", "mcp-custom-probe"},
+        )
+        
+        # Static/plugin mcp-* must pass through
+        assert "mcp-custom-probe" in result, (
+            f"static mcp-* toolset must survive, got {result!r}"
+        )
+        # Foreign MCP canonical must be dropped (no ownership proof)
+        assert "mcp-foreign" not in result, (
+            f"foreign MCP canonical must be dropped, got {result!r}"
+        )
+    finally:
+        _reg._tools.clear()
+        _reg._tools.update(_saved_tools)
+        _reg._toolset_aliases.clear()
+        _reg._toolset_aliases.update(_saved_aliases)
