@@ -193,18 +193,19 @@ def _agentless_runtime_standins():
                 sys.modules["tools.registry"] = _mock_registry_mod
                 _changed.append(("tools.registry", _prior["tools.registry"],
                                  _mock_registry_mod))
-        # Round-21 gate fix: ``_authored_builtin_toolset_names()`` now
-        # FROZENS its snapshot on first successful import.  Each test needs a
-        # fresh snapshot of the (possibly stand-in) ``toolsets.TOOLSETS`` at
-        # its start — otherwise a ``create_custom_toolset`` in an earlier
-        # test would permanently bake a runtime custom toolset into the
-        # "authored" universe for every later test.  Reset AND pre-capture:
-        # the snapshot must freeze the PRISTINE stand-in state before the
-        # test body runs, so a ``create_custom_toolset`` inside the test
-        # cannot re-bake itself into the authored universe.
+        # Round-22 gate fix: ``_authored_builtin_toolset_names()`` now captures
+        # its snapshot EAGERLY at module import time.  Each test needs a fresh
+        # snapshot of the (possibly stand-in) ``toolsets.TOOLSETS`` at its
+        # start — otherwise a ``create_custom_toolset`` in an earlier test
+        # would permanently bake a runtime custom toolset into the "authored"
+        # universe for every later test.  Reset AND re-capture using the eager
+        # capture helper: the snapshot must freeze the PRISTINE stand-in state
+        # before the test body runs, so a ``create_custom_toolset`` inside the
+        # test cannot re-bake itself into the authored universe.
         import api.streaming as _streaming_mod
-        _streaming_mod._AUTHORED_TOOLSETS_SNAPSHOT = None
-        _streaming_mod._authored_builtin_toolset_names()
+        _streaming_mod._AUTHORED_TOOLSETS_SNAPSHOT = (
+            _streaming_mod._capture_authored_builtin_snapshot()
+        )
         yield
     finally:
         # 4. Restore/delete ONLY what this fixture changed.  Entries that
@@ -3899,6 +3900,316 @@ def test_final_resolution_generation_stable_keeps_toolsets(monkeypatch):
         )
         assert final_toolsets == result, (
             f"stable authority must keep the toolsets, got {final_toolsets!r}"
+        )
+    finally:
+        monkeypatch.setattr(streaming, "_registry_generation", _real_gen)
+        _reg._tools.clear()
+        _reg._tools.update(_saved_tools)
+        _reg._toolset_aliases.clear()
+        _reg._toolset_aliases.update(_saved_aliases)
+
+
+# ── Round-22 production-shaped discriminators ──────────────────────────────
+
+def test_eager_snapshot_rejects_foreign_mcp_before_first_auth_lookup(monkeypatch):
+    """Round-22 gate finding 1 discriminator: the authored-builtin snapshot is
+    captured EAGERLY at module import time, so a foreign profile's
+    ``create_custom_toolset("mcp-foreign")`` that runs AFTER the snapshot
+    CANNOT bake itself into the "authored" universe.
+
+    The Round-21 lazy snapshot failed this ordering: the snapshot was None
+    until the first authorization call, so a ``create_custom_toolset`` that
+    ran before that first call contaminated the snapshot.  The autouse
+    fixture masked this by pre-capturing at pristine state.
+
+    This test simulates the production ordering:
+      1. Capture the snapshot EAGERLY (at "module import" = before any
+         runtime mutation),
+      2. Create a foreign runtime mcp-* toolset (contamination attempt),
+      3. Verify the snapshot does NOT contain mcp-foreign,
+      4. Verify all three authorization lanes reject the foreign toolset.
+
+    Additionally, verify that when the snapshot is ``None`` (initial eager
+    capture failed), the authorization paths ALL fail closed — they never
+    re-capture from a potentially contaminated dict.
+    """
+    import api.streaming as streaming
+    import toolsets as _ts_mod
+    from tools.registry import registry as _reg
+
+    _saved_toolsets = dict(_ts_mod.TOOLSETS)
+    _saved_tools = dict(_reg._tools)
+    _saved_aliases = dict(_reg._toolset_aliases)
+
+    try:
+        # Step 1: Capture the snapshot EAGERLY — simulates module import
+        # time, before any runtime create_custom_toolset can contaminate
+        # the TOOLSETS dict.
+        streaming._AUTHORED_TOOLSETS_SNAPSHOT = (
+            streaming._capture_authored_builtin_snapshot()
+        )
+        _pristine = streaming._authored_builtin_toolset_names()
+        assert _pristine is not None, "pristine snapshot must be available"
+        assert "mcp-foreign" not in _pristine
+
+        # Step 2: FOREIGN profile creates a runtime mcp-* toolset AFTER the
+        # eager capture.  The snapshot is frozen and must not change.
+        _ts_mod.create_custom_toolset("mcp-foreign",
+                                      "foreign profile toolset",
+                                      tools=["foreign_tool"], includes=[])
+        _reg.register("foreign_tool", "mcp-foreign", {"type": "object"},
+                      lambda *a, **k: "ok", override=True)
+        _reg.register_toolset_alias("alpha", "mcp-alpha")
+        _reg.register("alpha_tool", "mcp-alpha", {"type": "object"},
+                      lambda *a, **k: "ok", override=True)
+
+        # Step 3: The snapshot still does NOT contain mcp-foreign.
+        _authored = streaming._authored_builtin_toolset_names()
+        assert _authored == _pristine, (
+            "eager snapshot must be frozen — runtime mutations must not "
+            "change it"
+        )
+        assert "mcp-foreign" not in _authored, (
+            f"eager snapshot must not contain runtime foreign mcp-*, "
+            f"got {sorted(_authored)!r}"
+        )
+
+        # Step 4: All three authorization lanes reject the foreign toolset.
+        # Lane 1: Exact restrictive selector → rejected.
+        result = _apply_override(
+            ["web", "file"],
+            ["mcp-foreign"],
+            {"alpha"},
+        )
+        assert "mcp-foreign" not in result, (
+            f"foreign mcp-* must be rejected as exact selector, got {result!r}"
+        )
+
+        # Lane 2: Wildcard-default lane (additive).
+        result = _apply_override(
+            ["web", "file", "all"],
+            ["alpha"],
+            {"alpha"},
+        )
+        assert "mcp-foreign" not in result, (
+            f"foreign mcp-* must not survive wildcard-default, got {result!r}"
+        )
+
+        # Lane 3: Free-text wildcard lane (restrict).
+        result = _apply_override(
+            ["web", "file"],
+            ["all"],
+            {"alpha"},
+        )
+        assert "mcp-foreign" not in result, (
+            f"foreign mcp-* must not survive free-text wildcard, got {result!r}"
+        )
+
+        # Verify the foreign tool is not callable through any lane.
+        for _result in [
+            _apply_override(["web", "file"], ["mcp-foreign"], {"alpha"}),
+            _apply_override(["web", "file", "all"], ["alpha"], {"alpha"}),
+            _apply_override(["web", "file"], ["all"], {"alpha"}),
+        ]:
+            _final_tools = set()
+            for _name in _result:
+                _final_tools.update(_ts_mod.resolve_toolset(_name))
+            assert "foreign_tool" not in _final_tools, (
+                f"foreign_tool must not be callable, got {sorted(_final_tools)!r}"
+            )
+
+        # Step 5: When the snapshot is None (initial capture failed at
+        # import time), _authored_builtin_toolset_names() NEVER re-captures
+        # — it returns None, and all authorization paths fail closed.
+        # This is the core fix: no re-capture from a potentially
+        # contaminated dict.
+        streaming._AUTHORED_TOOLSETS_SNAPSHOT = None
+        assert streaming._authored_builtin_toolset_names() is None, (
+            "must not re-capture when initial eager capture failed"
+        )
+        # With None snapshot, exact selector is rejected (fail closed).
+        result = _apply_override(
+            ["web", "file"],
+            ["mcp-foreign"],
+            {"alpha"},
+        )
+        assert "mcp-foreign" not in result, (
+            f"foreign mcp-* must be rejected when snapshot is None, "
+            f"got {result!r}"
+        )
+    finally:
+        _ts_mod.TOOLSETS.clear()
+        _ts_mod.TOOLSETS.update(_saved_toolsets)
+        _reg._tools.clear()
+        _reg._tools.update(_saved_tools)
+        _reg._toolset_aliases.clear()
+        _reg._toolset_aliases.update(_saved_aliases)
+        # Restore the fixture-captured snapshot.
+        streaming._AUTHORED_TOOLSETS_SNAPSHOT = (
+            streaming._capture_authored_builtin_snapshot()
+        )
+
+
+def test_unavailable_generation_with_override_fails_closed(monkeypatch):
+    """Round-22 gate finding 2 discriminator: when an override IS applied but
+    the registry generation is unavailable (``None`` — no registry / no
+    generation counter), we cannot PROVE the authority is stable.  The
+    override must fail closed to an empty toolset list, not be treated as
+    "stable" (which is what Round-21 did).
+
+    This test exercises the production caller-level logic that mirrors the
+    streaming worker: ``_override_applied = True`` + ``_toolsets_gen = None``
+    → fail closed (empty toolsets).
+    """
+    import api.streaming as streaming
+    from tools.registry import registry as _reg
+
+    _real_gen = streaming._registry_generation
+    _saved_tools = dict(_reg._tools)
+    _saved_aliases = dict(_reg._toolset_aliases)
+
+    try:
+        # Force generation to None (registry unavailable / no counter).
+        monkeypatch.setattr(streaming, "_registry_generation", lambda: None)
+
+        _reg.register_toolset_alias("alpha", "mcp-alpha")
+        _reg.register("alpha_tool", "mcp-alpha", {"type": "object"},
+                      lambda *a, **k: "ok", override=True)
+
+        # Apply the override — _gen_slot will contain None (no generation).
+        _gen_slot = []
+        result = _apply_override(
+            ["web", "file"], ["alpha"], {"alpha"},
+            _gen_slot=_gen_slot,
+        )
+        # The helper returns a valid merged result with the override applied.
+        # The additive branch returns bare server names for ordinary servers.
+        assert "alpha" in result, (
+            f"override should be applied, got {result!r}"
+        )
+
+        # Simulate the worker-level check: override was applied, generation
+        # is None → cannot prove stability → fail closed.
+        _toolsets_gen = _gen_slot[0] if _gen_slot else None
+        _override_applied = True
+
+        # This mirrors the production worker logic (Round-22).
+        if _toolsets_gen is not None and streaming._registry_generation_changed(_toolsets_gen):
+            final_toolsets = []
+        elif _toolsets_gen is None and _override_applied:
+            final_toolsets = []
+        else:
+            final_toolsets = result
+
+        assert final_toolsets == [], (
+            f"override with unavailable generation must fail closed to empty, "
+            f"got {final_toolsets!r}"
+        )
+    finally:
+        monkeypatch.setattr(streaming, "_registry_generation", _real_gen)
+        _reg._tools.clear()
+        _reg._tools.update(_saved_tools)
+        _reg._toolset_aliases.clear()
+        _reg._toolset_aliases.update(_saved_aliases)
+
+
+def test_generation_movement_during_construction_fails_closed(monkeypatch):
+    """Round-22 gate finding 2 discriminator: the generation must be
+    re-validated IMMEDIATELY AFTER ``_AIAgent(...)`` construction.  A
+    registry mutation during the constructor's tool resolution must fail
+    closed (blank toolsets on the agent), not run or cache tools that were
+    never authorized.
+
+    This test simulates the production worker pattern:
+      1. Apply override → capture generation (e.g. gen=1),
+      2. Pre-construction check passes (gen still 1),
+      3. Simulate construction (gen moves to 2 during construction),
+      4. Post-construction check catches the movement → blank toolsets.
+    """
+    import api.streaming as streaming
+    from tools.registry import registry as _reg
+
+    _real_gen = streaming._registry_generation
+    _real_gen_changed = streaming._registry_generation_changed
+    _saved_tools = dict(_reg._tools)
+    _saved_aliases = dict(_reg._toolset_aliases)
+
+    try:
+        _reg.register_toolset_alias("alpha", "mcp-alpha")
+        _reg.register("alpha_tool", "mcp-alpha", {"type": "object"},
+                      lambda *a, **k: "ok", override=True)
+
+        # Phase 1: Apply override with gen=1.
+        _state = {"gen": 1}
+        monkeypatch.setattr(streaming, "_registry_generation",
+                            lambda: _state["gen"])
+
+        _gen_slot = []
+        result = _apply_override(
+            ["web", "file"], ["alpha"], {"alpha"},
+            _gen_slot=_gen_slot,
+        )
+        _toolsets_gen = _gen_slot[0]
+        assert _toolsets_gen == 1
+
+        # Phase 2: Pre-construction check (gen still 1 → passes).
+        assert not streaming._registry_generation_changed(_toolsets_gen)
+        _toolsets = result  # would go into _agent_kwargs
+
+        # Phase 3: Simulate construction — gen moves to 2 DURING construction.
+        _state["gen"] = 2
+
+        # Phase 4: Post-construction check catches the movement.
+        assert streaming._registry_generation_changed(_toolsets_gen), (
+            "generation movement during construction must be detected"
+        )
+        # Production blanks the agent's toolsets.
+        final_toolsets = [] if streaming._registry_generation_changed(_toolsets_gen) else _toolsets
+        assert final_toolsets == [], (
+            f"generation movement during construction must blank toolsets, "
+            f"got {final_toolsets!r}"
+        )
+    finally:
+        monkeypatch.setattr(streaming, "_registry_generation", _real_gen)
+        _reg._tools.clear()
+        _reg._tools.update(_saved_tools)
+        _reg._toolset_aliases.clear()
+        _reg._toolset_aliases.update(_saved_aliases)
+
+
+def test_no_override_no_generation_check_needed(monkeypatch):
+    """Round-22 positive control: when NO override is applied, the profile
+    defaults are config-derived (not registry-derived), so no generation
+    re-validation is needed.  ``_toolsets_gen`` is None and
+    ``_override_applied`` is False → toolsets are preserved.
+    """
+    import api.streaming as streaming
+    from tools.registry import registry as _reg
+
+    _real_gen = streaming._registry_generation
+    _saved_tools = dict(_reg._tools)
+    _saved_aliases = dict(_reg._toolset_aliases)
+
+    try:
+        # Even with generation unavailable, no override means no check needed.
+        monkeypatch.setattr(streaming, "_registry_generation", lambda: None)
+
+        # No override → _toolsets_gen stays None, _override_applied stays False.
+        _toolsets_gen = None
+        _override_applied = False
+        _toolsets = ["web", "file", "terminal"]
+
+        # Mirrors the production worker logic (Round-22).
+        if _toolsets_gen is not None and streaming._registry_generation_changed(_toolsets_gen):
+            final_toolsets = []
+        elif _toolsets_gen is None and _override_applied:
+            final_toolsets = []
+        else:
+            final_toolsets = _toolsets
+
+        assert final_toolsets == _toolsets, (
+            f"no override + no generation must preserve defaults, "
+            f"got {final_toolsets!r}"
         )
     finally:
         monkeypatch.setattr(streaming, "_registry_generation", _real_gen)

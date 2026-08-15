@@ -8062,20 +8062,48 @@ def _builtin_toolset_names():
     return names
 
 
-# Round-21 gate fix: ``toolsets.TOOLSETS`` is a RUNTIME-MUTABLE process-global
+# Round-22 gate fix: ``toolsets.TOOLSETS`` is a RUNTIME-MUTABLE process-global
 # dict — ``create_custom_toolset()`` inserts into it at runtime (e.g. from
 # another profile's agent session).  Live keys are therefore NOT proof of
-# current-profile or immutable ownership.  The authored-builtin universe is
-# captured ONCE per process (first successful import) and frozen; later
-# ``create_custom_toolset()`` mutations never re-authorize.  ``None`` means
-# the registry could not be established at all (fail closed).
-_AUTHORED_TOOLSETS_SNAPSHOT = None  # frozenset[str] | None
+# current-profile or immutable ownership.
+#
+# The authored-builtin universe is captured EAGERLY at module import time
+# (when ``api.streaming`` is first loaded into the process), BEFORE any
+# runtime ``create_custom_toolset()`` can contaminate it.  Round-21 used a
+# lazy snapshot (captured on first authorization call); Round-22 gate finding
+# 1 proved that if another profile's ``create_custom_toolset("mcp-foreign")``
+# runs before this helper's first call, the lazy snapshot freezes the
+# contaminated dict — admitting ``mcp-foreign`` as "authored."  An eager
+# capture at import time is the only ordering that is provably before any
+# runtime mutation, because the WebUI's streaming module is imported during
+# server startup, before any agent session creates custom toolsets.
+#
+# ``None`` means the registry could not be established at all (fail closed).
+def _capture_authored_builtin_snapshot():
+    """Capture the authored builtin toolset names EAGERLY at module import.
+
+    Returns a ``frozenset[str]`` of static ``toolsets.TOOLSETS`` keys (minus
+    wildcards ``all``/``*``), or ``None`` when ``toolsets`` is unavailable.
+    """
+    try:
+        import toolsets as _ts
+        _defs = getattr(_ts, "TOOLSETS", None)
+        if not isinstance(_defs, dict):
+            return None
+        return frozenset(
+            str(k) for k in _defs.keys()
+        ) - frozenset({"all", "*"})
+    except Exception:
+        return None
+
+
+_AUTHORED_TOOLSETS_SNAPSHOT = _capture_authored_builtin_snapshot()
 
 
 def _authored_builtin_toolset_names():
     """Return the FROZEN authored builtin toolset names (``toolsets.TOOLSETS``
-    keys captured once) — the immutable builtins a profile context is allowed
-    to expose.
+    keys captured eagerly at module import) — the immutable builtins a profile
+    context is allowed to expose.
 
     This is the *authorization* source for wildcard expansion and restrictive
     exact-selector admission.  Only toolsets that are authored definitions
@@ -8084,33 +8112,25 @@ def _authored_builtin_toolset_names():
     NEVER included: registry membership is not profile ownership
     (Round-18 finding 1).
 
-    Round-21 gate fix: the snapshot is captured ONCE at first successful
-    import and frozen.  Previously this helper re-read the live
-    ``toolsets.TOOLSETS`` dict on every call; ``create_custom_toolset()``
-    mutates that same process-global dict at runtime, so a custom or foreign
-    ``mcp-*`` toolset inserted by ANOTHER profile appeared in the
-    "authored" set and was accepted by ``_profile_authorizes_mcp_selector()``
-    and both wildcard lanes — a cross-profile capability over-grant through a
-    mutable global inventory.  The frozen snapshot never contains runtime
-    custom toolsets.
+    Round-22 gate fix: the snapshot is captured EAGERLY at module import
+    time (when ``api.streaming`` is first loaded), not lazily on first
+    authorization call.  The Round-21 lazy snapshot could freeze an
+    already-contaminated ``toolsets.TOOLSETS`` dict if another profile's
+    ``create_custom_toolset()`` ran before this helper's first call —
+    admitting a foreign runtime toolset as "authored."  An eager capture at
+    import time is provably before any runtime mutation.  If the initial
+    eager capture failed (``toolsets`` was not yet importable at module
+    load), this function returns ``None`` — it NEVER re-captures, because
+    a later capture cannot prove it is pristine (a ``create_custom_toolset``
+    may have contaminated the dict between import and the first call).
+    Tests may directly set ``_AUTHORED_TOOLSETS_SNAPSHOT`` to a captured
+    value via ``_capture_authored_builtin_snapshot()`` to exercise the
+    authorization paths with a stand-in ``TOOLSETS``.
 
     Returns ``None`` when ``toolsets`` is unavailable (fail closed — an
     unknown builtin universe cannot prove what is profile-owned).
     """
-    global _AUTHORED_TOOLSETS_SNAPSHOT
-    if _AUTHORED_TOOLSETS_SNAPSHOT is not None:
-        return _AUTHORED_TOOLSETS_SNAPSHOT
-    try:
-        import toolsets as _ts
-        _defs = getattr(_ts, "TOOLSETS", None)
-        if not isinstance(_defs, dict):
-            return None
-        _AUTHORED_TOOLSETS_SNAPSHOT = frozenset(
-            str(k) for k in _defs.keys()
-        ) - frozenset({"all", "*"})
-        return _AUTHORED_TOOLSETS_SNAPSHOT
-    except Exception:
-        return None
+    return _AUTHORED_TOOLSETS_SNAPSHOT
 
 
 def _profile_owned_static_toolsets(defaults, mcp_server_names, builtin_names=None):
@@ -10340,6 +10360,11 @@ def _run_agent_streaming(
             # applied (no re-validation needed) or the registry lacks a
             # generation counter.
             _toolsets_gen = None
+            # Round-22 gate fix: track whether an override was actually applied
+            # (vs. preserved defaults).  When an override WAS applied but the
+            # generation is None (no registry / no generation counter), we
+            # cannot prove the authority is stable → fail closed.
+            _override_applied = False
 
             # Per-session toolset override (#493): if the session has
             # enabled_toolsets set, apply it on top of the profile defaults.
@@ -10401,6 +10426,7 @@ def _run_agent_streaming(
                             _gen_slot=_gen_slot
                         )
                         _toolsets_gen = _gen_slot[0] if _gen_slot else None
+                        _override_applied = True
             except Exception as _ts_err:
                 print(f"[webui] WARNING: failed to read per-session toolsets for {session_id}: {_ts_err}", flush=True)
 
@@ -10515,16 +10541,33 @@ def _run_agent_streaming(
             except Exception:
                 _reasoning_config = None
 
-            # Round-21 gate fix: the per-session override resolved against an
-            # authority snapshot at generation `_toolsets_gen`.  Re-validate
-            # that generation at FINAL tool resolution (AIAgent construction):
-            # if the registry mutated between the helper return and here (a
-            # server registered, an alias moved), the toolsets handed to the
-            # Agent were reasoned from a stale authority — fail closed to an
-            # empty toolset list rather than resolve tools that were never
-            # authorized for this session.  None (no override / no generation
-            # counter) means there is no authority to go stale.
+            # Round-22 gate fix: the per-session override resolved against an
+            # authority snapshot at generation ``_toolsets_gen``.  Re-validate
+            # that generation IMMEDIATELY before AIAgent construction (both the
+            # ephemeral and cache-miss paths) AND immediately after, so a
+            # registry mutation between the helper return and construction —
+            # or during construction itself — is caught and the toolsets are
+            # blanked (fail closed) rather than resolved from a stale
+            # authority.
+            #
+            # Round-22 gate finding 2: the Round-21 check ran ONCE before
+            # building _agent_kwargs but before _AIAgent(...) construction.
+            # A registry mutation between the check and the constructor was
+            # not caught.  Also, a ``None`` generation (registry unavailable
+            # / no generation counter) was treated as "stable" — but when an
+            # override WAS applied, ``None`` means we cannot PROVE stability,
+            # so the override must fail closed to an empty toolset list.
+            #
+            # ``_toolsets_gen`` is ``None`` when NO override was applied (no
+            # re-validation needed — the profile defaults are config-derived,
+            # not registry-derived) or when the registry lacks a generation
+            # counter.  When an override WAS applied and the generation IS
+            # ``None``, we cannot prove the authority is stable → fail closed.
             if _toolsets_gen is not None and _registry_generation_changed(_toolsets_gen):
+                _toolsets = []
+            elif _toolsets_gen is None and _override_applied:
+                # Override was applied but we have no generation counter to
+                # prove stability → fail closed (empty toolsets).
                 _toolsets = []
 
             _agent_kwargs = dict(
@@ -10591,6 +10634,12 @@ def _run_agent_streaming(
             # injectionFrequency: "first-turn" actually suppresses after turn 1.
             if ephemeral:
                 agent = _AIAgent(**_agent_kwargs)
+                # Round-22 gate fix: re-validate generation IMMEDIATELY after
+                # construction — a registry mutation during the constructor's
+                # tool resolution must fail closed (blank toolsets), not run
+                # or cache tools that were never authorized.
+                if _toolsets_gen is not None and _registry_generation_changed(_toolsets_gen):
+                    agent.enabled_toolsets = []
                 logger.debug('[webui] Created ephemeral agent for session %s', session_id)
             else:
                 import hashlib as _hashlib
@@ -10723,6 +10772,12 @@ def _run_agent_streaming(
                         agent._interrupt_message = None
                 else:
                     agent = _AIAgent(**_agent_kwargs)
+                    # Round-22 gate fix: re-validate generation IMMEDIATELY after
+                    # construction — a registry mutation during the constructor's
+                    # tool resolution must fail closed (blank toolsets), not be
+                    # run or cached.
+                    if _toolsets_gen is not None and _registry_generation_changed(_toolsets_gen):
+                        agent.enabled_toolsets = []
                     # Register the new agent with the memory lifecycle so
                     # its commit_memory_session() can be found later.
                     try:
@@ -11432,6 +11487,10 @@ def _run_agent_streaming(
                             if 'credential_pool' in _agent_params:
                                 _agent_kwargs['credential_pool'] = _heal_rt.get('credential_pool')
                             agent = _AIAgent(**_agent_kwargs)
+                            # Round-22 gate fix: re-validate generation after
+                            # construction on the session-healing path too.
+                            if _toolsets_gen is not None and _registry_generation_changed(_toolsets_gen):
+                                agent.enabled_toolsets = []
                             with STREAMS_LOCK:
                                 AGENT_INSTANCES[stream_id] = agent
                             from api.config import SESSION_AGENT_CACHE as _SAC, SESSION_AGENT_CACHE_LOCK as _SAC_L
