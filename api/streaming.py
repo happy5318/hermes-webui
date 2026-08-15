@@ -8292,6 +8292,44 @@ def _canonicalize_override_targets(override, mcp_server_names):
     return out
 
 
+def _profile_authorizes_mcp_selector(name, defaults):
+    """Return True only when an exact restrictive ``mcp-*`` selector is
+    provably part of the CURRENT profile's authority.
+
+    Round-20 gate finding: the previous admission test — a successful alias
+    lookup with no alias edge — is INVENTORY information, not OWNERSHIP.
+    In production ``builtin_names`` is the process-global registry
+    inventory, so an alias-less ``mcp-<server>`` canonical registered by
+    ANOTHER profile sits in the shadow set, resolves nothing through the
+    alias table, and was admitted as if it were a static/plugin toolset —
+    making its tools callable under this profile.
+
+    Authority comes only from the profile's OWN configuration:
+
+      * an explicit profile default for this request (a current-profile
+        enabled plugin / static toolset explicitly authorized here), or
+      * an authored immutable builtin definition (``toolsets.TOOLSETS``
+        key).
+
+    Registry membership never authorizes.  Returns False (fail closed)
+    when authorization cannot be established.
+    """
+    if not isinstance(name, str) or not name:
+        return False
+    if not isinstance(defaults, (list, tuple, set)):
+        return False  # cannot establish authorization → fail closed
+    _explicit = {
+        d for d in defaults
+        if isinstance(d, str) and d not in {"all", "*"}
+    }
+    if name in _explicit:
+        return True
+    _authored = _authored_builtin_toolset_names()
+    if _authored is None:
+        return False  # cannot establish authorization → fail closed
+    return name in _authored
+
+
 def _apply_session_toolset_override(defaults, override, mcp_server_names,
                                     builtin_names=None):
     """Resolve a per-session ``enabled_toolsets`` override against the profile
@@ -8703,9 +8741,20 @@ def _apply_session_toolset_override(defaults, override, mcp_server_names,
                 # Has alias edge = foreign MCP canonical from another profile
                 # Drop it - fail closed
                 continue
-            # Successful lookup with NO alias edge = static/plugin toolset
-            # with mcp- prefix.  Allow it to pass through — and stop here so
-            # the unconditional append below cannot emit it a second time
+            # Successful lookup with NO alias edge is INVENTORY information,
+            # not OWNERSHIP (Round-20 gate finding): the process-global
+            # registry may hold alias-less `mcp-<server>` canonicals
+            # registered by OTHER profiles — an alias-less entry resolves
+            # nothing through the alias table, yet emitting it makes its
+            # tools callable under this profile.  Admit the selector ONLY
+            # from the current profile's authority snapshot: an authored
+            # immutable builtin (`toolsets.TOOLSETS` definition) or an
+            # explicit profile default for this request.  Unknown or
+            # foreign provenance fails closed (dropped).
+            if not _profile_authorizes_mcp_selector(name, defaults):
+                continue
+            # Authorized: pass through exactly once — stop here so the
+            # unconditional append below cannot emit it a second time
             # (Round-19 gate finding: duplicate selector in the result).
             safe_override.append(name)
             continue

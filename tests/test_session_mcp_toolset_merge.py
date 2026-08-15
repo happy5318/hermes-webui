@@ -3022,32 +3022,39 @@ def test_free_text_wildcard_expands_to_profile_owned_only():
 def test_static_mcp_prefix_plugin_distinguished_from_foreign_mcp():
     """Static/plugin toolsets with mcp- prefix (no alias edge) must be
     distinguished from foreign MCP canonicals (have alias edge).
-    
+
     Round-18 gate fix: registry membership is NOT authorization.
+
+    Round-20 gate fix: the static/plugin selector is admitted only when it
+    is present in the CURRENT profile's authority — here an explicit
+    profile default (``defaults`` entry) proves the plugin is enabled for
+    this request.  A registry-only ``mcp-*`` entry with no profile
+    authorization fails closed.
     """
     from tools.registry import registry as _reg
-    
+
     _saved_tools = dict(_reg._tools)
     _saved_aliases = dict(_reg._toolset_aliases)
-    
+
     try:
         # Foreign MCP has alias edge
         _reg.register_toolset_alias("foreign", "mcp-foreign")
         _reg.register("foreign_tool", "mcp-foreign", {"type": "object"},
                       lambda *a, **k: "ok", override=True)
-        
+
         # Static/plugin mcp-* toolset has NO alias edge
         _reg.register("custom_probe", "mcp-custom-probe", {"type": "object"},
                       lambda *a, **k: "ok", override=True)
-        
-        # Current profile: no MCP servers configured
+
+        # Current profile: no MCP servers configured, but the profile
+        # explicitly enabled the mcp-custom-probe plugin for this request.
         result = _apply_override(
-            ["web"],
+            ["web", "mcp-custom-probe"],
             ["mcp-custom-probe", "mcp-foreign"],  # free-text selectors
             set(),  # no MCP servers configured
             builtin_names={"web", "file", "terminal", "mcp-foreign", "mcp-custom-probe"},
         )
-        
+
         # Static/plugin mcp-* must pass through
         assert "mcp-custom-probe" in result, (
             f"static mcp-* toolset must survive, got {result!r}"
@@ -3325,7 +3332,13 @@ def test_restrict_mcp_static_passthrough_no_duplicate(monkeypatch):
     """Round-19 finding: the restrictive exact-selector branch used to
     append an accepted alias-less ``mcp-*`` selector and then fall through
     to the unconditional append — producing a duplicate.  The pass-through
-    must emit the selector exactly once."""
+    must emit the selector exactly once.
+
+    Round-20 (gate finding): the selector is accepted ONLY from the current
+    profile's authority — here an explicit profile default (``defaults``
+    entry) proves the plugin is enabled for this request.  Registry
+    membership alone is inventory, not ownership.
+    """
     import toolsets as _ts_mod
     from tools.registry import registry as _reg
 
@@ -3340,7 +3353,7 @@ def test_restrict_mcp_static_passthrough_no_duplicate(monkeypatch):
                       lambda *a, **k: "ok", override=True)
 
         result = _apply_override(
-            ["web", "file"],
+            ["web", "file", "mcp-custom-probe"],  # profile explicitly enabled it
             ["mcp-custom-probe"],  # static/plugin, no alias edge
             {"alpha"},  # unrelated configured server
             builtin_names={"web", "file", "terminal", "mcp-custom-probe"},
@@ -3499,6 +3512,138 @@ def test_production_call_authority_not_from_registry_inventory(monkeypatch):
         )
         assert "plugin_foreign_tool" not in final_tools, (
             f"foreign plugin tool must NOT resolve, got {sorted(final_tools)!r}"
+        )
+    finally:
+        _ts_mod.TOOLSETS.clear()
+        _ts_mod.TOOLSETS.update(_saved_toolsets)
+        _reg._tools.clear()
+        _reg._tools.update(_saved_tools)
+        _reg._toolset_aliases.clear()
+        _reg._toolset_aliases.update(_saved_aliases)
+
+
+# ── Round-20: exact mcp-* selectors need profile authority, not registry ──
+# The Round-19 gate certified that the restrictive exact-selector lane
+# treated a successful alias lookup with no alias edge as proof that an
+# `mcp-*` selector is an authorized static/plugin toolset.  In production
+# `builtin_names` comes from `_builtin_toolset_names()` — the process-global
+# registry inventory — so an ALIAS-LESS `mcp-foreign` entry registered by
+# another profile sits in the shadow set, resolves nothing through the
+# alias table, yet was admitted and its tools became callable.
+#
+# Round-20 fix: a restrictive exact `mcp-*` selector is admitted ONLY from
+# the current profile's authority snapshot — an authored immutable builtin
+# (`toolsets.TOOLSETS` definition) or an explicit profile default for this
+# request — or an exact configured-MCP canonical with a proven owner
+# (existing lane).  A successful "no alias" lookup is inventory
+# information, not ownership.  Unknown or foreign provenance fails closed.
+
+
+def test_restrict_foreign_aliasless_mcp_selector_fails_closed(monkeypatch):
+    """Round-20 gate finding (negative side, reviewer discriminator): a
+    REAL process-global alias-less ``mcp-*`` registration — an
+    ``mcp-foreign`` canonical registered by ANOTHER profile — is
+    INVENTORY, not OWNERSHIP.  Submitted as an exact restrictive override
+    it must be rejected and its tool must be ABSENT from the final
+    callable set, even though the alias lookup succeeds (returns None) and
+    the entry is present in the registry inventory shadow set.
+
+    Production-composed: ``builtin_names`` is NOT injected; the real
+    ``_builtin_toolset_names()`` shadow collector runs and the selector is
+    absent from the current profile's defaults/config.
+    """
+    import toolsets as _ts_mod
+    from tools.registry import registry as _reg
+
+    _saved_toolsets = dict(_ts_mod.TOOLSETS)
+    _saved_tools = dict(_reg._tools)
+    _saved_aliases = dict(_reg._toolset_aliases)
+
+    try:
+        # Configured server alpha — unrelated to the foreign entry.
+        _reg.register_toolset_alias("alpha", "mcp-alpha")
+        _reg.register("alpha_tool", "mcp-alpha", {"type": "object"},
+                      lambda *a, **k: "ok", override=True)
+        # FOREIGN, ALIAS-LESS: registered in the process-global registry,
+        # NO alias edge, NOT configured in the current profile.
+        _reg.register("foreign_tool", "mcp-foreign", {"type": "object"},
+                      lambda *a, **k: "ok", override=True)
+        # Seed-assertion (round-8 rule): the alias-less lookup SUCCEEDS
+        # (returns None) — exactly the case the old code misread as proof
+        # of static/plugin provenance.
+        assert _reg.get_toolset_alias_target("foreign") is None
+
+        result = _apply_override(
+            ["web", "file"],  # profile defaults — no mcp-foreign
+            ["mcp-foreign"],  # exact restrictive selector
+            {"alpha"},        # only alpha configured
+        )  # builtin_names omitted → production shadow collector
+
+        assert result == [], (
+            f"foreign alias-less mcp-* selector must fail closed, got {result!r}"
+        )
+        # Tool-level proof: foreign_tool must not be callable.
+        final_tools = set()
+        for name in result:
+            final_tools.update(_ts_mod.resolve_toolset(name))
+        assert "foreign_tool" not in final_tools, (
+            f"foreign tool must not resolve, got {sorted(final_tools)!r}"
+        )
+    finally:
+        _ts_mod.TOOLSETS.clear()
+        _ts_mod.TOOLSETS.update(_saved_toolsets)
+        _reg._tools.clear()
+        _reg._tools.update(_saved_tools)
+        _reg._toolset_aliases.clear()
+        _reg._toolset_aliases.update(_saved_aliases)
+
+
+def test_restrict_mcp_selector_authorized_by_profile_survives_once(monkeypatch):
+    """Round-20 gate finding (positive side): a GENUINELY authorized
+    ``mcp-*`` static/plugin selector — present in the CURRENT profile's
+    authority (an explicit profile default / enabled plugin for this
+    request) — must survive EXACTLY ONCE in the restrictive result, even
+    though the same name also exists in the process-global registry shadow
+    set.
+
+    Production-composed: ``builtin_names`` is NOT injected; the real
+    ``_builtin_toolset_names()`` shadow collector runs.
+    """
+    import toolsets as _ts_mod
+    from tools.registry import registry as _reg
+
+    _saved_toolsets = dict(_ts_mod.TOOLSETS)
+    _saved_tools = dict(_reg._tools)
+    _saved_aliases = dict(_reg._toolset_aliases)
+
+    try:
+        # Static/plugin toolset named "mcp-custom-probe", NO MCP alias edge.
+        _ts_mod.create_custom_toolset("mcp-custom-probe",
+                                      "registered mcp-* plugin",
+                                      tools=["probe_tool"], includes=[])
+        _reg.register("probe_tool", "mcp-custom-probe", {"type": "object"},
+                      lambda *a, **k: "ok", override=True)
+        # Unrelated configured server alpha.
+        _reg.register_toolset_alias("alpha", "mcp-alpha")
+        _reg.register("alpha_tool", "mcp-alpha", {"type": "object"},
+                      lambda *a, **k: "ok", override=True)
+
+        # The current profile EXPLICITLY enabled the plugin for this request.
+        result = _apply_override(
+            ["web", "file", "mcp-custom-probe"],
+            ["mcp-custom-probe"],
+            {"alpha"},
+        )  # builtin_names omitted → production shadow collector
+
+        assert result.count("mcp-custom-probe") == 1, (
+            f"authorized mcp-* selector must survive exactly once, got {result!r}"
+        )
+        # It must resolve its own tools (not double-appended, not foreign).
+        final_tools = set()
+        for name in result:
+            final_tools.update(_ts_mod.resolve_toolset(name))
+        assert "probe_tool" in final_tools, (
+            f"authorized plugin tool must resolve, got {sorted(final_tools)!r}"
         )
     finally:
         _ts_mod.TOOLSETS.clear()
