@@ -62,6 +62,12 @@ _mock_registry = _types.SimpleNamespace()
 _mock_registry._tools = {}
 _mock_registry._toolset_aliases = {}
 _mock_registry._snapshot_entries = lambda: list(_mock_registry._tools.values())
+# Round-22 gate fix: the mock registry must expose a _generation counter
+# (bumped on every register/alias mutation) so _registry_generation() returns
+# a real int, not None.  Without this, CI tests that exercise the real
+# _run_agent_streaming() path would fail-closed on every override because
+# _toolsets_gen is None (no generation counter to prove stability).
+_mock_registry._generation = 0
 
 
 def _mock_register(name, toolset, schema, handler, check_fn=None,
@@ -82,10 +88,12 @@ def _mock_register(name, toolset, schema, handler, check_fn=None,
         dynamic_schema_overrides=dynamic_schema_overrides,
     )
     _mock_registry._tools[name] = entry
+    _mock_registry._generation += 1
 
 
 def _mock_register_toolset_alias(alias, toolset):
     _mock_registry._toolset_aliases[alias] = toolset
+    _mock_registry._generation += 1
 
 
 def _mock_get_registered_toolset_names():
