@@ -193,6 +193,18 @@ def _agentless_runtime_standins():
                 sys.modules["tools.registry"] = _mock_registry_mod
                 _changed.append(("tools.registry", _prior["tools.registry"],
                                  _mock_registry_mod))
+        # Round-21 gate fix: ``_authored_builtin_toolset_names()`` now
+        # FROZENS its snapshot on first successful import.  Each test needs a
+        # fresh snapshot of the (possibly stand-in) ``toolsets.TOOLSETS`` at
+        # its start — otherwise a ``create_custom_toolset`` in an earlier
+        # test would permanently bake a runtime custom toolset into the
+        # "authored" universe for every later test.  Reset AND pre-capture:
+        # the snapshot must freeze the PRISTINE stand-in state before the
+        # test body runs, so a ``create_custom_toolset`` inside the test
+        # cannot re-bake itself into the authored universe.
+        import api.streaming as _streaming_mod
+        _streaming_mod._AUTHORED_TOOLSETS_SNAPSHOT = None
+        _streaming_mod._authored_builtin_toolset_names()
         yield
     finally:
         # 4. Restore/delete ONLY what this fixture changed.  Entries that
@@ -1067,6 +1079,14 @@ def test_registered_mcp_prefix_toolset_passes_through(monkeypatch):
     MCP server (e.g. ``mcp-custom-probe``) must be preserved in the restrict
     branch — master passes it through, and dropping it silently discards a
     valid toolset.
+
+    Round-21 gate fix: the toolset is preserved ONLY when the current
+    profile EXPLICITLY authorizes it — an authored builtin in the frozen
+    ``toolsets.TOOLSETS`` snapshot or an explicit profile default for this
+    request.  A runtime ``create_custom_toolset`` entry is mutable global
+    inventory, not profile ownership, so the test authorizes the probe
+    through the profile ``defaults`` (the same channel the production
+    ``_resolve_cli_toolsets(cfg)`` uses for profile-enabled plugins).
     """
     import toolsets as _ts_mod
     from tools.registry import registry as _reg
@@ -1090,7 +1110,7 @@ def test_registered_mcp_prefix_toolset_passes_through(monkeypatch):
         _reg.register("alpha_tool", "mcp-alpha", {"type": "object"},
                       lambda *a, **k: "ok", override=True)
 
-        defaults = ["web", "file"]
+        defaults = ["web", "file", "mcp-custom-probe"]  # profile-authorized
         override = ["mcp-custom-probe"]
         mcp_servers = {"alpha"}
         result = _apply_override(
@@ -2799,6 +2819,13 @@ def test_immutable_static_mcp_prefix_survives_with_provenance(monkeypatch):
 
     This verifies the `true_shadow` check in the restrict branch correctly
     distinguishes between real static/plugin toolsets and MCP server selectors.
+
+    Round-21 gate fix: shadow-set provenance is INVENTORY, not OWNERSHIP —
+    ``create_custom_toolset`` entries are mutable process-global state that a
+    foreign profile could have inserted.  The current profile authorizes the
+    static ``mcp-browser`` plugin through an explicit profile ``defaults``
+    entry (the same channel ``_resolve_cli_toolsets(cfg)`` uses), and the
+    selector then survives exactly once.
     """
     import toolsets as _ts_mod
     from tools.registry import registry as _reg
@@ -2820,7 +2847,7 @@ def test_immutable_static_mcp_prefix_survives_with_provenance(monkeypatch):
         _reg.register("alpha_tool", "mcp-alpha", {"type": "object"},
                       lambda *a, **k: "ok", override=True)
 
-        defaults = ["web", "file"]
+        defaults = ["web", "file", "mcp-browser"]  # profile-enabled plugin
         override = ["mcp-browser"]  # user selects the static toolset
         mcp_servers = {"alpha"}  # only alpha is a configured MCP server
         result = _apply_override(
@@ -2828,8 +2855,8 @@ def test_immutable_static_mcp_prefix_survives_with_provenance(monkeypatch):
             builtin_names={"web", "file", "terminal", "mcp-browser"},  # proven in shadow
         )
 
-        # mcp-browser must survive (it's in true_shadow)
-        assert "mcp-browser" in result, (
+        # mcp-browser must survive exactly once (profile-authorized)
+        assert result.count("mcp-browser") == 1, (
             f"static mcp-* toolset with provenance must survive, got {result!r}"
         )
         # It resolves to its own tools
@@ -3648,6 +3675,233 @@ def test_restrict_mcp_selector_authorized_by_profile_survives_once(monkeypatch):
     finally:
         _ts_mod.TOOLSETS.clear()
         _ts_mod.TOOLSETS.update(_saved_toolsets)
+        _reg._tools.clear()
+        _reg._tools.update(_saved_tools)
+        _reg._toolset_aliases.clear()
+        _reg._toolset_aliases.update(_saved_aliases)
+
+
+def test_two_profile_runtime_custom_mcp_rejected_all_lanes(monkeypatch):
+    """Round-21 gate finding (two-profile discriminator): ``toolsets.TOOLSETS``
+    is a RUNTIME-MUTABLE process-global dict — ``create_custom_toolset()``
+    inserts into it at runtime (e.g. from another profile's agent session).
+    A FOREIGN profile's runtime custom ``mcp-*`` toolset — present in BOTH the
+    live ``toolsets.TOOLSETS`` AND the process-global registry — but ABSENT
+    from the current profile's defaults/config must be rejected:
+
+      1. as an exact restrictive selector,
+      2. from the wildcard-default lane (additive, ``defaults`` carries ``all``),
+      3. from the free-text wildcard lane (restrict, override ``all``),
+
+    while a GENUINELY current-profile toolset (explicit ``defaults`` entry)
+    survives exactly once.
+
+    Production-composed: ``builtin_names`` is NOT injected; the real
+    ``_builtin_toolset_names()`` shadow collector and the frozen
+    ``_authored_builtin_toolset_names()`` snapshot run (Round-21: the
+    snapshot was pre-captured by the autouse fixture at PRISTINE stand-in
+    state, so the runtime ``create_custom_toolset`` below can never bake
+    itself into the authored universe).
+    """
+    import toolsets as _ts_mod
+    from tools.registry import registry as _reg
+
+    _saved_toolsets = dict(_ts_mod.TOOLSETS)
+    _saved_tools = dict(_reg._tools)
+    _saved_aliases = dict(_reg._toolset_aliases)
+
+    try:
+        # ── FOREIGN profile's runtime custom toolset ─────────────────────
+        # Inserted through the SAME runtime API the Agent uses
+        # (create_custom_toolset) → live TOOLSETS membership.  Also
+        # registered in the process-global registry.  Absent from the
+        # current profile's defaults/config.
+        _ts_mod.create_custom_toolset("mcp-foreign", "foreign profile toolset",
+                                      tools=["foreign_tool"], includes=[])
+        _reg.register("foreign_tool", "mcp-foreign", {"type": "object"},
+                      lambda *a, **k: "ok", override=True)
+        # Configured server alpha — the current profile's own MCP server.
+        _reg.register_toolset_alias("alpha", "mcp-alpha")
+        _reg.register("alpha_tool", "mcp-alpha", {"type": "object"},
+                      lambda *a, **k: "ok", override=True)
+        # Seed-assertion: the foreign entry IS in the live global inventory
+        # (the exact topology the old live-keys code misread as ownership).
+        assert "mcp-foreign" in _ts_mod.TOOLSETS
+
+        # 1) Exact restrictive selector → rejected.
+        result = _apply_override(
+            ["web", "file"],  # current-profile defaults — no mcp-foreign
+            ["mcp-foreign"],  # exact selector
+            {"alpha"},
+        )
+        assert "mcp-foreign" not in result, (
+            f"foreign runtime custom mcp-* must fail closed as exact "
+            f"selector, got {result!r}"
+        )
+        final_tools = set()
+        for name in result:
+            final_tools.update(_ts_mod.resolve_toolset(name))
+        assert "foreign_tool" not in final_tools, (
+            f"foreign tool must not resolve, got {sorted(final_tools)!r}"
+        )
+
+        # 2) Wildcard-default lane (additive): defaults carry ``all``.
+        result = _apply_override(
+            ["web", "file", "all"],
+            ["alpha"],  # all configured servers ticked
+            {"alpha"},
+        )
+        assert "mcp-foreign" not in result, (
+            f"foreign runtime custom mcp-* must not survive wildcard-default "
+            f"lane, got {result!r}"
+        )
+
+        # 3) Free-text wildcard lane (restrict): override ``all``.
+        result = _apply_override(
+            ["web", "file"],
+            ["all"],
+            {"alpha"},
+        )
+        assert "mcp-foreign" not in result, (
+            f"foreign runtime custom mcp-* must not survive free-text "
+            f"wildcard lane, got {result!r}"
+        )
+
+        # 4) Genuinely current-profile toolset survives EXACTLY ONCE.
+        # The profile explicitly enables mcp-custom-probe via its defaults
+        # (the same channel _resolve_cli_toolsets(cfg) produces).
+        _ts_mod.create_custom_toolset("mcp-custom-probe",
+                                      "current-profile plugin",
+                                      tools=["probe_tool"], includes=[])
+        _reg.register("probe_tool", "mcp-custom-probe", {"type": "object"},
+                      lambda *a, **k: "ok", override=True)
+        result = _apply_override(
+            ["web", "file", "mcp-custom-probe"],
+            ["mcp-custom-probe"],
+            {"alpha"},
+        )
+        assert result.count("mcp-custom-probe") == 1, (
+            f"current-profile toolset must survive exactly once, got {result!r}"
+        )
+    finally:
+        _ts_mod.TOOLSETS.clear()
+        _ts_mod.TOOLSETS.update(_saved_toolsets)
+        _reg._tools.clear()
+        _reg._tools.update(_saved_tools)
+        _reg._toolset_aliases.clear()
+        _reg._toolset_aliases.update(_saved_aliases)
+
+
+def test_final_resolution_generation_boundary_fails_closed(monkeypatch):
+    """Round-21 gate finding: the authority generation captured at helper
+    entry must be re-validated at FINAL tool resolution (AIAgent
+    construction), not only before the helper returns.
+
+    The helper already fails closed when the registry mutates WHILE it is
+    deciding (Round-19).  Round-21 extends the boundary: a registry mutation
+    BETWEEN the helper return and the Agent construction (a server
+    registering, an alias moving) must also fail closed — the toolsets handed
+    to the Agent were reasoned from a stale authority snapshot.
+
+    This test drives the production call shape: the caller captures the
+    authority generation via ``_gen_slot``, then re-validates it at final
+    resolution with ``_registry_generation_changed`` — the exact pattern the
+    streaming worker uses before AIAgent construction.
+    """
+    import api.streaming as streaming
+    from tools.registry import registry as _reg
+
+    _real_gen = streaming._registry_generation
+    _state = {"gen": 1}
+
+    def _controlled_generation():
+        return _state["gen"]
+
+    monkeypatch.setattr(streaming, "_registry_generation", _controlled_generation)
+    _saved_tools = dict(_reg._tools)
+    _saved_aliases = dict(_reg._toolset_aliases)
+    try:
+        # Configured server alpha → canonical mcp-alpha.
+        _reg.register_toolset_alias("alpha", "mcp-alpha")
+        _reg.register("alpha_tool", "mcp-alpha", {"type": "object"},
+                      lambda *a, **k: "ok", override=True)
+
+        # Production call shape: helper captures the authority generation.
+        _gen_slot = []
+        result = _apply_override(
+            ["web", "file"], ["alpha"], {"alpha"},
+            _gen_slot=_gen_slot,
+        )
+        assert _gen_slot, "helper must report the entry generation via _gen_slot"
+        assert "alpha" in result or "mcp-alpha" in result, (
+            f"additive result expected, got {result!r}"
+        )
+
+        # MUTATION between helper return and final Agent resolution: the
+        # registry generation moves (a server registers).
+        _state["gen"] = 2
+
+        # Final resolution re-validates the SAME authority generation.
+        assert streaming._registry_generation_changed(_gen_slot[0]), (
+            "generation movement after helper return must be detected at "
+            "final resolution"
+        )
+        # The streaming worker fails closed to an empty toolset list.
+        final_toolsets = (
+            [] if streaming._registry_generation_changed(_gen_slot[0])
+            else result
+        )
+        assert final_toolsets == [], (
+            f"stale authority must fail closed at final resolution, "
+            f"got {final_toolsets!r}"
+        )
+    finally:
+        monkeypatch.setattr(streaming, "_registry_generation", _real_gen)
+        _reg._tools.clear()
+        _reg._tools.update(_saved_tools)
+        _reg._toolset_aliases.clear()
+        _reg._toolset_aliases.update(_saved_aliases)
+
+
+def test_final_resolution_generation_stable_keeps_toolsets(monkeypatch):
+    """Positive half of the Round-21 generation-boundary: when the registry
+    does NOT mutate between helper return and final resolution, the toolsets
+    survive unchanged (the re-validation is a no-op)."""
+    import api.streaming as streaming
+    from tools.registry import registry as _reg
+
+    _real_gen = streaming._registry_generation
+    _state = {"gen": 1}
+
+    def _controlled_generation():
+        return _state["gen"]
+
+    monkeypatch.setattr(streaming, "_registry_generation", _controlled_generation)
+    _saved_tools = dict(_reg._tools)
+    _saved_aliases = dict(_reg._toolset_aliases)
+    try:
+        _reg.register_toolset_alias("alpha", "mcp-alpha")
+        _reg.register("alpha_tool", "mcp-alpha", {"type": "object"},
+                      lambda *a, **k: "ok", override=True)
+
+        _gen_slot = []
+        result = _apply_override(
+            ["web", "file"], ["alpha"], {"alpha"},
+            _gen_slot=_gen_slot,
+        )
+        assert _gen_slot
+
+        # No mutation → final resolution keeps the toolsets.
+        assert not streaming._registry_generation_changed(_gen_slot[0])
+        final_toolsets = (
+            [] if streaming._registry_generation_changed(_gen_slot[0])
+            else result
+        )
+        assert final_toolsets == result, (
+            f"stable authority must keep the toolsets, got {final_toolsets!r}"
+        )
+    finally:
+        monkeypatch.setattr(streaming, "_registry_generation", _real_gen)
         _reg._tools.clear()
         _reg._tools.update(_saved_tools)
         _reg._toolset_aliases.clear()

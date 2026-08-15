@@ -8062,28 +8062,53 @@ def _builtin_toolset_names():
     return names
 
 
-def _authored_builtin_toolset_names():
-    """Return the AUTHORED static builtin toolset names (``toolsets.TOOLSETS``
-    keys) — the immutable builtins a profile context is allowed to expose.
+# Round-21 gate fix: ``toolsets.TOOLSETS`` is a RUNTIME-MUTABLE process-global
+# dict — ``create_custom_toolset()`` inserts into it at runtime (e.g. from
+# another profile's agent session).  Live keys are therefore NOT proof of
+# current-profile or immutable ownership.  The authored-builtin universe is
+# captured ONCE per process (first successful import) and frozen; later
+# ``create_custom_toolset()`` mutations never re-authorize.  ``None`` means
+# the registry could not be established at all (fail closed).
+_AUTHORED_TOOLSETS_SNAPSHOT = None  # frozenset[str] | None
 
-    This is the *authorization* source for wildcard expansion.  Only toolsets
-    that are authored definitions (static builtins + current-process custom
-    toolsets) count as profile-owned static toolsets.  Process-global
-    REGISTRY names — registered MCP canonicals, foreign plugin toolsets —
-    are NEVER included: registry membership is not profile ownership
-    (Round-18 finding 1).  An alias-less foreign ``mcp-foreign`` entry or a
-    foreign non-MCP plugin registered in the shared registry must never
-    enter a wildcard expansion for another profile.
+
+def _authored_builtin_toolset_names():
+    """Return the FROZEN authored builtin toolset names (``toolsets.TOOLSETS``
+    keys captured once) — the immutable builtins a profile context is allowed
+    to expose.
+
+    This is the *authorization* source for wildcard expansion and restrictive
+    exact-selector admission.  Only toolsets that are authored definitions
+    (static builtins) count as profile-owned static toolsets.  Process-global
+    REGISTRY names — registered MCP canonicals, foreign plugin toolsets — are
+    NEVER included: registry membership is not profile ownership
+    (Round-18 finding 1).
+
+    Round-21 gate fix: the snapshot is captured ONCE at first successful
+    import and frozen.  Previously this helper re-read the live
+    ``toolsets.TOOLSETS`` dict on every call; ``create_custom_toolset()``
+    mutates that same process-global dict at runtime, so a custom or foreign
+    ``mcp-*`` toolset inserted by ANOTHER profile appeared in the
+    "authored" set and was accepted by ``_profile_authorizes_mcp_selector()``
+    and both wildcard lanes — a cross-profile capability over-grant through a
+    mutable global inventory.  The frozen snapshot never contains runtime
+    custom toolsets.
 
     Returns ``None`` when ``toolsets`` is unavailable (fail closed — an
     unknown builtin universe cannot prove what is profile-owned).
     """
+    global _AUTHORED_TOOLSETS_SNAPSHOT
+    if _AUTHORED_TOOLSETS_SNAPSHOT is not None:
+        return _AUTHORED_TOOLSETS_SNAPSHOT
     try:
         import toolsets as _ts
         _defs = getattr(_ts, "TOOLSETS", None)
         if not isinstance(_defs, dict):
             return None
-        return {str(k) for k in _defs.keys()} - {"all", "*"}
+        _AUTHORED_TOOLSETS_SNAPSHOT = frozenset(
+            str(k) for k in _defs.keys()
+        ) - frozenset({"all", "*"})
+        return _AUTHORED_TOOLSETS_SNAPSHOT
     except Exception:
         return None
 
@@ -8308,8 +8333,12 @@ def _profile_authorizes_mcp_selector(name, defaults):
 
       * an explicit profile default for this request (a current-profile
         enabled plugin / static toolset explicitly authorized here), or
-      * an authored immutable builtin definition (``toolsets.TOOLSETS``
-        key).
+      * an authored immutable builtin definition (the FROZEN
+        ``toolsets.TOOLSETS`` snapshot — see
+        ``_authored_builtin_toolset_names()``; Round-21: the snapshot is
+        captured once and never includes runtime ``create_custom_toolset``
+        entries, so a foreign profile's runtime custom toolset cannot
+        authorize itself).
 
     Registry membership never authorizes.  Returns False (fail closed)
     when authorization cannot be established.
@@ -8331,7 +8360,7 @@ def _profile_authorizes_mcp_selector(name, defaults):
 
 
 def _apply_session_toolset_override(defaults, override, mcp_server_names,
-                                    builtin_names=None):
+                                    builtin_names=None, _gen_slot=None):
     """Resolve a per-session ``enabled_toolsets`` override against the profile
     defaults.
 
@@ -8411,7 +8440,16 @@ def _apply_session_toolset_override(defaults, override, mcp_server_names,
     # must fail closed (Round-18 finding: "generation movement must fail
     # closed").  The check is a no-op when the registry is unavailable or
     # does not expose a generation.
+    #
+    # Round-21 gate fix: the entry generation is ALSO handed back to the
+    # caller through ``_gen_slot`` (a list) so the FINAL tool resolution
+    # (AIAgent construction) can re-validate the same authority generation
+    # *after* this helper returns — a registry mutation between the helper
+    # return and the Agent construction must fail closed too, not only
+    # mutations that happen while this helper is running.
     _gen_at_entry = _registry_generation()
+    if _gen_slot is not None:
+        _gen_slot.append(_gen_at_entry)
 
     # Any non-list value (scalar, dict, set, …) is invalid persisted state.
     # Fail closed to restrictive — never let the caller's broad except restore
@@ -10297,6 +10335,11 @@ def _run_agent_streaming(
             # server toolsets are included, matching native CLI behaviour.
             from api.config import _resolve_cli_toolsets
             _toolsets = _resolve_cli_toolsets(_cfg)
+            # Round-21 gate fix: generation of the authority snapshot the
+            # per-session override reasoned from.  None when no override was
+            # applied (no re-validation needed) or the registry lacks a
+            # generation counter.
+            _toolsets_gen = None
 
             # Per-session toolset override (#493): if the session has
             # enabled_toolsets set, apply it on top of the profile defaults.
@@ -10344,9 +10387,20 @@ def _run_agent_streaming(
                         # from the MCP-only test so a server named e.g. "web"
                         # can't silently flip the override into additive mode
                         # and get shadowed by the builtin.
+                        #
+                        # Round-21 gate fix: capture the authority generation
+                        # the helper reasoned from, so the FINAL tool
+                        # resolution below (AIAgent construction) can
+                        # re-validate it — a registry mutation between the
+                        # helper return and the Agent construction must fail
+                        # closed, not only mutations that happen while the
+                        # helper runs.
+                        _gen_slot = []
                         _toolsets = _apply_session_toolset_override(
-                            _toolsets, _override, _mcp_server_names
+                            _toolsets, _override, _mcp_server_names,
+                            _gen_slot=_gen_slot
                         )
+                        _toolsets_gen = _gen_slot[0] if _gen_slot else None
             except Exception as _ts_err:
                 print(f"[webui] WARNING: failed to read per-session toolsets for {session_id}: {_ts_err}", flush=True)
 
@@ -10460,6 +10514,18 @@ def _run_agent_streaming(
                 _reasoning_config = parse_reasoning_effort(_effort)
             except Exception:
                 _reasoning_config = None
+
+            # Round-21 gate fix: the per-session override resolved against an
+            # authority snapshot at generation `_toolsets_gen`.  Re-validate
+            # that generation at FINAL tool resolution (AIAgent construction):
+            # if the registry mutated between the helper return and here (a
+            # server registered, an alias moved), the toolsets handed to the
+            # Agent were reasoned from a stale authority — fail closed to an
+            # empty toolset list rather than resolve tools that were never
+            # authorized for this session.  None (no override / no generation
+            # counter) means there is no authority to go stale.
+            if _toolsets_gen is not None and _registry_generation_changed(_toolsets_gen):
+                _toolsets = []
 
             _agent_kwargs = dict(
                 model=resolved_model,
