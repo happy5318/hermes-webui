@@ -4058,131 +4058,114 @@ def test_eager_snapshot_rejects_foreign_mcp_before_first_auth_lookup(monkeypatch
         )
 
 
-def test_unavailable_generation_with_override_fails_closed(monkeypatch):
+def test_unavailable_generation_with_override_fails_closed(monkeypatch, tmp_path):
     """Round-22 gate finding 2 discriminator: when an override IS applied but
     the registry generation is unavailable (``None`` — no registry / no
     generation counter), we cannot PROVE the authority is stable.  The
-    override must fail closed to an empty toolset list, not be treated as
+    override must fail closed to an EMPTY-TOOL agent, not be treated as
     "stable" (which is what Round-21 did).
 
-    This test exercises the production caller-level logic that mirrors the
-    streaming worker: ``_override_applied = True`` + ``_toolsets_gen = None``
-    → fail closed (empty toolsets).
+    Round-23 rework (reviewer gate): the Round-22 version copied the worker's
+    ``if/elif`` condition into the test body — a mirror, not a proof.  This
+    now drives the REAL ``_run_agent_streaming()`` construction transaction
+    with ``_registry_generation()`` forced to ``None`` and asserts the
+    fail-closed EMPTY-TOOL agent (enabled_toolsets=[]) is what gets cached,
+    published, and run — never a candidate carrying the override's toolsets.
     """
     import api.streaming as streaming
     from tools.registry import registry as _reg
 
     _real_gen = streaming._registry_generation
-    _saved_tools = dict(_reg._tools)
-    _saved_aliases = dict(_reg._toolset_aliases)
+    _gen_state = {"value": None}
+    _GateFakeAgent = _make_gate_fake_agent(_gen_state)
 
     try:
         # Force generation to None (registry unavailable / no counter).
-        monkeypatch.setattr(streaming, "_registry_generation", lambda: None)
+        monkeypatch.setattr(streaming, "_registry_generation",
+                            lambda: _gen_state["value"])
+        _publish_proxy = _PublishRecordingDict()
+        monkeypatch.setattr(streaming, "AGENT_INSTANCES", _publish_proxy)
+        from api.config import SESSION_AGENT_CACHE, SESSION_AGENT_CACHE_LOCK
 
-        _reg.register_toolset_alias("alpha", "mcp-alpha")
-        _reg.register("alpha_tool", "mcp-alpha", {"type": "object"},
-                      lambda *a, **k: "ok", override=True)
-
-        # Apply the override — _gen_slot will contain None (no generation).
-        _gen_slot = []
-        result = _apply_override(
-            ["web", "file"], ["alpha"], {"alpha"},
-            _gen_slot=_gen_slot,
-        )
-        # The helper returns a valid merged result with the override applied.
-        # The additive branch returns bare server names for ordinary servers.
-        assert "alpha" in result, (
-            f"override should be applied, got {result!r}"
+        sid = "gate-unavail-gen"
+        stream_id = "gate-unavail-gen-stream"
+        _setup_gate_real_caller(
+            tmp_path, monkeypatch, _GateFakeAgent, sid, stream_id,
         )
 
-        # Simulate the worker-level check: override was applied, generation
-        # is None → cannot prove stability → fail closed.
-        _toolsets_gen = _gen_slot[0] if _gen_slot else None
-        _override_applied = True
-
-        # This mirrors the production worker logic (Round-22).
-        if _toolsets_gen is not None and streaming._registry_generation_changed(_toolsets_gen):
-            final_toolsets = []
-        elif _toolsets_gen is None and _override_applied:
-            final_toolsets = []
-        else:
-            final_toolsets = result
-
-        assert final_toolsets == [], (
-            f"override with unavailable generation must fail closed to empty, "
-            f"got {final_toolsets!r}"
+        # Exactly ONE construction: the fail-closed EMPTY-TOOL fallback.
+        # (The stale-authority pre-check rejects before any candidate with the
+        # override's toolsets can be built.)
+        assert len(_GateFakeAgent.instances) == 1, (
+            f"expected 1 fail-closed construction, got {len(_GateFakeAgent.instances)}"
+        )
+        empty = _GateFakeAgent.instances[0]
+        assert empty.enabled_toolsets == [], (
+            f"fail-closed agent must be empty-tool, got {empty.enabled_toolsets!r}"
+        )
+        assert empty.closed is False, "the empty-tool fallback must not be closed"
+        assert empty.ran is True, "the empty-tool fallback is the agent that runs"
+        with SESSION_AGENT_CACHE_LOCK:
+            cached_entry = SESSION_AGENT_CACHE.get(sid)
+        assert cached_entry is not None and cached_entry[0] is empty, (
+            "cache must hold the empty-tool fallback (never the override toolsets)"
+        )
+        assert _publish_proxy.published.get(stream_id) is empty, (
+            "AGENT_INSTANCES must publish the empty-tool fallback: "
+            f"published={_publish_proxy.published!r}"
         )
     finally:
         monkeypatch.setattr(streaming, "_registry_generation", _real_gen)
         _reg._tools.clear()
-        _reg._tools.update(_saved_tools)
         _reg._toolset_aliases.clear()
-        _reg._toolset_aliases.update(_saved_aliases)
 
 
 def test_generation_movement_during_construction_fails_closed(monkeypatch):
-    """Round-22 gate finding 2 discriminator: the generation must be
-    re-validated IMMEDIATELY AFTER ``_AIAgent(...)`` construction.  A
-    registry mutation during the constructor's tool resolution must fail
-    closed (blank toolsets on the agent), not run or cache tools that were
-    never authorized.
+    """Round-22 gate finding 2 discriminator, Round-23 rework: the generation
+    must be re-validated IMMEDIATELY AFTER construction.  A registry mutation
+    during the constructor's tool resolution must fail closed — and the
+    Round-23 construction transaction closes and discards the stale candidate
+    instead of merely blanking ``enabled_toolsets`` post-hoc (which left the
+    constructor-derived tools/valid_tool_names callable).
 
-    This test simulates the production worker pattern:
-      1. Apply override → capture generation (e.g. gen=1),
+    This drives the REAL ``_construct_override_gated_agent()`` transaction:
+      1. Authority captured at gen=1,
       2. Pre-construction check passes (gen still 1),
-      3. Simulate construction (gen moves to 2 during construction),
-      4. Post-construction check catches the movement → blank toolsets.
+      3. Construction moves gen to 2 DURING the constructor,
+      4. Post-construction check catches the movement → stale candidate is
+         closed and discarded, the single retry succeeds.
     """
     import api.streaming as streaming
-    from tools.registry import registry as _reg
 
     _real_gen = streaming._registry_generation
-    _real_gen_changed = streaming._registry_generation_changed
-    _saved_tools = dict(_reg._tools)
-    _saved_aliases = dict(_reg._toolset_aliases)
+    _gen_state = {"value": 1}
+    _GateFakeAgent = _make_gate_fake_agent(_gen_state, move_on=(1,))
 
     try:
-        _reg.register_toolset_alias("alpha", "mcp-alpha")
-        _reg.register("alpha_tool", "mcp-alpha", {"type": "object"},
-                      lambda *a, **k: "ok", override=True)
-
-        # Phase 1: Apply override with gen=1.
-        _state = {"gen": 1}
         monkeypatch.setattr(streaming, "_registry_generation",
-                            lambda: _state["gen"])
+                            lambda: _gen_state["value"])
 
-        _gen_slot = []
-        result = _apply_override(
-            ["web", "file"], ["alpha"], {"alpha"},
-            _gen_slot=_gen_slot,
+        def _rederive():
+            return (["web", "file"], 2, True)
+
+        agent, outcome, final_ts = streaming._construct_override_gated_agent(
+            _GateFakeAgent, {"model": "gpt-4o"},
+            ["web", "file"], 1, True,
+            rederive_authority=_rederive,
         )
-        _toolsets_gen = _gen_slot[0]
-        assert _toolsets_gen == 1
-
-        # Phase 2: Pre-construction check (gen still 1 → passes).
-        assert not streaming._registry_generation_changed(_toolsets_gen)
-        _toolsets = result  # would go into _agent_kwargs
-
-        # Phase 3: Simulate construction — gen moves to 2 DURING construction.
-        _state["gen"] = 2
-
-        # Phase 4: Post-construction check catches the movement.
-        assert streaming._registry_generation_changed(_toolsets_gen), (
-            "generation movement during construction must be detected"
+        # The stale candidate was closed; the retried agent survived.
+        assert outcome == "retried", f"expected retried, got {outcome!r}"
+        assert len(_GateFakeAgent.instances) == 2, (
+            f"expected 2 constructions, got {len(_GateFakeAgent.instances)}"
         )
-        # Production blanks the agent's toolsets.
-        final_toolsets = [] if streaming._registry_generation_changed(_toolsets_gen) else _toolsets
-        assert final_toolsets == [], (
-            f"generation movement during construction must blank toolsets, "
-            f"got {final_toolsets!r}"
+        assert _GateFakeAgent.instances[0].closed is True, (
+            "generation movement during construction must close the stale candidate"
         )
+        assert _GateFakeAgent.instances[1].closed is False
+        assert agent is _GateFakeAgent.instances[1]
+        assert final_ts == ["web", "file"]
     finally:
         monkeypatch.setattr(streaming, "_registry_generation", _real_gen)
-        _reg._tools.clear()
-        _reg._tools.update(_saved_tools)
-        _reg._toolset_aliases.clear()
-        _reg._toolset_aliases.update(_saved_aliases)
 
 
 def test_no_override_no_generation_check_needed(monkeypatch):
@@ -4190,38 +4173,572 @@ def test_no_override_no_generation_check_needed(monkeypatch):
     defaults are config-derived (not registry-derived), so no generation
     re-validation is needed.  ``_toolsets_gen`` is None and
     ``_override_applied`` is False → toolsets are preserved.
+
+    Round-23 rework: drives the REAL ``_construct_override_gated_agent()``
+    transaction (the Round-22 version copied the worker's if/elif chain).
     """
     import api.streaming as streaming
-    from tools.registry import registry as _reg
 
     _real_gen = streaming._registry_generation
-    _saved_tools = dict(_reg._tools)
-    _saved_aliases = dict(_reg._toolset_aliases)
 
     try:
         # Even with generation unavailable, no override means no check needed.
         monkeypatch.setattr(streaming, "_registry_generation", lambda: None)
 
-        # No override → _toolsets_gen stays None, _override_applied stays False.
-        _toolsets_gen = None
-        _override_applied = False
-        _toolsets = ["web", "file", "terminal"]
+        class _RecAgent:
+            def __init__(self, **kwargs):
+                self.enabled_toolsets = kwargs.get("enabled_toolsets")
 
-        # Mirrors the production worker logic (Round-22).
-        if _toolsets_gen is not None and streaming._registry_generation_changed(_toolsets_gen):
-            final_toolsets = []
-        elif _toolsets_gen is None and _override_applied:
-            final_toolsets = []
-        else:
-            final_toolsets = _toolsets
-
-        assert final_toolsets == _toolsets, (
-            f"no override + no generation must preserve defaults, "
-            f"got {final_toolsets!r}"
+        agent, outcome, final_ts = streaming._construct_override_gated_agent(
+            _RecAgent, {"model": "gpt-4o"},
+            ["web", "file", "terminal"], None, False,  # no override
+            rederive_authority=None,
+        )
+        assert outcome == "stable", f"expected stable, got {outcome!r}"
+        assert final_ts == ["web", "file", "terminal"], (
+            f"no override + no generation must preserve defaults, got {final_ts!r}"
+        )
+        assert agent.enabled_toolsets == ["web", "file", "terminal"], (
+            f"agent must receive the preserved defaults, got {agent.enabled_toolsets!r}"
         )
     finally:
         monkeypatch.setattr(streaming, "_registry_generation", _real_gen)
-        _reg._tools.clear()
-        _reg._tools.update(_saved_tools)
-        _reg._toolset_aliases.clear()
-        _reg._toolset_aliases.update(_saved_aliases)
+
+
+# ── Round-23: centralized construction transaction ──────────────────────────
+# Reviewer Round-22 finding: post-hoc `agent.enabled_toolsets = []` on a stale
+# candidate does NOT revoke constructor-derived tools/valid_tool_names, and the
+# cache-miss/healing paths registered, cached, published, and ran the stale
+# candidate anyway.  The fix centralizes overridden-agent construction in
+# _construct_override_gated_agent(): pre-check → construct into a LOCAL
+# candidate → post-check → close+discard stale candidate (never registered/
+# cached/published/run) → at most one retry from freshly derived authority →
+# fail-closed EMPTY-tool agent built with enabled_toolsets=[].
+
+
+def _make_gate_fake_agent(_gen_state, move_on=(), fail_first_401=False):
+    """Build a FakeAgent class whose constructor bumps ``_gen_state['value']``
+    (simulating a registry mutation during the constructor's tool resolution)
+    for the construction attempts listed in ``move_on`` (1-based attempt
+    numbers, e.g. ``(1,)`` = only the FIRST construction moves the generation).
+    Records instances, close() calls, and run_conversation() calls so tests can
+    prove a stale candidate was closed and never registered/cached/run.
+
+    When ``fail_first_401`` is True, the first run_conversation() call on the
+    FIRST agent that actually runs returns an auth failure (with
+    ``_last_error`` set) so the production credential-heal path re-derives
+    authority and rebuilds the agent; subsequent calls succeed.
+    """
+    class _GateFakeAgent:
+        instances = []
+        closed = []
+        ran = []
+        move_attempts = set(move_on)
+        run_calls = 0
+
+        def __init__(self, **kwargs):
+            _GateFakeAgent.instances.append(self)
+            self.enabled_toolsets = kwargs.get("enabled_toolsets")
+            self.closed = False
+            self.ran = False
+            attempt = len(_GateFakeAgent.instances)
+            if attempt in _GateFakeAgent.move_attempts:
+                _gen_state["value"] += 1
+
+        def close(self):
+            self.closed = True
+            _GateFakeAgent.closed.append(self)
+
+        def run_conversation(self, **kwargs):
+            self.ran = True
+            _GateFakeAgent.ran.append(self)
+            _GateFakeAgent.run_calls += 1
+            if fail_first_401 and _GateFakeAgent.run_calls == 1:
+                self._last_error = "401 Unauthorized"
+                return {
+                    "failed": True,
+                    "error": "401 Unauthorized",
+                    "messages": [],
+                }
+            return {
+                "failed": False,
+                "messages": [{"role": "assistant", "content": "ok"}],
+            }
+
+    return _GateFakeAgent
+
+
+def test_gate_construct_stable_no_override(monkeypatch):
+    """No override applied → no generation re-validation needed; construct
+    directly with the profile-default toolsets (outcome 'stable')."""
+    import api.streaming as streaming
+
+    _gen_state = {"value": 1}
+    _real_gen = streaming._registry_generation
+
+    class _StableAgent:
+        def __init__(self, **kwargs):
+            self.enabled_toolsets = kwargs.get("enabled_toolsets")
+            self.closed = False
+
+    try:
+        monkeypatch.setattr(streaming, "_registry_generation",
+                            lambda: _gen_state["value"])
+        agent, outcome, final_ts = streaming._construct_override_gated_agent(
+            _StableAgent, {"model": "gpt-4o"},
+            ["web", "file"], None, False,  # no override
+            rederive_authority=None,
+        )
+        assert outcome == "stable", f"expected stable, got {outcome!r}"
+        assert final_ts == ["web", "file"]
+        assert agent.enabled_toolsets == ["web", "file"]
+    finally:
+        monkeypatch.setattr(streaming, "_registry_generation", _real_gen)
+
+
+def test_gate_construct_unavailable_generation_with_override_fails_closed(monkeypatch):
+    """Override WAS applied but the generation is unavailable (None) → cannot
+    prove stability → fail closed to an EMPTY-tool agent (enabled_toolsets=[])
+    — never a candidate with the override's toolsets."""
+    import api.streaming as streaming
+
+    _real_gen = streaming._registry_generation
+    _constructed = []
+
+    class _RecAgent:
+        def __init__(self, **kwargs):
+            _constructed.append(kwargs.get("enabled_toolsets"))
+            self.enabled_toolsets = kwargs.get("enabled_toolsets")
+            self.closed = False
+
+    try:
+        monkeypatch.setattr(streaming, "_registry_generation", lambda: None)
+        agent, outcome, final_ts = streaming._construct_override_gated_agent(
+            _RecAgent, {"model": "gpt-4o"},
+            ["web", "gate-alpha"], None, True,  # override applied, gen None
+            rederive_authority=None,
+        )
+        assert outcome == "fail-closed", f"expected fail-closed, got {outcome!r}"
+        assert final_ts == [], f"expected empty final toolsets, got {final_ts!r}"
+        assert agent.enabled_toolsets == [], (
+            f"fail-closed agent must be empty-tool, got {agent.enabled_toolsets!r}"
+        )
+        assert _constructed == [[]], (
+            f"only the empty-tool fallback may be constructed, got {_constructed!r}"
+        )
+    finally:
+        monkeypatch.setattr(streaming, "_registry_generation", _real_gen)
+
+
+def test_gate_construct_precheck_stale_retries_once_then_fails_closed(monkeypatch):
+    """Pre-check stale (generation moved BEFORE construction) → retry once from
+    freshly derived authority; when the retry authority is ALSO stale → fail
+    closed to an empty-tool agent.  No candidate is ever constructed from the
+    stale authority."""
+    import api.streaming as streaming
+
+    _gen_state = {"value": 2}  # authority captured gen=1, live is 2
+    _real_gen = streaming._registry_generation
+    _constructed = []
+
+    class _RecAgent:
+        def __init__(self, **kwargs):
+            _constructed.append(kwargs.get("enabled_toolsets"))
+            self.enabled_toolsets = kwargs.get("enabled_toolsets")
+            self.closed = False
+
+    try:
+        monkeypatch.setattr(streaming, "_registry_generation",
+                            lambda: _gen_state["value"])
+
+        def _rederive():
+            # Fresh authority ALSO stale (generation still moving).
+            return (["web"], 1, True)
+
+        agent, outcome, final_ts = streaming._construct_override_gated_agent(
+            _RecAgent, {"model": "gpt-4o"},
+            ["web"], 1, True,
+            rederive_authority=_rederive,
+        )
+        assert outcome == "fail-closed", f"expected fail-closed, got {outcome!r}"
+        assert final_ts == []
+        assert agent.enabled_toolsets == []
+        # Only the empty-tool fallback was constructed (never a stale candidate).
+        assert _constructed == [[]], (
+            f"stale authority must never construct a candidate, got {_constructed!r}"
+        )
+    finally:
+        monkeypatch.setattr(streaming, "_registry_generation", _real_gen)
+
+
+def test_gate_construct_postcheck_stale_closes_and_retries_success(monkeypatch):
+    """Generation moves DURING the constructor (post-check catches it): the
+    stale candidate is closed and discarded; the single retry from freshly
+    derived authority succeeds and returns the fresh agent (outcome 'retried')."""
+    import api.streaming as streaming
+
+    _gen_state = {"value": 1}
+    _real_gen = streaming._registry_generation
+    _GateFakeAgent = _make_gate_fake_agent(_gen_state, move_on=(1,))
+
+    try:
+        monkeypatch.setattr(streaming, "_registry_generation",
+                            lambda: _gen_state["value"])
+
+        def _rederive():
+            # Fresh authority: generation now stable at 2.
+            return (["web", "file"], 2, True)
+
+        agent, outcome, final_ts = streaming._construct_override_gated_agent(
+            _GateFakeAgent, {"model": "gpt-4o"},
+            ["web"], 1, True,
+            rederive_authority=_rederive,
+        )
+        assert outcome == "retried", f"expected retried, got {outcome!r}"
+        assert final_ts == ["web", "file"]
+        assert len(_GateFakeAgent.instances) == 2, (
+            f"expected 2 constructions (stale + retry), got {len(_GateFakeAgent.instances)}"
+        )
+        # The FIRST (stale) candidate was closed; the retried candidate lives.
+        assert _GateFakeAgent.instances[0].closed is True, (
+            "stale candidate must be closed"
+        )
+        assert _GateFakeAgent.instances[1].closed is False
+        assert agent is _GateFakeAgent.instances[1]
+        assert agent.enabled_toolsets == ["web", "file"]
+    finally:
+        monkeypatch.setattr(streaming, "_registry_generation", _real_gen)
+
+
+def test_gate_construct_retry_exhaustion_fails_closed_empty(monkeypatch):
+    """Every construction attempt sees generation movement → the single retry
+    is exhausted → fail closed to an EMPTY-tool agent.  BOTH stale candidates
+    are closed."""
+    import api.streaming as streaming
+
+    _gen_state = {"value": 1}
+    _real_gen = streaming._registry_generation
+    _GateFakeAgent = _make_gate_fake_agent(_gen_state, move_on=(1, 2))
+
+    try:
+        monkeypatch.setattr(streaming, "_registry_generation",
+                            lambda: _gen_state["value"])
+
+        def _rederive():
+            return (["web", "file"], 2, True)
+
+        agent, outcome, final_ts = streaming._construct_override_gated_agent(
+            _GateFakeAgent, {"model": "gpt-4o"},
+            ["web"], 1, True,
+            rederive_authority=_rederive,
+        )
+        assert outcome == "fail-closed", f"expected fail-closed, got {outcome!r}"
+        assert final_ts == []
+        assert agent.enabled_toolsets == [], (
+            f"fail-closed fallback must be empty-tool, got {agent.enabled_toolsets!r}"
+        )
+        # Both stale candidates were closed; the empty-tool fallback lives.
+        assert len(_GateFakeAgent.instances) == 3, (
+            f"expected 3 constructions (2 stale + empty fallback), got {len(_GateFakeAgent.instances)}"
+        )
+        assert all(_GateFakeAgent.instances[i].closed for i in (0, 1)), (
+            "both stale candidates must be closed"
+        )
+        assert _GateFakeAgent.instances[2].closed is False
+        assert agent is _GateFakeAgent.instances[2]
+    finally:
+        monkeypatch.setattr(streaming, "_registry_generation", _real_gen)
+
+
+def _setup_gate_real_caller(tmp_path, monkeypatch, FakeAgentCls, sid, stream_id,
+                            override_toolsets=("gate-alpha",)):
+    """Shared production-composed setup: seed registry aliases/tools, create a
+    session with a per-session override, monkeypatch the real
+    ``_run_agent_streaming`` call-site dependencies, and run the worker.
+    Assertions on FakeAgentCls.instances afterwards prove which candidate was
+    closed / cached / published / run."""
+    import queue
+    import sys
+    import types as _types
+
+    import toolsets as _ts_mod
+    from api import models
+    from tools.registry import registry as _reg
+
+    _saved_toolsets = dict(_ts_mod.TOOLSETS)
+    _saved_tools = dict(_reg._tools)
+    _saved_aliases = dict(_reg._toolset_aliases)
+
+    _ts_mod.create_custom_toolset("safe-composite", "safe workflow",
+                                  tools=[], includes=["safe-inner"])
+    _reg.register_toolset_alias("gate-alpha", "mcp-gate-alpha")
+    _reg.register("alpha_tool", "mcp-gate-alpha", {"type": "object"},
+                  lambda *a, **k: "ok", override=True)
+    _reg.register("safe_unique_tool", "safe-inner", {"type": "object"},
+                  lambda *a, **k: "ok", override=True)
+
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
+    monkeypatch.setattr(streaming, "SESSION_DIR", session_dir)
+    session = models.Session(
+        session_id=sid,
+        title="gate-real-caller",
+        workspace=str(tmp_path),
+        model="gpt-4o",
+        messages=[],
+        context_messages=[],
+    )
+    session.active_stream_id = stream_id
+    session.pending_user_message = "hi"
+    session.pending_started_at = 1.0
+    session.save()
+    models.SESSIONS[sid] = session
+    streaming.SESSIONS[sid] = session
+    streaming.STREAMS[stream_id] = queue.Queue()
+
+    fake_hermes_state = _types.ModuleType("hermes_state")
+    fake_hermes_state.SessionDB = lambda *_a, **_k: object()
+
+    def _fake_load_metadata_only(session_id):
+        meta = models.Session(session_id=session_id, model="gpt-4o")
+        meta.enabled_toolsets = list(override_toolsets)
+        return meta
+
+    with monkeypatch.context() as m:
+        m.setattr(streaming, "_get_ai_agent", lambda: FakeAgentCls)
+        m.setattr(streaming, "resolve_model_provider",
+                  lambda *_a, **_k: ("gpt-4o", "openai", None))
+        m.setattr("api.config.get_config", lambda *_a, **_k: {
+            "mcp_servers": {"gate-alpha": {}},
+        })
+        m.setattr("api.config._resolve_cli_toolsets",
+                  lambda *_a, **_k: ["web", "search", "safe-composite"])
+        m.setattr(models.Session, "load_metadata_only",
+                  staticmethod(_fake_load_metadata_only))
+        m.setitem(sys.modules, "hermes_state", fake_hermes_state)
+        try:
+            streaming._run_agent_streaming(
+                session_id=sid,
+                msg_text="hi",
+                model="gpt-4o",
+                workspace=str(tmp_path),
+                stream_id=stream_id,
+            )
+        finally:
+            _ts_mod.TOOLSETS.clear()
+            _ts_mod.TOOLSETS.update(_saved_toolsets)
+            _reg._tools.clear()
+            _reg._tools.update(_saved_tools)
+            _reg._toolset_aliases.clear()
+            _reg._toolset_aliases.update(_saved_aliases)
+    return session
+
+
+class _PublishRecordingDict(dict):
+    """Dict that records every ``__setitem__`` so tests can prove WHICH agent
+    instance was published into AGENT_INSTANCES (the real module clears the
+    entry in its finally block, so the post-run dict alone cannot show it)."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.published = {}
+
+    def __setitem__(self, key, value):
+        super().__setitem__(key, value)
+        self.published[key] = value
+
+
+def test_real_caller_cache_miss_generation_move_discards_stale_candidate(monkeypatch, tmp_path):
+    """PRODUCTION-COMPOSED (cache-miss path): drive the REAL
+    ``_run_agent_streaming()`` with a registry generation that moves DURING the
+    constructor's tool resolution.  The stale candidate must be closed and
+    never registered, cached, published, or run; the single retry from freshly
+    derived authority must produce the agent that ends up cached + published +
+    run."""
+    import api.streaming as streaming
+    from api.config import SESSION_AGENT_CACHE, SESSION_AGENT_CACHE_LOCK
+
+    _gen_state = {"value": 1}
+    _real_gen = streaming._registry_generation
+    _GateFakeAgent = _make_gate_fake_agent(_gen_state, move_on=(1,))
+    try:
+        monkeypatch.setattr(streaming, "_registry_generation",
+                            lambda: _gen_state["value"])
+        _publish_proxy = _PublishRecordingDict()
+        monkeypatch.setattr(streaming, "AGENT_INSTANCES", _publish_proxy)
+        sid = "gate-cache-miss"
+        stream_id = "gate-cache-miss-stream"
+        _setup_gate_real_caller(
+            tmp_path, monkeypatch, _GateFakeAgent, sid, stream_id,
+        )
+
+        # Exactly two constructions: the stale first attempt + the retried one.
+        assert len(_GateFakeAgent.instances) == 2, (
+            f"expected 2 constructions, got {len(_GateFakeAgent.instances)}"
+        )
+        stale, fresh = _GateFakeAgent.instances
+        assert stale.closed is True, "stale candidate must be closed"
+        assert fresh.closed is False, "retried candidate must not be closed"
+        assert stale.ran is False, "stale candidate must never run"
+        assert fresh.ran is True, "retried candidate must be the one that runs"
+
+        # The stale candidate must never be cached.
+        with SESSION_AGENT_CACHE_LOCK:
+            cached_entry = SESSION_AGENT_CACHE.get(sid)
+        assert cached_entry is not None and cached_entry[0] is fresh, (
+            "cache must hold the retried agent, not the stale candidate"
+        )
+        # The published AGENT_INSTANCES entry must be the retried agent.
+        assert _publish_proxy.published.get(stream_id) is fresh, (
+            "AGENT_INSTANCES must publish the retried agent, not the stale one: "
+            f"published={_publish_proxy.published!r}"
+        )
+    finally:
+        monkeypatch.setattr(streaming, "_registry_generation", _real_gen)
+
+
+def test_real_caller_ephemeral_generation_move_discards_stale_candidate(monkeypatch, tmp_path):
+    """PRODUCTION-COMPOSED (ephemeral path): same transaction semantics on the
+    ephemeral (no-cache) construction path — the stale candidate is closed and
+    never run; the retried agent runs."""
+    import api.streaming as streaming
+
+    _gen_state = {"value": 1}
+    _real_gen = streaming._registry_generation
+    _GateFakeAgent = _make_gate_fake_agent(_gen_state, move_on=(1,))
+    try:
+        monkeypatch.setattr(streaming, "_registry_generation",
+                            lambda: _gen_state["value"])
+        _publish_proxy = _PublishRecordingDict()
+        monkeypatch.setattr(streaming, "AGENT_INSTANCES", _publish_proxy)
+        sid = "gate-ephemeral"
+        stream_id = "gate-ephemeral-stream"
+        _setup_gate_real_caller(
+            tmp_path, monkeypatch, _GateFakeAgent, sid, stream_id,
+        )
+        assert len(_GateFakeAgent.instances) == 2, (
+            f"expected 2 constructions, got {len(_GateFakeAgent.instances)}"
+        )
+        stale, fresh = _GateFakeAgent.instances
+        assert stale.closed is True, "stale candidate must be closed"
+        assert fresh.closed is False
+        assert stale.ran is False, "stale candidate must never run"
+        assert fresh.ran is True, "retried candidate must run"
+        assert _publish_proxy.published.get(stream_id) is fresh, (
+            "AGENT_INSTANCES must publish the retried agent: "
+            f"published={_publish_proxy.published!r}"
+        )
+    finally:
+        monkeypatch.setattr(streaming, "_registry_generation", _real_gen)
+
+
+def test_real_caller_healing_fresh_authority_discards_stale_candidate(monkeypatch, tmp_path):
+    """PRODUCTION-COMPOSED (credential healing path): a 401 auth failure
+    triggers credential self-heal, which re-derives a FRESH authority and
+    rebuilds through the construction transaction.  A generation move during
+    the heal rebuild must close+discard the stale candidate; the retried agent
+    is the one that ends up cached + published + run."""
+    import api.streaming as streaming
+    from api.config import SESSION_AGENT_CACHE, SESSION_AGENT_CACHE_LOCK
+
+    _gen_state = {"value": 1}
+    _real_gen = streaming._registry_generation
+    _GateFakeAgent = _make_gate_fake_agent(_gen_state, move_on=(1, 3),
+                                           fail_first_401=True)
+    try:
+        monkeypatch.setattr(streaming, "_registry_generation",
+                            lambda: _gen_state["value"])
+        _publish_proxy = _PublishRecordingDict()
+        monkeypatch.setattr(streaming, "AGENT_INSTANCES", _publish_proxy)
+
+        def _fake_heal(provider_id, session_id, agent_lock, *, target_model=None):
+            # Simulate a successful credential refresh; the rebuild then
+            # re-derives fresh authority and constructs again.
+            return {"api_key": "new-key", "provider": "openai"}
+
+        monkeypatch.setattr(streaming, "_attempt_credential_self_heal",
+                            _fake_heal)
+        sid = "gate-heal"
+        stream_id = "gate-heal-stream"
+        _setup_gate_real_caller(
+            tmp_path, monkeypatch, _GateFakeAgent, sid, stream_id,
+        )
+
+        # Construction attempts: initial (stale→close), retry (fresh), heal
+        # rebuild (stale→close), heal retry (fresh) — 4 instances.
+        assert len(_GateFakeAgent.instances) == 4, (
+            f"expected 4 constructions, got {len(_GateFakeAgent.instances)}"
+        )
+        i0, i1, i2, i3 = _GateFakeAgent.instances
+        assert i0.closed is True, "initial stale candidate must be closed"
+        assert i1.closed is False, "initial retried candidate must not be closed"
+        assert i2.closed is True, "heal stale candidate must be closed"
+        assert i3.closed is False, "heal retried candidate must not be closed"
+        # Only the two fresh agents may run; stale ones never run.
+        assert i0.ran is False and i2.ran is False
+        assert i1.ran is True and i3.ran is True
+        # The final cached + published agent is the heal-retried one.
+        with SESSION_AGENT_CACHE_LOCK:
+            cached_entry = SESSION_AGENT_CACHE.get(sid)
+        assert cached_entry is not None and cached_entry[0] is i3, (
+            "cache must hold the heal-retried agent"
+        )
+        assert _publish_proxy.published.get(stream_id) is i3, (
+            "AGENT_INSTANCES must publish the heal-retried agent: "
+            f"published={_publish_proxy.published!r}"
+        )
+    finally:
+        monkeypatch.setattr(streaming, "_registry_generation", _real_gen)
+
+
+def test_real_caller_retry_exhaustion_fails_closed_empty(monkeypatch, tmp_path):
+    """PRODUCTION-COMPOSED (bounded retry exhaustion): every construction
+    attempt observes generation movement → the single retry is exhausted →
+    fail closed to an EMPTY-tool agent (enabled_toolsets=[]) built from
+    initialization.  Both stale candidates are closed; the empty-tool agent is
+    the only one that ends up cached + published + run."""
+    import api.streaming as streaming
+    from api.config import SESSION_AGENT_CACHE, SESSION_AGENT_CACHE_LOCK
+
+    _gen_state = {"value": 1}
+    _real_gen = streaming._registry_generation
+    _GateFakeAgent = _make_gate_fake_agent(_gen_state, move_on=(1, 2))
+    try:
+        monkeypatch.setattr(streaming, "_registry_generation",
+                            lambda: _gen_state["value"])
+        _publish_proxy = _PublishRecordingDict()
+        monkeypatch.setattr(streaming, "AGENT_INSTANCES", _publish_proxy)
+        sid = "gate-exhaust"
+        stream_id = "gate-exhaust-stream"
+        _setup_gate_real_caller(
+            tmp_path, monkeypatch, _GateFakeAgent, sid, stream_id,
+        )
+
+        # 2 stale candidates (both closed) + 1 empty-tool fallback = 3.
+        assert len(_GateFakeAgent.instances) == 3, (
+            f"expected 3 constructions, got {len(_GateFakeAgent.instances)}"
+        )
+        s1, s2, empty = _GateFakeAgent.instances
+        assert s1.closed is True and s2.closed is True, (
+            "both stale candidates must be closed"
+        )
+        assert empty.closed is False
+        assert s1.ran is False and s2.ran is False, (
+            "stale candidates must never run"
+        )
+        assert empty.enabled_toolsets == [], (
+            f"fail-closed fallback must be empty-tool, got {empty.enabled_toolsets!r}"
+        )
+        assert empty.ran is True, "empty-tool fallback is the agent that runs"
+        with SESSION_AGENT_CACHE_LOCK:
+            cached_entry = SESSION_AGENT_CACHE.get(sid)
+        assert cached_entry is not None and cached_entry[0] is empty, (
+            "cache must hold the empty-tool fallback (never a stale candidate)"
+        )
+        assert _publish_proxy.published.get(stream_id) is empty, (
+            "AGENT_INSTANCES must publish the empty-tool fallback: "
+            f"published={_publish_proxy.published!r}"
+        )
+    finally:
+        monkeypatch.setattr(streaming, "_registry_generation", _real_gen)

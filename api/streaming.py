@@ -8284,6 +8284,164 @@ def _registry_generation_changed(gen_at_entry):
     return _registry_generation() != gen_at_entry
 
 
+def _authority_snapshot_stale(gen_at_entry, override_applied):
+    """Return True when a captured authority snapshot can no longer be
+    trusted for agent construction.
+
+    Two fail-closed conditions (Round-22/23 gate semantics):
+
+    * ``gen_at_entry`` is not None and the live generation moved — the
+      registry mutated after the authority snapshot was captured.
+    * ``gen_at_entry`` is None and ``override_applied`` — an override WAS
+      applied but no generation counter exists to prove the authority is
+      stable.  ``None`` alone is fine when no override was applied (profile
+      defaults are config-derived, not registry-derived).
+    """
+    if gen_at_entry is not None and _registry_generation_changed(gen_at_entry):
+        return True
+    if gen_at_entry is None and override_applied:
+        return True
+    return False
+
+
+def _derive_session_toolset_authority(cfg, session_id):
+    """(Re-)derive the per-session toolset override authority from the
+    CURRENT registry state.
+
+    Mirrors the inline resolution used at the top of ``_run_agent_streaming``
+    so a construction-transaction retry (or a credential-heal rebuild) can
+    obtain a *fresh* authority instead of reusing a stale one.
+
+    Returns ``(toolsets, gen, applied)``:
+      * toolsets — the resolved per-session toolset list
+      * gen      — the registry generation the override reasoned from
+                   (None when no override was applied or the registry
+                   lacks a generation counter)
+      * applied  — True when a per-session override was actually applied
+    """
+    from api.config import _resolve_cli_toolsets
+
+    _toolsets = _resolve_cli_toolsets(cfg)
+    _gen = None
+    _applied = False
+    try:
+        from api.models import Session, SESSION_DIR
+        _session_path = SESSION_DIR / f"{session_id}.json"
+        if _session_path.exists():
+            _session_meta = Session.load_metadata_only(session_id)
+            _override = getattr(_session_meta, 'enabled_toolsets', None) if _session_meta else None
+            if _override is not None:
+                try:
+                    _mcp_server_names = set(
+                        (cfg.get('mcp_servers') or {}).keys()
+                    )
+                except Exception:
+                    _mcp_server_names = set()
+                _gen_slot = []
+                _toolsets = _apply_session_toolset_override(
+                    _toolsets, _override, _mcp_server_names,
+                    _gen_slot=_gen_slot,
+                )
+                _gen = _gen_slot[0] if _gen_slot else None
+                _applied = True
+    except Exception:
+        pass
+    return _toolsets, _gen, _applied
+
+
+def _construct_override_gated_agent(
+    agent_cls,
+    agent_kwargs,
+    toolsets,
+    toolsets_gen,
+    override_applied,
+    rederive_authority=None,
+):
+    """Centralized overridden-agent construction transaction (Round-23 gate).
+
+    Builds an AIAgent only from a *provably stable* authority snapshot:
+
+      1. Validates the captured generation immediately BEFORE construction.
+      2. Constructs into a local candidate.
+      3. Validates immediately AFTER construction — a registry mutation
+         during the constructor's tool resolution must fail closed.
+      4. On movement or unavailable authority the candidate is closed and
+         discarded: it is NEVER registered, cached, published, or run.
+      5. Retries at most once from a freshly derived authority, then fails
+         closed.
+      6. The fail-closed fallback is an EMPTY-tool agent constructed with
+         ``enabled_toolsets=[]`` so its ``tools`` and ``valid_tool_names``
+         are empty from initialization.  A stale candidate is never
+         sanitized by mutating only ``enabled_toolsets`` afterwards — the
+         constructor-derived tool caches would survive that.
+
+    Args:
+      agent_cls: the AIAgent class to construct.
+      agent_kwargs: kwargs for the constructor (``enabled_toolsets`` is
+          overwritten with the validated toolsets on each attempt).
+      toolsets: the currently resolved per-session toolsets.
+      toolsets_gen: the registry generation the authority reasoned from.
+      override_applied: whether a per-session override was applied.
+      rederive_authority: optional callable ``() -> (toolsets, gen, applied)``
+          returning a FRESH authority for the single retry.  When omitted the
+          transaction fails closed immediately on the first stale check.
+
+    Returns ``(agent, outcome, final_toolsets)``:
+      * outcome == 'stable'      — built from the captured authority.
+      * outcome == 'retried'     — built from a freshly derived authority.
+      * outcome == 'fail-closed' — empty-tool agent (``enabled_toolsets=[]``).
+      * final_toolsets — the toolsets the returned agent was constructed
+        with (the re-derived toolsets after a retry, or ``[]`` when
+        fail-closed).  Callers that compute a cache signature from the
+        toolsets MUST use this value, not the pre-transaction ``toolsets``.
+    """
+    _kwargs = dict(agent_kwargs)
+    _attempt_toolsets = toolsets
+    _attempt_gen = toolsets_gen
+    _attempt_applied = override_applied
+    _retried = False
+
+    for _attempt in range(2):  # initial + at most one retry
+        # 1. Pre-check: the authority must still hold BEFORE construction.
+        if _authority_snapshot_stale(_attempt_gen, _attempt_applied):
+            if not _retried and rederive_authority is not None:
+                _attempt_toolsets, _attempt_gen, _attempt_applied = rederive_authority()
+                _retried = True
+                continue
+            # Fail closed: empty-tool agent from initialization.
+            _kwargs['enabled_toolsets'] = []
+            return agent_cls(**_kwargs), 'fail-closed', []
+
+        # 2. Construct into a LOCAL candidate.
+        _kwargs['enabled_toolsets'] = _attempt_toolsets
+        candidate = agent_cls(**_kwargs)
+
+        # 3. Post-check: the registry must not have moved during construction.
+        if _attempt_gen is not None and _registry_generation_changed(_attempt_gen):
+            # Stale candidate — close and discard.  Never register/cache/
+            # publish/run it: its constructor-derived tool caches reference
+            # tools that were never authorized.
+            try:
+                _close_fn = candidate.close if hasattr(candidate, 'close') else None
+                if callable(_close_fn):
+                    _close_fn()
+            except Exception:
+                pass
+            if not _retried and rederive_authority is not None:
+                _attempt_toolsets, _attempt_gen, _attempt_applied = rederive_authority()
+                _retried = True
+                continue
+            # Fail closed: empty-tool agent from initialization.
+            _kwargs['enabled_toolsets'] = []
+            return agent_cls(**_kwargs), 'fail-closed', []
+
+        return candidate, ('retried' if _retried else 'stable'), _attempt_toolsets
+
+    # Unreachable (loop is bounded), but fail closed defensively.
+    _kwargs['enabled_toolsets'] = []
+    return agent_cls(**_kwargs), 'fail-closed', []
+
+
 def _registry_alias_target(name):
     """Return the alias target for *name* from the live registry.
 
@@ -10353,82 +10511,15 @@ def _run_agent_streaming(
 
             # Per-profile toolsets — use _resolve_cli_toolsets() so MCP
             # server toolsets are included, matching native CLI behaviour.
-            from api.config import _resolve_cli_toolsets
-            _toolsets = _resolve_cli_toolsets(_cfg)
-            # Round-21 gate fix: generation of the authority snapshot the
-            # per-session override reasoned from.  None when no override was
-            # applied (no re-validation needed) or the registry lacks a
-            # generation counter.
-            _toolsets_gen = None
-            # Round-22 gate fix: track whether an override was actually applied
-            # (vs. preserved defaults).  When an override WAS applied but the
-            # generation is None (no registry / no generation counter), we
-            # cannot prove the authority is stable → fail closed.
-            _override_applied = False
-
-            # Per-session toolset override (#493): if the session has
-            # enabled_toolsets set, apply it on top of the profile defaults.
             #
-            # The per-session toolset picker lets users tick configured MCP
-            # servers for the current chat. Those checkboxes emit the bare MCP
-            # server name (e.g. "my-search"). Previously ANY override value
-            # *replaced* the profile defaults wholesale, so ticking a single MCP
-            # server dropped every built-in toolset (web, file, terminal,
-            # delegation, …). The agent then received a toolset the registry had
-            # no matching tools for (MCP tools register under "mcp-<server>"),
-            # leaving the model with an empty tool list and a broken session.
-            #
-            # Fix: treat an override that is composed *only* of configured MCP
-            # server names as an ADDITION to the profile defaults (the "enable
-            # this server for this chat" intent the checkbox UI implies). An
-            # override that names any non-MCP toolset keeps the original
-            # RESTRICT semantics (the power-user free-text "limit to these
-            # toolsets" use case).
-            try:
-                from api.models import Session, SESSION_DIR
-                _session_path = SESSION_DIR / f"{session_id}.json"
-                if _session_path.exists():
-                    _session_meta = Session.load_metadata_only(session_id)
-                    # load_metadata_only returns a Session INSTANCE, not a dict.
-                    # The previous .get('enabled_toolsets') raised AttributeError
-                    # which was swallowed by the bare except below — the entire
-                    # per-session toolset override silently no-op'd. Use
-                    # getattr() to read the attribute correctly.
-                    # (Opus pre-release advisor finding for v0.50.257.)
-                    _override = getattr(_session_meta, 'enabled_toolsets', None) if _session_meta else None
-                    # Distinguish absence (None = no override, keep defaults)
-                    # from invalid persisted state (scalar, dict, …) which
-                    # _apply_session_toolset_override will handle fail-closed.
-                    if _override is not None:
-                        try:
-                            _mcp_server_names = set(
-                                (_cfg.get('mcp_servers') or {}).keys()
-                            )
-                        except Exception:
-                            _mcp_server_names = set()
-                        # Additive when the override names only configured MCP
-                        # servers (composer picker tick); restrict otherwise.
-                        # Names colliding with a builtin toolset are excluded
-                        # from the MCP-only test so a server named e.g. "web"
-                        # can't silently flip the override into additive mode
-                        # and get shadowed by the builtin.
-                        #
-                        # Round-21 gate fix: capture the authority generation
-                        # the helper reasoned from, so the FINAL tool
-                        # resolution below (AIAgent construction) can
-                        # re-validate it — a registry mutation between the
-                        # helper return and the Agent construction must fail
-                        # closed, not only mutations that happen while the
-                        # helper runs.
-                        _gen_slot = []
-                        _toolsets = _apply_session_toolset_override(
-                            _toolsets, _override, _mcp_server_names,
-                            _gen_slot=_gen_slot
-                        )
-                        _toolsets_gen = _gen_slot[0] if _gen_slot else None
-                        _override_applied = True
-            except Exception as _ts_err:
-                print(f"[webui] WARNING: failed to read per-session toolsets for {session_id}: {_ts_err}", flush=True)
+            # Round-23 gate fix: authority resolution is centralized in
+            # _derive_session_toolset_authority() so the construction
+            # transaction can re-derive a FRESH authority on retry (and the
+            # credential-heal path can rebuild from a fresh authority too)
+            # instead of reusing a stale inline snapshot.
+            _toolsets, _toolsets_gen, _override_applied = _derive_session_toolset_authority(
+                _cfg, session_id
+            )
 
             # Fallback model chain from profile config (e.g. for rate-limit or
             # provider recovery). Match Hermes CLI/gateway semantics:
@@ -10541,34 +10632,17 @@ def _run_agent_streaming(
             except Exception:
                 _reasoning_config = None
 
-            # Round-22 gate fix: the per-session override resolved against an
-            # authority snapshot at generation ``_toolsets_gen``.  Re-validate
-            # that generation IMMEDIATELY before AIAgent construction (both the
-            # ephemeral and cache-miss paths) AND immediately after, so a
-            # registry mutation between the helper return and construction —
-            # or during construction itself — is caught and the toolsets are
-            # blanked (fail closed) rather than resolved from a stale
-            # authority.
-            #
-            # Round-22 gate finding 2: the Round-21 check ran ONCE before
-            # building _agent_kwargs but before _AIAgent(...) construction.
-            # A registry mutation between the check and the constructor was
-            # not caught.  Also, a ``None`` generation (registry unavailable
-            # / no generation counter) was treated as "stable" — but when an
-            # override WAS applied, ``None`` means we cannot PROVE stability,
-            # so the override must fail closed to an empty toolset list.
-            #
-            # ``_toolsets_gen`` is ``None`` when NO override was applied (no
-            # re-validation needed — the profile defaults are config-derived,
-            # not registry-derived) or when the registry lacks a generation
-            # counter.  When an override WAS applied and the generation IS
-            # ``None``, we cannot prove the authority is stable → fail closed.
-            if _toolsets_gen is not None and _registry_generation_changed(_toolsets_gen):
-                _toolsets = []
-            elif _toolsets_gen is None and _override_applied:
-                # Override was applied but we have no generation counter to
-                # prove stability → fail closed (empty toolsets).
-                _toolsets = []
+            # Round-23 gate fix: the Round-22 inline pre-construction check
+            # (blank toolsets when the authority generation moved) is replaced
+            # by the centralized construction transaction in
+            # _construct_override_gated_agent(): it validates the captured
+            # generation immediately before construction, constructs into a
+            # LOCAL candidate, validates immediately after, closes and
+            # discards a stale candidate (never registered/cached/published/
+            # run), retries at most once from a freshly derived authority,
+            # and only then fails closed to an empty-tool agent built with
+            # enabled_toolsets=[] (so tools/valid_tool_names are empty from
+            # initialization — never sanitized post-hoc).
 
             _agent_kwargs = dict(
                 model=resolved_model,
@@ -10633,13 +10707,28 @@ def _run_agent_streaming(
             # Mirrors gateway _agent_cache.  Keeps _user_turn_count alive so
             # injectionFrequency: "first-turn" actually suppresses after turn 1.
             if ephemeral:
-                agent = _AIAgent(**_agent_kwargs)
-                # Round-22 gate fix: re-validate generation IMMEDIATELY after
-                # construction — a registry mutation during the constructor's
-                # tool resolution must fail closed (blank toolsets), not run
-                # or cache tools that were never authorized.
-                if _toolsets_gen is not None and _registry_generation_changed(_toolsets_gen):
-                    agent.enabled_toolsets = []
+                # Round-23 gate fix: centralized construction transaction.
+                # Pre-validates the authority generation, constructs into a
+                # local candidate, post-validates, closes+discards a stale
+                # candidate (never run), retries once from fresh authority,
+                # and fails closed to an empty-tool agent (enabled_toolsets=[])
+                # if the authority cannot be proven stable.
+                agent, _gate_outcome, _final_toolsets = _construct_override_gated_agent(
+                    _AIAgent,
+                    _agent_kwargs,
+                    _toolsets,
+                    _toolsets_gen,
+                    _override_applied,
+                    rederive_authority=lambda: _derive_session_toolset_authority(
+                        _cfg, session_id
+                    ),
+                )
+                if _gate_outcome == 'fail-closed':
+                    logger.warning(
+                        '[webui] Fail-closed empty-tool agent for session %s '
+                        '(per-session toolset authority could not be proven stable)',
+                        session_id,
+                    )
                 logger.debug('[webui] Created ephemeral agent for session %s', session_id)
             else:
                 import hashlib as _hashlib
@@ -10771,13 +10860,56 @@ def _run_agent_streaming(
                     if hasattr(agent, '_interrupt_message'):
                         agent._interrupt_message = None
                 else:
-                    agent = _AIAgent(**_agent_kwargs)
-                    # Round-22 gate fix: re-validate generation IMMEDIATELY after
-                    # construction — a registry mutation during the constructor's
-                    # tool resolution must fail closed (blank toolsets), not be
-                    # run or cached.
-                    if _toolsets_gen is not None and _registry_generation_changed(_toolsets_gen):
-                        agent.enabled_toolsets = []
+                    # Round-23 gate fix: centralized construction transaction.
+                    # A stale candidate is closed and discarded — it is never
+                    # registered, cached, published, or run (the Round-22
+                    # post-hoc `agent.enabled_toolsets = []` sanitize left the
+                    # constructor-derived tools/valid_tool_names callable).
+                    agent, _gate_outcome, _final_toolsets = _construct_override_gated_agent(
+                        _AIAgent,
+                        _agent_kwargs,
+                        _toolsets,
+                        _toolsets_gen,
+                        _override_applied,
+                        rederive_authority=lambda: _derive_session_toolset_authority(
+                            _cfg, session_id
+                        ),
+                    )
+                    if _gate_outcome == 'fail-closed':
+                        logger.warning(
+                            '[webui] Fail-closed empty-tool agent for session %s '
+                            '(per-session toolset authority could not be proven stable)',
+                            session_id,
+                        )
+                    # The cache signature must reflect the toolsets the agent
+                    # was ACTUALLY constructed with (a retry may have re-derived
+                    # a different set; fail-closed yields []).  Recompute when
+                    # the transaction changed the toolsets so a later cache hit
+                    # does not reuse an agent whose toolset identity differs
+                    # from the signature it was stored under.
+                    if _final_toolsets != _toolsets:
+                        _sig_blob = _json.dumps([
+                            resolved_model or '',
+                            _agent_cache_api_key_sig(resolved_api_key, _credential_pool),
+                            resolved_base_url or '',
+                            resolved_provider or '',
+                            _rt.get('api_mode') or '',
+                            _rt.get('command') or '',
+                            _rt.get('args') or [],
+                            bool(_credential_pool),
+                            _max_iterations_cfg or '',
+                            _max_tokens_cfg or '',
+                            _fallback_resolved or {},
+                            sorted(_final_toolsets) if _final_toolsets else [],
+                            _reasoning_config or {},
+                            _main_request_overrides or {},
+                            _public_prefill_context_status(_prefill_context),
+                            _profile_home or '',
+                            _safe_profile_runtime_env.get('TERMINAL_ENV', '') or '',
+                            _safe_profile_runtime_env.get('TERMINAL_SSH_HOST', '') or '',
+                            _safe_profile_runtime_env.get('TERMINAL_SSH_USER', '') or '',
+                        ], sort_keys=True)
+                        _agent_sig = _hashlib.sha256(_sig_blob.encode()).hexdigest()[:16]
                     # Register the new agent with the memory lifecycle so
                     # its commit_memory_session() can be found later.
                     try:
@@ -11486,11 +11618,66 @@ def _run_agent_streaming(
                             _replace_session_db_in_kwargs(_agent_kwargs, _state_db_path)
                             if 'credential_pool' in _agent_params:
                                 _agent_kwargs['credential_pool'] = _heal_rt.get('credential_pool')
-                            agent = _AIAgent(**_agent_kwargs)
-                            # Round-22 gate fix: re-validate generation after
-                            # construction on the session-healing path too.
-                            if _toolsets_gen is not None and _registry_generation_changed(_toolsets_gen):
-                                agent.enabled_toolsets = []
+                            # Round-23 gate fix: credential healing gets its
+                            # OWN fresh pre-check/re-derivation immediately
+                            # before construction — the request-start authority
+                            # snapshot may be minutes old by the time a 401
+                            # heal runs.  Re-derive the per-session toolset
+                            # authority now and build through the same
+                            # centralized construction transaction (stale
+                            # candidate closed+discarded, single retry, then
+                            # fail-closed empty-tool agent).
+                            _heal_toolsets, _heal_gen, _heal_applied = _derive_session_toolset_authority(
+                                _cfg, session_id
+                            )
+                            # The sig recompute below needs hashlib/json; the
+                            # cache-miss branch imported them but the
+                            # ephemeral path skips that branch entirely — yet
+                            # a 401 heal can fire on an ephemeral run too.
+                            import hashlib as _hashlib
+                            import json as _json
+                            agent, _gate_outcome, _final_toolsets = _construct_override_gated_agent(
+                                _AIAgent,
+                                _agent_kwargs,
+                                _heal_toolsets,
+                                _heal_gen,
+                                _heal_applied,
+                                rederive_authority=lambda: _derive_session_toolset_authority(
+                                    _cfg, session_id
+                                ),
+                            )
+                            if _gate_outcome == 'fail-closed':
+                                logger.warning(
+                                    '[webui] Fail-closed empty-tool agent during '
+                                    'credential heal for session %s (toolset '
+                                    'authority could not be proven stable)',
+                                    session_id,
+                                )
+                            # The cache signature must match the toolsets the
+                            # healed agent was ACTUALLY constructed with.
+                            if _final_toolsets != _toolsets:
+                                _sig_blob = _json.dumps([
+                                    resolved_model or '',
+                                    _agent_cache_api_key_sig(resolved_api_key, _credential_pool),
+                                    resolved_base_url or '',
+                                    resolved_provider or '',
+                                    _rt.get('api_mode') or '',
+                                    _rt.get('command') or '',
+                                    _rt.get('args') or [],
+                                    bool(_credential_pool),
+                                    _max_iterations_cfg or '',
+                                    _max_tokens_cfg or '',
+                                    _fallback_resolved or {},
+                                    sorted(_final_toolsets) if _final_toolsets else [],
+                                    _reasoning_config or {},
+                                    _main_request_overrides or {},
+                                    _public_prefill_context_status(_prefill_context),
+                                    _profile_home or '',
+                                    _safe_profile_runtime_env.get('TERMINAL_ENV', '') or '',
+                                    _safe_profile_runtime_env.get('TERMINAL_SSH_HOST', '') or '',
+                                    _safe_profile_runtime_env.get('TERMINAL_SSH_USER', '') or '',
+                                ], sort_keys=True)
+                                _agent_sig = _hashlib.sha256(_sig_blob.encode()).hexdigest()[:16]
                             with STREAMS_LOCK:
                                 AGENT_INSTANCES[stream_id] = agent
                             from api.config import SESSION_AGENT_CACHE as _SAC, SESSION_AGENT_CACHE_LOCK as _SAC_L
@@ -12723,7 +12910,14 @@ def _run_agent_streaming(
                     resolved_provider, resolved_api_key, resolved_base_url = _resolve_custom_provider_runtime_overrides(
                         resolved_provider, resolved_api_key, resolved_base_url
                     )
-                    # Build a fresh agent with the new credentials
+                    # Build a fresh agent with the new credentials.
+                    # Round-23 gate fix: the credential-heal path must get
+                    # its own fresh pre-check/re-derivation immediately before
+                    # construction (the request-start authority snapshot may
+                    # be minutes old), and must build through the same
+                    # centralized construction transaction so a stale
+                    # candidate is closed+discarded rather than cached,
+                    # published, and run with constructor-derived tools.
                     _heal_kwargs = dict(_agent_kwargs) if '_agent_kwargs' in dir() else {}
                     _heal_kwargs['api_key'] = resolved_api_key
                     _heal_kwargs['base_url'] = resolved_base_url
@@ -12732,7 +12926,51 @@ def _run_agent_streaming(
                     _replace_session_db_in_kwargs(_heal_kwargs, _state_db_path)
                     if 'credential_pool' in _agent_params:
                         _heal_kwargs['credential_pool'] = _heal_rt.get('credential_pool')
-                    _heal_agent = _AIAgent(**_heal_kwargs)
+                    _heal_toolsets2, _heal_gen2, _heal_applied2 = _derive_session_toolset_authority(
+                        _cfg, session_id
+                    )
+                    import hashlib as _hashlib
+                    import json as _json
+                    _heal_agent, _heal_gate2, _heal_final_ts2 = _construct_override_gated_agent(
+                        _AIAgent,
+                        _heal_kwargs,
+                        _heal_toolsets2,
+                        _heal_gen2,
+                        _heal_applied2,
+                        rederive_authority=lambda: _derive_session_toolset_authority(
+                            _cfg, session_id
+                        ),
+                    )
+                    if _heal_gate2 == 'fail-closed':
+                        logger.warning(
+                            '[webui] Fail-closed empty-tool agent during '
+                            'credential heal (except path) for session %s '
+                            '(toolset authority could not be proven stable)',
+                            session_id,
+                        )
+                    if _heal_final_ts2 != _toolsets:
+                        _sig_blob = _json.dumps([
+                            resolved_model or '',
+                            _agent_cache_api_key_sig(resolved_api_key, _credential_pool),
+                            resolved_base_url or '',
+                            resolved_provider or '',
+                            _rt.get('api_mode') or '',
+                            _rt.get('command') or '',
+                            _rt.get('args') or [],
+                            bool(_credential_pool),
+                            _max_iterations_cfg or '',
+                            _max_tokens_cfg or '',
+                            _fallback_resolved or {},
+                            sorted(_heal_final_ts2) if _heal_final_ts2 else [],
+                            _reasoning_config or {},
+                            _main_request_overrides or {},
+                            _public_prefill_context_status(_prefill_context),
+                            _profile_home or '',
+                            _safe_profile_runtime_env.get('TERMINAL_ENV', '') or '',
+                            _safe_profile_runtime_env.get('TERMINAL_SSH_HOST', '') or '',
+                            _safe_profile_runtime_env.get('TERMINAL_SSH_USER', '') or '',
+                        ], sort_keys=True)
+                        _agent_sig = _hashlib.sha256(_sig_blob.encode()).hexdigest()[:16]
                     with STREAMS_LOCK:
                         AGENT_INSTANCES[stream_id] = _heal_agent
                     from api.config import SESSION_AGENT_CACHE as _SAC2, SESSION_AGENT_CACHE_LOCK as _SAC2_L
