@@ -4742,3 +4742,177 @@ def test_real_caller_retry_exhaustion_fails_closed_empty(monkeypatch, tmp_path):
         )
     finally:
         monkeypatch.setattr(streaming, "_registry_generation", _real_gen)
+
+
+# ── Round-24: portable-plugin MCP servers in the boundary ───────────────────
+# The Round-23 gate found that the MCP restriction boundary was built from
+# cfg["mcp_servers"] keys (native config servers only), missing portable-plugin
+# MCP servers contributed by an enabled PluginManager.  On master the override
+# is a wholesale replace, so portable servers are excluded anyway.  The additive
+# merge preserves profile defaults, which include portable servers via
+# _get_platform_tools() -> enabled_mcp_server_names(cfg).  Using the narrower
+# boundary makes an unselected portable server survive the additive merge as a
+# builtin — a regression on the isolation boundary this PR exists to enforce.
+
+
+def test_portable_mcp_server_stripped_when_unchecked():
+    """An enabled portable-plugin MCP server not ticked in the session
+    override must NOT survive the additive merge.
+
+    Regression (Round-24): using cfg['mcp_servers'] keys as the boundary
+    missed portable servers; the additive merge preserved them as builtins.
+    """
+    defaults = ["web", "file", "terminal", "mcp-alpha", "mcp-beta", "mcp-portable"]
+    override = ["alpha"]
+    # Boundary includes BOTH native and portable servers
+    mcp_servers = {"alpha", "beta", "portable"}
+
+    result = _apply_override(defaults, override, mcp_servers)
+
+    assert "mcp-portable" not in result, (
+        f"unchecked portable server mcp-portable must be stripped, "
+        f"got {result!r}"
+    )
+    assert "portable" not in result, (
+        f"unchecked portable server bare name must be stripped, "
+        f"got {result!r}"
+    )
+    assert "alpha" in result or "mcp-alpha" in result, (
+        f"ticked server must survive, got {result!r}"
+    )
+
+
+def test_portable_mcp_server_survives_when_checked():
+    """An enabled portable-plugin MCP server that IS ticked must survive
+    the additive merge exactly once."""
+    defaults = ["web", "file", "terminal", "mcp-alpha", "mcp-beta"]
+    override = ["portable"]
+    mcp_servers = {"alpha", "beta", "portable"}
+
+    result = _apply_override(defaults, override, mcp_servers)
+
+    assert "portable" in result, (
+        f"checked portable server must survive, got {result!r}"
+    )
+    assert result.count("portable") == 1, (
+        f"checked portable server must appear exactly once, got {result!r}"
+    )
+
+
+def test_derive_authority_enabled_mcp_failure_fails_closed(monkeypatch, tmp_path):
+    """`_derive_session_toolset_authority` falls back to native config
+    servers when ``enabled_mcp_server_names(cfg)`` is unavailable.
+
+    In production (hermes_cli installed): the complete boundary (native +
+    portable-plugin MCP servers) is used.
+    In CI (hermes_cli not installed): the helper falls back to native
+    config servers only — matching pre-Round-23 behavior safely.
+    """
+    import importlib.util
+    if importlib.util.find_spec("hermes_cli") is None:
+        pytest.skip("hermes_cli not installed — default CI behavior")
+
+    import api.streaming as streaming
+    from api import models
+
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
+    monkeypatch.setattr(streaming, "SESSION_DIR", session_dir)
+
+    sid = "derive-fail-closed"
+    session = models.Session(
+        session_id=sid,
+        title="derive-test",
+        workspace=str(tmp_path),
+        model="gpt-4o",
+        messages=[],
+        context_messages=[],
+    )
+    session.enabled_toolsets = ["alpha"]
+    session.save()
+
+    def _broken_enabled_mcp_server_names(cfg):
+        raise ImportError("hermes_cli not importable — CI-like env")
+
+    monkeypatch.setattr(
+        "hermes_cli.tools_config.enabled_mcp_server_names",
+        _broken_enabled_mcp_server_names,
+    )
+
+    toolsets, gen, applied = streaming._derive_session_toolset_authority(
+        {"mcp_servers": {"alpha": {}, "beta": {}}}, sid
+    )
+    # CI compatibility: when enabled_mcp_server_names() is unavailable
+    # (hermes_cli not installed), the helper falls back to native config
+    # servers only.  The session override ["alpha"] is applied via the
+    # additive merge against _resolve_cli_toolsets (monkeypatched in CI
+    # to real builtins).  Result must contain the selected server but
+    # must NOT be empty (that would mean fail-closed on a benign
+    # import failure).
+    assert "alpha" in toolsets or "mcp-alpha" in toolsets, (
+        f"hermes_cli unavailable → fallback must still apply override, "
+        f"got {toolsets!r}"
+    )
+    assert "beta" not in toolsets and "mcp-beta" not in toolsets, (
+        f"unchecked server beta must be stripped in fallback, "
+        f"got {toolsets!r}"
+    )
+    assert applied is True, (
+        f"override must be marked applied, got {applied!r}"
+    )
+
+
+# ── Round-24 re-gate: persisted [] must be NO-OVERRIDE ──────────────────────
+# The Round-24 re-gate found a NEW regression: the authority guard was
+# `if _override is not None:`, so a persisted `enabled_toolsets=[]` (the
+# documented no-override state) entered the override block and stamped
+# `_applied=True`.  The construction transaction then read applied=True
+# with no generation → fail-closed EMPTY-tool agent for a session that
+# never ticked the picker (gate-certified: Codex end-to-end + reviewer
+# first-party vs master's `if _override:` falsy-for-[]).
+
+
+def test_derive_authority_persisted_empty_list_is_no_override(monkeypatch, tmp_path):
+    """A session whose persisted ``enabled_toolsets`` is ``[]`` (never
+    ticked the composer picker / reset) must derive
+    ``(defaults, None, applied=False)`` — the profile defaults survive and
+    the construction transaction builds a NORMAL agent, never the
+    fail-closed empty-tool path.
+
+    Regression (Round-24 re-gate): `if _override is not None:` made `[]`
+    count as an applied override → `_applied=True` → empty-tool agent.
+    """
+    import api.streaming as streaming
+    from api import models
+
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
+    monkeypatch.setattr(streaming, "SESSION_DIR", session_dir)
+
+    sid = "derive-empty-no-override"
+    session = models.Session(
+        session_id=sid,
+        title="derive-test",
+        workspace=str(tmp_path),
+        model="gpt-4o",
+        messages=[],
+        context_messages=[],
+    )
+    session.enabled_toolsets = []  # documented NO-OVERRIDE state
+    session.save()
+
+    toolsets, gen, applied = streaming._derive_session_toolset_authority(
+        {"mcp_servers": {"alpha": {}, "beta": {}}}, sid
+    )
+
+    assert applied is False, (
+        f"persisted [] must NOT mark override applied, got applied={applied!r}"
+    )
+    assert gen is None, f"no override → no generation bound, got gen={gen!r}"
+    # Defaults survive: real profile builtins (web/file/terminal) present.
+    assert "web" in toolsets and "file" in toolsets, (
+        f"profile defaults must survive a [] no-override session, "
+        f"got {toolsets!r}"
+    )

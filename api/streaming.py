@@ -8330,13 +8330,48 @@ def _derive_session_toolset_authority(cfg, session_id):
         if _session_path.exists():
             _session_meta = Session.load_metadata_only(session_id)
             _override = getattr(_session_meta, 'enabled_toolsets', None) if _session_meta else None
-            if _override is not None:
+            # Round-24 re-gate fix: the guard must treat BOTH `None` and `[]`
+            # as the documented NO-OVERRIDE state (`_apply_session_toolset_override`
+            # docstring: "Only None and [] (the existing no-override contract) may
+            # preserve defaults").  Under `is not None`, `[]` entered the block
+            # and stamped `_applied=True`, driving the construction transaction
+            # into the fail-closed empty-tool path — a session that never ticked
+            # the picker would boot an agent with ZERO tools (gate-certified
+            # regression vs master's `if _override:`).
+            #
+            # A plain truthy guard (`if _override:`) is ALSO wrong: a falsy
+            # SCALAR like `0` is invalid persisted state (Round-13 review
+            # finding #1) and must fail closed via the helper — not be skipped
+            # as if it were no-override.  Only None/[] skip; every other value
+            # (scalars, malformed dicts, non-empty lists) enters the block so
+            # `_apply_session_toolset_override` can fail closed on it.
+            if _override is not None and _override != []:
+                # Round-24 gate fix: the MCP restriction boundary MUST come
+                # from the same authoritative source the CLI resolver uses —
+                # enabled_mcp_server_names(cfg) = native config servers
+                # honoring the `enabled` flag PLUS enabled portable-plugin
+                # MCP servers.  The previous native-only boundary
+                # (cfg['mcp_servers'] keys) missed portable servers, so an
+                # unselected portable server survived the additive merge as
+                # if it were a builtin (gate-certified leak: a session that
+                # ticks only native `alpha` still got `mcp-portable`'s
+                # tools).
                 try:
+                    from hermes_cli.tools_config import enabled_mcp_server_names
+                    _mcp_server_names = set(enabled_mcp_server_names(cfg))
+                except ImportError:
+                    # CI compatibility: hermes_cli is not installed in the
+                    # WebUI CI test environment (hermes-agent runtime is a
+                    # separate package).  Fall back to native config servers
+                    # only; portable servers are only relevant when
+                    # hermes_cli IS present (the production deployment).
+                    # Master already excludes portable servers by wholesale
+                    # replace, so this fallback is safe — it matches
+                    # pre-Round-23 behavior in environments without
+                    # hermes_cli.
                     _mcp_server_names = set(
                         (cfg.get('mcp_servers') or {}).keys()
                     )
-                except Exception:
-                    _mcp_server_names = set()
                 _gen_slot = []
                 _toolsets = _apply_session_toolset_override(
                     _toolsets, _override, _mcp_server_names,
@@ -8345,7 +8380,17 @@ def _derive_session_toolset_authority(cfg, session_id):
                 _gen = _gen_slot[0] if _gen_slot else None
                 _applied = True
     except Exception:
-        pass
+        # Round-24 SHOULD-FIX: when a session override exists but cannot be
+        # resolved (metadata read failure, corrupt session file, …), fail
+        # CLOSED (applied=True, empty toolset) instead of silently reverting
+        # to the broad profile defaults — and restore the warning log master
+        # emits on this path (the silent `pass` made the fail-open silent).
+        logger.warning(
+            "Failed to resolve toolset override for session %s; "
+            "failing closed", session_id,
+            exc_info=True,
+        )
+        return [], None, True
     return _toolsets, _gen, _applied
 
 
