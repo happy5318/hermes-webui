@@ -4327,6 +4327,74 @@ def coerce_reasoning_effort_for_model(
     return raw
 
 
+def configured_reasoning_effort_for_model(
+    config_data: dict | None,
+    *,
+    model_id: str | None = None,
+    provider_id: str | None = None,
+    base_url: str | None = None,
+) -> str:
+    """Resolve the configured reasoning effort for one concrete model.
+
+    ``agent.reasoning_overrides`` is a model-scoped override and must win over
+    the global ``agent.reasoning_effort`` value.  The WebUI used to read only
+    the global field in its streaming worker and Gateway bridge, so a global
+    ``max`` leaked into every model even when the core agent would have picked
+    a safer per-model value.  Keep the resolution here so status, native
+    streaming, and Gateway-backed streaming share one decision point.
+    """
+    data = config_data if isinstance(config_data, dict) else {}
+    agent_cfg = data.get("agent")
+    if not isinstance(agent_cfg, dict):
+        agent_cfg = {}
+
+    effort = agent_cfg.get("reasoning_effort")
+    overrides = agent_cfg.get("reasoning_overrides")
+    model = str(model_id or "").strip()
+
+    # Prefer the Hermes core resolver when available; it owns the tolerant
+    # spelling/qualified-model matching rules.  The fallback keeps WebUI
+    # usable in installations where the companion agent tree is unavailable.
+    per_model = None
+    if isinstance(overrides, dict) and model:
+        try:
+            from hermes_constants import resolve_per_model_reasoning_effort
+
+            per_model = resolve_per_model_reasoning_effort(model, overrides)
+        except Exception:
+            per_model = None
+        if per_model is None:
+            candidates = [model, model.lower()]
+            if model.startswith("@") and ":" in model:
+                candidates.append(model.rsplit(":", 1)[-1])
+            candidates.extend(
+                value.replace(".", "-")
+                for value in list(candidates)
+                if "." in value
+            )
+            normalized_overrides = {
+                str(key).strip().lower(): value
+                for key, value in overrides.items()
+            }
+            for candidate in candidates:
+                if candidate.lower() in normalized_overrides:
+                    per_model = parse_reasoning_effort(
+                        normalized_overrides[candidate.lower()]
+                    )
+                    if per_model is not None:
+                        break
+
+    if per_model is not None:
+        effort = "none" if per_model.get("enabled") is False else per_model.get("effort", "")
+
+    return coerce_reasoning_effort_for_model(
+        effort,
+        model,
+        provider_id=provider_id,
+        base_url=base_url,
+    )
+
+
 def get_reasoning_status(
     *,
     model_id: str | None = None,
@@ -4344,8 +4412,6 @@ def get_reasoning_status(
     display_cfg = config_data.get("display") or {}
     agent_cfg = config_data.get("agent") or {}
     show_raw = display_cfg.get("show_reasoning") if isinstance(display_cfg, dict) else None
-    effort_raw = agent_cfg.get("reasoning_effort") if isinstance(agent_cfg, dict) else None
-
     resolve_model = model_id
     resolve_provider = provider_id
     resolve_base_url = base_url
@@ -4379,9 +4445,9 @@ def get_reasoning_status(
         "show_reasoning": bool(show_raw) if isinstance(show_raw, bool) else True,
         # Report the COERCED effort so boot/status/chip read paths agree with
         # what streaming actually sends. (Codex review of the drop-max alignment.)
-        "reasoning_effort": coerce_reasoning_effort_for_model(
-            str(effort_raw or "").strip().lower(),
-            resolve_model,
+        "reasoning_effort": configured_reasoning_effort_for_model(
+            config_data,
+            model_id=resolve_model,
             provider_id=resolve_provider,
             base_url=resolve_base_url,
         ),
