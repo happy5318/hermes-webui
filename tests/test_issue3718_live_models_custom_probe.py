@@ -192,3 +192,40 @@ def test_probe_failure_falls_back_to_config_ids(monkeypatch):
     )
 
     assert _ids(payload) == ["chat-default", "chat-a"]
+
+
+@pytest.mark.parametrize(
+    "models_value",
+    [
+        pytest.param([], id="native-empty-list"),
+        pytest.param("[]", id="serialized-empty-list"),
+        pytest.param({}, id="empty-mapping"),
+        pytest.param("   ", id="blank-scalar"),
+    ],
+)
+def test_empty_allowlist_is_treated_as_not_configured(monkeypatch, models_value):
+    """An empty ``models`` value must NOT be read as "allow nothing".
+
+    Pins a deliberate semantic decision. Gating the filter on *declared-ness*
+    rather than on a non-empty allowlist would make ``models: []`` emit an
+    EMPTY picker, leaving the provider unselectable — a harder failure than
+    surfacing a few extra models, and unrecoverable from the UI because
+    ``custom_providers`` has no WebUI write path (hand-edited config.yaml only).
+    There is also no deny-all use case: a provider the user wants hidden is
+    removed from ``custom_providers`` outright.
+
+    If someone later "fixes" the empty case into a deny-all gate, this test
+    fails and forces the trade-off to be re-argued rather than silently shipped.
+    """
+    import api.routes as routes
+
+    provider = dict(_BASE_PROVIDER, models=models_value)
+    payload, _ = _run_live_models(
+        monkeypatch, routes, provider, catalog=_LIVE_CATALOG
+    )
+
+    assert _ids(payload) == _LIVE_CATALOG, (
+        "empty allowlist must fall through to full live discovery, "
+        "never collapse the picker to zero models"
+    )
+    assert _ids(payload), "picker must never be emptied by an empty allowlist"

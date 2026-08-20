@@ -20910,12 +20910,24 @@ def _handle_live_models(handler, parsed):
                 # providers (esp. New-API-style gateways) expose their ENTIRE
                 # catalog via /v1/models — including image/audio models that
                 # are not chat models.  The picker must not surface models the
-                # user never declared in config.yaml.  Only an explicit
+                # user never declared in config.yaml.  Only a NON-EMPTY explicit
                 # ``models`` allowlist gates the filter — a provider configured
                 # with just a singular ``model`` (no ``models`` list) keeps the
                 # unfiltered live catalog.  When no allowlist is configured,
                 # return the live list as-is (preserves the pre-filter
                 # discovery behaviour).
+                #
+                # An empty allowlist (``models: []``, ``models: "[]"``, or a
+                # value that decodes to no usable ids) is deliberately treated
+                # as "not configured", NOT as "allow nothing".  Gating on
+                # declared-ness instead would emit an EMPTY picker and make the
+                # provider unselectable — a harder failure than surfacing a few
+                # extra models, and unrecoverable from the UI because
+                # ``custom_providers`` is hand-edited in config.yaml (the WebUI
+                # has no write path for it).  ``[]`` in practice means a
+                # leftover/placeholder key, not an intentional deny-all, and no
+                # deny-all use case exists: a provider the user wants hidden is
+                # removed from ``custom_providers`` outright.
                 if ids:
                     if _allowlist_ids:
                         _allowlist_set = set(_allowlist_ids)
