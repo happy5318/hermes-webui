@@ -3439,6 +3439,7 @@ def _apply_core_sync_or_error_marker(
             _recover_journaled_output_and_terminal_error(
                 session,
                 _stream_id,
+                dedupe_existing=True,
                 terminal_recovery=_terminal_recovery,
             )
         )
@@ -3553,6 +3554,7 @@ def _apply_core_sync_or_error_marker(
         _recover_journaled_output_and_terminal_error(
             session,
             _stream_id,
+            dedupe_existing=True,
             terminal_recovery=_terminal_recovery,
         )
     )
