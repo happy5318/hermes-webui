@@ -20936,7 +20936,7 @@ def _handle_live_models(handler, parsed):
                             if _aid not in ids:
                                 ids.append(_aid)
                 else:
-                    ids = list(_config_ids)
+                    ids = list(_allowlist_ids or _config_ids)
 
         # ── OpenAI-compat live fetch fallback ──────────────────────────────────
         # When provider_model_ids() is unavailable or returns [] for a provider

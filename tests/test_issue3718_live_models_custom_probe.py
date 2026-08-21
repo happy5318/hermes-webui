@@ -182,16 +182,38 @@ def test_allowlisted_model_missing_from_live_is_appended(monkeypatch):
     assert _ids(payload) == ["chat-a", "chat-offline"]
 
 
-def test_probe_failure_falls_back_to_config_ids(monkeypatch):
-    """When the live probe fails, config ids (incl. singular model) are used."""
+def test_contradictory_singular_model_outside_plural_allowlist_is_ignored(monkeypatch):
+    """A singular default outside the plural allowlist must not leak into the picker.
+
+    Paired test: whether the live probe succeeds or fails, only the explicit
+    plural allowlist is exposed.
+    """
     import api.routes as routes
 
     provider = dict(_BASE_PROVIDER, model="chat-default", models=["chat-a"])
+
+    # 1. Successful live fetch -> only plural allowlist
+    payload_success, _ = _run_live_models(
+        monkeypatch, routes, provider, catalog=_LIVE_CATALOG, fail=False
+    )
+    assert _ids(payload_success) == ["chat-a"]
+
+    # 2. Failed live fetch -> still only plural allowlist (not chat-default)
+    payload_fail, _ = _run_live_models(
+        monkeypatch, routes, provider, catalog=_LIVE_CATALOG, fail=True
+    )
+    assert _ids(payload_fail) == ["chat-a"]
+
+
+def test_probe_failure_without_allowlist_falls_back_to_singular_model(monkeypatch):
+    """When no plural allowlist is configured and probe fails, singular model is used."""
+    import api.routes as routes
+
+    provider = dict(_BASE_PROVIDER, model="chat-default")
     payload, _ = _run_live_models(
         monkeypatch, routes, provider, catalog=_LIVE_CATALOG, fail=True
     )
-
-    assert _ids(payload) == ["chat-default", "chat-a"]
+    assert _ids(payload) == ["chat-default"]
 
 
 @pytest.mark.parametrize(
