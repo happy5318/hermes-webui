@@ -4476,22 +4476,33 @@ def configured_reasoning_effort_for_model(
             candidates = [model, model.lower()]
             if model.startswith("@") and ":" in model:
                 candidates.append(model.rsplit(":", 1)[-1])
-            candidates.extend(
-                value.replace(".", "-")
-                for value in list(candidates)
-                if "." in value
-            )
+
             normalized_overrides = {
                 str(key).strip().lower(): value
                 for key, value in overrides.items()
             }
             for candidate in candidates:
-                if candidate.lower() in normalized_overrides:
+                cand_lower = candidate.lower()
+                if cand_lower in normalized_overrides:
                     per_model = parse_reasoning_effort(
-                        normalized_overrides[candidate.lower()]
+                        normalized_overrides[cand_lower]
                     )
                     if per_model is not None:
                         break
+
+            if per_model is None:
+                canonical_overrides = {
+                    str(key).strip().lower().replace(".", "-"): value
+                    for key, value in overrides.items()
+                }
+                for candidate in candidates:
+                    cand_canon = candidate.lower().replace(".", "-")
+                    if cand_canon in canonical_overrides:
+                        per_model = parse_reasoning_effort(
+                            canonical_overrides[cand_canon]
+                        )
+                        if per_model is not None:
+                            break
 
     if per_model is not None:
         if per_model.get("enabled") is False:
