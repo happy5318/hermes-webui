@@ -1353,6 +1353,21 @@ def _is_known_model_provider(provider_id: str) -> bool:
     return False
 
 
+def _slug_from_name(name: object) -> str:
+    """Return a slug derived from a provider display name.
+
+    Only literal ASCII spaces are replaced with ``-``; all other characters
+    (including non-ASCII such as CJK, colons, and hyphens) are preserved
+    so the slug matches the Hermes agent's ``_normalize_custom_pool_name``
+    convention exactly (``name.strip().lower().replace(" ", "-")``).
+    """
+    raw = str(name or "").strip().lower()
+    if not raw:
+        return ""
+    slug = raw.replace(" ", "-")
+    return slug
+
+
 def _custom_provider_slug_from_name(name: object) -> str:
     raw = str(name or "").strip().lower()
     if not raw:
@@ -1362,11 +1377,32 @@ def _custom_provider_slug_from_name(name: object) -> str:
     # Keep name-derived custom provider slugs out of the @provider:model colon
     # grammar. Endpoint-derived slugs may still be custom:<host>:<port>, but a
     # friendly name like "Local (127.0.0.1:15721)" should not preserve ':'.
-    slug = re.sub(r"[^a-z0-9._-]+", "-", raw).strip("-")
-    slug = re.sub(r"-{2,}", "-", slug)
+    slug = _slug_from_name(raw)
     if not slug:
         return ""
     return "custom:" + slug
+
+
+def _legacy_slug_from_name(name: object) -> str | None:
+    """Return the pre-unicode slug normalization for ``name``, or None.
+
+    Before #6646, ``_custom_provider_slug_from_name`` applied
+    ``re.sub(r"[^a-z0-9._-]+", "-", raw).strip("-")`` then collapsed repeated
+    ``-``.  That produced ``my-proxy`` from ``My  Proxy`` (double space), while
+    today's ``_slug_from_name`` (which mirrors the agent's
+    ``_normalize_custom_pool_name``) yields ``my--proxy``.  Sessions persisted
+    before the upgrade carry the legacy slug, so credential lookup must accept
+    it — but only when it uniquely identifies one configured provider, and
+    never pick credentials from an arbitrary entry on ambiguity.
+    """
+    raw = str(name or "").strip().lower()
+    if not raw:
+        return None
+    import re as _re
+
+    slug = _re.sub(r"[^a-z0-9._-]+", "-", raw).strip("-")
+    slug = _re.sub(r"-{2,}", "-", slug)
+    return slug or None
 
 
 def _custom_provider_entries(config_obj: dict | None = None) -> list[dict]:
@@ -1594,15 +1630,64 @@ def _legacy_custom_api_key_env_name(provider_id: object) -> str:
     return f"{raw}_API_KEY"
 
 
+def _api_key_env_name_is_ambiguous(provider_id: object, target_env_name: str) -> bool:
+    """True when another configured custom provider infers the same env name.
+
+    Distinct providers collapsing onto one env var makes the env value
+    unattributable — looking it up would guess. Fail closed: the caller
+    must skip the inferred-var lookup and return None instead.
+    """
+    target = str(target_env_name or "").strip()
+    if not target:
+        return False
+    current = str(provider_id or "").strip().lower()
+    if current.startswith("custom:"):
+        current = current[len("custom:"):].strip()
+    for entry in _custom_provider_entries(get_config()):
+        name = str(entry.get("name") or "").strip()
+        if not name:
+            continue
+        slug = _custom_provider_slug_from_name(name)
+        if not slug:
+            continue
+        # slug is "custom:<slug>"; compare its bare part against current
+        bare_slug = slug[len("custom:"):].strip() if slug.startswith("custom:") else slug
+        if bare_slug == current or _slug_from_name(current) == bare_slug:
+            continue  # same provider
+        if _api_key_env_name(bare_slug) == target:
+            return True
+        legacy = _legacy_custom_api_key_env_name(bare_slug)
+        if legacy and legacy == target:
+            return True
+    return False
+
+
 def _lookup_custom_api_key_env(provider_id: object) -> str | None:
-    """Look up sanitized custom-provider env first, then legacy broken shape."""
+    """Look up sanitized custom-provider env first, then legacy broken shape.
+
+    Fail closed when the inferred env name is shared by another configured
+    custom provider: the env value cannot be attributed to this provider,
+    so skip rather than guess (review finding #2).
+    """
     env_name = _api_key_env_name(provider_id)
+    if _api_key_env_name_is_ambiguous(provider_id, env_name):
+        logger.warning(
+            "Custom provider env var %s is ambiguous across configured providers; skipping inferred env lookup",
+            env_name,
+        )
+        return None
     api_key = _thread_local_env_value(env_name).strip()
     if api_key:
         return api_key
 
     legacy_env_name = _legacy_custom_api_key_env_name(provider_id)
     if legacy_env_name and legacy_env_name != env_name:
+        if _api_key_env_name_is_ambiguous(provider_id, legacy_env_name):
+            logger.warning(
+                "Custom provider legacy env var %s is ambiguous across configured providers; skipping",
+                legacy_env_name,
+            )
+            return None
         legacy_key = _thread_local_env_value(legacy_env_name).strip()
         if legacy_key:
             if legacy_env_name not in _LEGACY_CUSTOM_API_KEY_ENV_WARNED:
@@ -2098,11 +2183,15 @@ def _format_nous_label(mid: str) -> str:
 # Above this count, _build_nous_featured_set() trims the visible list to
 # ~_NOUS_FEATURED_TARGET entries; the full catalog is still returned to the
 # client under ``extra_models`` so /model autocomplete covers everything.
-# Caps reflect human scannability — a 25-row dropdown is the practical UX
-# ceiling, and per-vendor sampling at 15 keeps the flagship shape visible
-# without one vendor dominating.
-_NOUS_FEATURED_THRESHOLD = 25
-_NOUS_FEATURED_TARGET = 15
+# Caps reflect human scannability — originally a 25-row dropdown was the
+# practical UX ceiling with per-vendor sampling at 15. Raised to 100/100
+# (2026-08-07) because this same threshold also gates non-Nous providers
+# (e.g. a New-API custom provider with 26+ configured models was getting
+# silently split into 15 visible + N hidden extras) — 100 comfortably
+# covers any single provider's realistic catalog size without hiding
+# newly-added models behind "Show more" / search.
+_NOUS_FEATURED_THRESHOLD = 100
+_NOUS_FEATURED_TARGET = 100
 _MODEL_PICKER_OVERFLOW_THRESHOLD = _NOUS_FEATURED_THRESHOLD
 _MODEL_PICKER_VISIBLE_TARGET = _NOUS_FEATURED_TARGET
 _OPENROUTER_FREE_TIER_AUGMENT_CAP = 30
@@ -2568,6 +2657,18 @@ def _parse_provider_qualified_model_id(model_id: str) -> tuple[str, str] | None:
     inner = candidate[1:]
     provider_hint, bare_model = inner.rsplit(":", 1)
     if provider_hint.startswith("custom:") and provider_hint.count(":") >= 2:
+        # Canonical round-trip guard (#6646 finding 1): a name-derived slug
+        # may legitimately contain colons (e.g. "Local (127.0.0.1:15721)"
+        # → custom:local-(127.0.0.1:15721), matching the agent's
+        # _normalize_custom_pool_name which only replaces spaces). Parsing
+        # that slug with the colon-suffix heuristics below would eat the
+        # slug's own colons as model segments (provider becomes
+        # custom:local-(127.0.0.1, model 15721):deepseek-v4-flash).
+        # Resolve the full provider_hint against the configured canonical
+        # providers FIRST — if it is an exact known slug, round-trip
+        # succeeds without any heuristic splitting.
+        if _named_custom_provider_slug_for_provider(provider_hint) == provider_hint:
+            return bare_model, provider_hint
         _slug_rest = provider_hint[len("custom:"):]
         if not _custom_slug_rest_looks_like_host_port(_slug_rest):
             provider_hint, extra = provider_hint.rsplit(":", 1)
@@ -4352,6 +4453,14 @@ def configured_reasoning_effort_for_model(
     overrides = agent_cfg.get("reasoning_overrides")
     model = str(model_id or "").strip()
 
+    if model:
+        parsed_qualified = _parse_provider_qualified_model_id(model)
+        if parsed_qualified:
+            bare_model, parsed_provider = parsed_qualified
+            model = bare_model
+            if not provider_id:
+                provider_id = parsed_provider
+
     # Prefer the Hermes core resolver when available; it owns the tolerant
     # spelling/qualified-model matching rules.  The fallback keeps WebUI
     # usable in installations where the companion agent tree is unavailable.
@@ -4385,7 +4494,12 @@ def configured_reasoning_effort_for_model(
                         break
 
     if per_model is not None:
-        effort = "none" if per_model.get("enabled") is False else per_model.get("effort", "")
+        if per_model.get("enabled") is False:
+            effort = "none"
+        else:
+            override_eff = str(per_model.get("effort") or "").strip().lower()
+            if override_eff in VALID_REASONING_EFFORTS:
+                effort = override_eff
 
     return coerce_reasoning_effort_for_model(
         effort,
