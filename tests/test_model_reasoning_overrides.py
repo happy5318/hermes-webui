@@ -147,3 +147,49 @@ def test_gateway_reasoning_effort_ignores_gateway_url_for_non_probed_provider(
         model="gemini-3.6-flash-tiered",
         model_provider="custom:example-gateway",
     ) == "low"
+
+
+def test_configured_reasoning_effort_qualified_custom_provider_models_resolve_consistently():
+    """Qualified custom-provider models must resolve overrides consistently across paths."""
+    config_data = {
+        "agent": {
+            "reasoning_effort": "high",
+            "reasoning_overrides": {
+                "claude-opus-4.5": "low",
+            },
+        },
+    }
+
+    # Native / shared config resolver
+    resolved_native = cfg.configured_reasoning_effort_for_model(
+        config_data,
+        model_id="@custom:example-gateway:claude-opus-4-5",
+    )
+    assert resolved_native == "low"
+
+    # Gateway path
+    resolved_gateway = gateway_chat._gateway_reasoning_effort_for_request(
+        config_data,
+        model="@custom:example-gateway:claude-opus-4-5",
+        model_provider="custom:example-gateway",
+    )
+    assert resolved_gateway == "low"
+
+
+def test_configured_reasoning_effort_unrepresentable_override_retains_global():
+    """An unrepresentable per-model override must retain the working global effort."""
+    config_data = {
+        "agent": {
+            "reasoning_effort": "high",
+            "reasoning_overrides": {
+                "some-model": "ultra",
+            },
+        },
+    }
+
+    resolved = cfg.configured_reasoning_effort_for_model(
+        config_data,
+        model_id="some-model",
+    )
+    assert resolved == "high"
+
