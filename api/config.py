@@ -4372,9 +4372,42 @@ def configured_reasoning_effort_for_model(
         except Exception:
             per_model = None
         if per_model is None:
+            # Fallback candidate list.  Mirror the core resolver's shapes so an
+            # install without the companion agent tree resolves the same
+            # overrides.  Exact/full-id candidates come FIRST so a full-id
+            # override always outranks a bare-tail one.
             candidates = [model, model.lower()]
             if model.startswith("@") and ":" in model:
                 candidates.append(model.rsplit(":", 1)[-1])
+            # Slash-qualified ids (``openai/gpt-5.4-mini``,
+            # ``openrouter/anthropic/claude-opus-4.5``) must also match a bare
+            # override key.  Without these the override was silently dropped
+            # and the global effort won.  Emit the aggregator-stripped middle
+            # form before the bare tail so the more specific id wins.
+            for _cand in list(candidates):
+                if "/" not in _cand:
+                    continue
+                _parts = _cand.split("/")
+                if len(_parts) >= 3:
+                    candidates.append("/".join(_parts[1:]))
+                candidates.append(_parts[-1])
+
+            def _fallback_parse(raw):
+                """Parse an override value with CORE semantics.
+
+                ``parse_reasoning_effort()`` in this module returns ``None`` for
+                a YAML boolean ``False`` and for the ``"false"``/``"disabled"``
+                spellings, but Hermes core treats all of them as *reasoning
+                disabled*.  Leaving them unparsed made the fallback silently
+                ignore an explicit disable and keep the global effort.
+                """
+                if raw is False:
+                    return {"enabled": False}
+                if raw is None or raw is True:
+                    return None
+                if str(raw).strip().lower() in {"none", "false", "disabled"}:
+                    return {"enabled": False}
+                return parse_reasoning_effort(raw)
 
             normalized_overrides = {
                 str(key).strip().lower(): value
@@ -4383,7 +4416,7 @@ def configured_reasoning_effort_for_model(
             for candidate in candidates:
                 cand_lower = candidate.lower()
                 if cand_lower in normalized_overrides:
-                    per_model = parse_reasoning_effort(
+                    per_model = _fallback_parse(
                         normalized_overrides[cand_lower]
                     )
                     if per_model is not None:
@@ -4397,7 +4430,7 @@ def configured_reasoning_effort_for_model(
                 for candidate in candidates:
                     cand_canon = candidate.lower().replace(".", "-")
                     if cand_canon in canonical_overrides:
-                        per_model = parse_reasoning_effort(
+                        per_model = _fallback_parse(
                             canonical_overrides[cand_canon]
                         )
                         if per_model is not None:
