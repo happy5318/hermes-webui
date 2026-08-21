@@ -193,3 +193,37 @@ def test_configured_reasoning_effort_unrepresentable_override_retains_global():
     )
     assert resolved == "high"
 
+
+def test_fallback_reasoning_override_bidirectional_dot_dash_matching(monkeypatch):
+    """When the companion resolver is unavailable, dot-dash matching must work in both directions."""
+    import sys
+    monkeypatch.setitem(sys.modules, "hermes_constants", None)
+
+    # 1. Incoming dashed, override dotted
+    cfg_dotted = {
+        "agent": {
+            "reasoning_effort": "high",
+            "reasoning_overrides": {"claude-opus-4.5": "low"},
+        }
+    }
+    assert cfg.configured_reasoning_effort_for_model(
+        cfg_dotted, model_id="claude-opus-4-5"
+    ) == "low"
+
+    # 2. Incoming dotted, override dashed
+    cfg_dashed = {
+        "agent": {
+            "reasoning_effort": "high",
+            "reasoning_overrides": {"claude-opus-4-5": "low"},
+        }
+    }
+    assert cfg.configured_reasoning_effort_for_model(
+        cfg_dashed, model_id="claude-opus-4.5"
+    ) == "low"
+
+    # 3. Unmatched model retains global
+    assert cfg.configured_reasoning_effort_for_model(
+        cfg_dotted, model_id="unmatched-model"
+    ) == "high"
+
+
