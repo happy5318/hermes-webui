@@ -4248,8 +4248,26 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         || text.includes('compression finished')
         || (text.includes('compressed')&&!text.includes('compressing'))
       ) return 'compressed';
+      // A bare phase/status of 'running' is NOT a compression cue. Every
+      // lifecycle row a turn leaves behind mid-flight (interrupted turn,
+      // dropped terminal event, long provider stall) carries phase='running',
+      // and defaulting those to 'compressing' rebuilt a phantom
+      // "Compressing context" divider on sessions that never compressed —
+      // visible immediately on reopen, since the completion guard
+      // (_ensureAnchorCompressionCompletedOnLiveProgress) only runs on live
+      // progress and never fires for a session the user merely opens.
+      // Require an explicit compression phase or a positive text cue instead.
+      // Skip / defer / cooldown notices are decisions NOT to compress; they
+      // mention compression but must never paint a running divider. Mirrors
+      // the same rejection in api/streaming.py's live-status matcher.
       if(
-        phase==='running'||phase==='compressing'
+        text.includes('skipping')
+        || text.includes('defer')
+        || text.includes('cooldown')
+        || text.includes('will not start')
+      ) return '';
+      if(
+        phase==='compressing'
         || text.includes('compressing context')
         || text.includes('compacting context')
         || text.includes('preflight compression')
