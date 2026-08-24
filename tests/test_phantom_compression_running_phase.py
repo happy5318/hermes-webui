@@ -161,6 +161,23 @@ def test_completed_compression_rows_still_classify_as_compressed():
     assert _classify(rows) == ["compressed"] * 4
 
 
+def test_bare_preflight_row_is_neutral_but_authoritative_compaction_is_not():
+    """Preflight is only a decision log; compaction is the active-start cue."""
+    rows = [
+        {
+            "role": "lifecycle",
+            "kind": "lifecycle_status",
+            "text": "📦 Preflight compression: ~101,000 tokens >= 96,000 threshold",
+        },
+        {
+            "role": "lifecycle",
+            "kind": "lifecycle_status",
+            "text": "🗜️ Compacting context — summarizing earlier conversation so I can continue...",
+        },
+    ]
+    assert _classify(rows) == ["", "compressing"]
+
+
 def test_skip_and_defer_notices_never_compress():
     """Skip/cooldown notices must stay neutral even on a running row."""
     rows = [

@@ -83,10 +83,14 @@ Automatic compression is a live-only context barrier, not a special branded
 tool card. Render it as a centered, non-interactive divider with quiet horizontal
 rules: `Compressing context` while the compression barrier is active and
 `Context auto-compressed` when the agent has continued or the compression
-completion event arrives. Do not give it a caret, click target, leading status
-dot, or standalone running badge. In settled final history, remove live-only
-automatic compression rows unless they explain a visible recovery or error
-state.
+completion event arrives. A bare `Preflight compression` lifecycle notice is a
+decision log, not proof that the barrier started; both live handling and replay
+hydration must wait for an authoritative cue such as `Pre-API compression`,
+`Compacting context`, `Context too large`, or `compression attempt`. Generic
+`running` rows and skip/defer/cooldown notices are also neutral. Do not give the
+divider a caret, click target, leading status dot, or standalone running badge.
+In settled final history, remove live-only automatic compression rows unless they
+explain a visible recovery or error state.
 
 The existing two-stage proposal in `docs/ui-ux/two-stage-proposal.html` records a
 compatible direction for long turns: live work can be grouped as a worklog, then

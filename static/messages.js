@@ -4270,7 +4270,6 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         phase==='compressing'
         || text.includes('compressing context')
         || text.includes('compacting context')
-        || text.includes('preflight compression')
         || text.includes('pre-api compression')
         || text.includes('context too large')
         || text.includes('compression attempt')
