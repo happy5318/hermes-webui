@@ -2064,7 +2064,7 @@ def _settle_result_messages(
             msg_text,
             source,
         )
-    session.context_messages = _strip_orphan_tool_calls(
+    session.context_messages = (
         _deduplicate_context_messages(next_context_messages)
         if result_messages
         else list(next_context_messages or [])
@@ -5408,6 +5408,36 @@ def _sanitize_messages_for_api(
         if sanitized.get('role'):
             clean.append(sanitized)
 
+    # Repair adjacent tool-call/result blocks before validating tool results
+    # globally. Otherwise a result belonging to a later, unrelated turn can
+    # make an earlier orphan call look answered and survive this projection.
+    repaired_clean = _strip_orphan_tool_calls(clean)
+    clean = [
+        repaired
+        for original, repaired in zip(clean, repaired_clean, strict=True)
+        if not (
+            original.get('role') == 'assistant'
+            and original.get('tool_calls')
+            and not repaired.get('tool_calls')
+            and not str(repaired.get('content') or '').strip()
+        )
+    ]
+
+    # Recompute ownership from the repaired call rows.  A tool result that was
+    # only linked to a now-removed non-adjacent call must be removed too.
+    surviving_tool_call_ids = {
+        tc.get('id') or tc.get('call_id')
+        for msg in clean
+        if msg.get('role') == 'assistant'
+        for tc in (msg.get('tool_calls') or [])
+        if isinstance(tc, dict) and (tc.get('id') or tc.get('call_id'))
+    }
+    clean = [
+        msg for msg in clean
+        if msg.get('role') != 'tool'
+        or (msg.get('tool_call_id') or '') in surviving_tool_call_ids
+    ]
+
     # Third pass: strip orphaned tool_calls from assistant messages — calls whose id
     # has no matching tool-role response in the clean list.  Strict providers (DeepSeek,
     # newer OpenAI) reject with 400 when an assistant message references a tool call that
@@ -5537,6 +5567,33 @@ def _api_safe_message_positions(messages):
             sanitized['content'] = _strip_oob_blocks(sanitized['content'])
         if sanitized.get('role'):
             out.append((idx, sanitized))
+
+    # Repair adjacent tool-call/result blocks before validating tool results
+    # globally, matching _sanitize_messages_for_api.
+    original_out = out
+    repaired_rows = _strip_orphan_tool_calls([msg for _idx, msg in original_out])
+    out = [
+        (idx, repaired)
+        for (idx, original), repaired in zip(original_out, repaired_rows, strict=True)
+        if not (
+            original.get('role') == 'assistant'
+            and original.get('tool_calls')
+            and not repaired.get('tool_calls')
+            and not str(repaired.get('content') or '').strip()
+        )
+    ]
+    surviving_tool_call_ids = {
+        tc.get('id') or tc.get('call_id')
+        for _idx, msg in out
+        if msg.get('role') == 'assistant'
+        for tc in (msg.get('tool_calls') or [])
+        if isinstance(tc, dict) and (tc.get('id') or tc.get('call_id'))
+    }
+    out = [
+        (idx, msg) for idx, msg in out
+        if msg.get('role') != 'tool'
+        or (msg.get('tool_call_id') or '') in surviving_tool_call_ids
+    ]
 
     # Third pass: strip orphaned tool_calls from assistant messages (mirrors
     # _sanitize_messages_for_api pass 3).
@@ -5683,7 +5740,11 @@ def _strip_orphan_tool_calls(messages):
         kept = []
         dropped = []
         for call in calls:
-            call_id = str(call.get("id") or "") if isinstance(call, dict) else ""
+            call_id = (
+                str(call.get("id") or call.get("call_id") or "")
+                if isinstance(call, dict)
+                else ""
+            )
             if call_id and call_id in covered:
                 kept.append(call)
             else:
