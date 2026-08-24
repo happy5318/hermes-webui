@@ -116,7 +116,7 @@ class TestOrphansRemoved:
         assert [c["id"] for c in msgs[1]["tool_calls"]] == ["orphan"]
 
     def test_trailing_settled_assistant_call_cannot_reach_next_provider_request(self):
-        """A settled tail orphan is repaired before the next API projection."""
+        """An orphan is repaired outbound without rewriting persisted context."""
         previous = [{"role": "user", "content": "go", "timestamp": 1.0}]
         result = previous + [_assistant(["orphan"], content="final text")]
         session = SimpleNamespace(
@@ -135,10 +135,30 @@ class TestOrphansRemoved:
             None,
         )
 
-        assert "tool_calls" not in session.context_messages[-1]
+        assert "tool_calls" in result[-1]
+        assert "tool_calls" in session.context_messages[-1]
         next_request = _sanitize_messages_for_api(session.context_messages)
         assert all(not msg.get("tool_calls") for msg in next_request)
         assert [call["id"] for call in result[-1]["tool_calls"]] == ["orphan"]
+
+    def test_anthropic_call_id_pair_survives_outbound_repair(self):
+        msgs = [
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"call_id": "anthropic-1", "type": "function", "function": {"name": "t", "arguments": "{}"}}
+            ]},
+            {"role": "tool", "tool_call_id": "anthropic-1", "content": "ok"},
+        ]
+        repaired = _sanitize_messages_for_api(msgs)
+        assert repaired[0]["tool_calls"][0]["call_id"] == "anthropic-1"
+
+    def test_non_adjacent_result_cannot_rescue_earlier_orphan(self):
+        msgs = [
+            {"role": "assistant", "content": "", "tool_calls": [_call("foreign")]},
+            {"role": "assistant", "content": "intervening"},
+            {"role": "tool", "tool_call_id": "foreign", "content": "late result"},
+        ]
+        repaired = _sanitize_messages_for_api(msgs)
+        assert repaired == [{"role": "assistant", "content": "intervening"}]
 
     def test_orphan_before_trailing_row_still_stripped(self):
         msgs = [_assistant(["ghost"], content="text"), _assistant(["second-ghost"])]

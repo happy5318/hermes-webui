@@ -396,8 +396,8 @@ def test_gateway_chat_worker_translates_sse_and_persists_session(tmp_path, monke
     assert all(len(item) == 3 and item[2] for item in events)
 
 
-def test_gateway_writeback_repairs_context_without_mutating_display_transcript(tmp_path, monkeypatch):
-    """The empty-context Gateway fallback must keep display rows byte-for-byte intact."""
+def test_gateway_writeback_preserves_context_and_display_transcript(tmp_path, monkeypatch):
+    """Gateway settlement must not rewrite either durable history projection."""
     session_dir = tmp_path / "sessions"
     session_dir.mkdir()
     monkeypatch.setattr(models, "SESSION_DIR", session_dir)
@@ -464,7 +464,7 @@ def test_gateway_writeback_repairs_context_without_mutating_display_transcript(t
         STREAMS.pop(stream_id, None)
 
     saved = models.get_session(s.session_id)
-    assert "tool_calls" not in saved.context_messages[0]
+    assert "tool_calls" in saved.context_messages[0]
     assert json.dumps(saved.messages[0:1], sort_keys=True, ensure_ascii=False, separators=(",", ":")) == display_before
 
 
