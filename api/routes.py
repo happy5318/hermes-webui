@@ -3348,6 +3348,7 @@ def _run_journal_live_snapshot(stream_id: str | None, *, handler=None) -> dict |
     fresh_segment = True
     last_ts = None
     reasoning_first_tool_count: int | None = None
+    pending_compression_event: dict | None = None
 
     def mark_boundary() -> int:
         nonlocal current_activity_burst_id
@@ -3429,8 +3430,30 @@ def _run_journal_live_snapshot(stream_id: str | None, *, handler=None) -> dict |
 
     for event in events:
         event_name = str(event.get("event") or event.get("type") or "")
-        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        raw_payload = event.get("payload")
+        payload = raw_payload if isinstance(raw_payload, dict) else {}
         last_ts = event.get("created_at", last_ts)
+        if event_name == "compressing":
+            pending_compression_event = event
+            continue
+        terminal_or_compressed = event_name in {
+            "compressed",
+            "done",
+            "cancel",
+            "error",
+            "apperror",
+            "stream_end",
+        }
+        payload_text = str(payload.get("text") or "") if isinstance(payload, dict) else ""
+        payload_name = str(payload.get("name") or "").strip() if isinstance(payload, dict) else ""
+        visible_progress = (
+            (event_name in {"token", "reasoning", "interim_assistant"} and bool(payload_text))
+            or (event_name in {"tool", "tool_complete"} and bool(payload_name))
+        )
+        if terminal_or_compressed or visible_progress:
+            # A later lifecycle completion or real projected stream progress
+            # means the unmatched compression marker is no longer active.
+            pending_compression_event = None
         if event_name == "token":
             text = str(payload.get("text") or "")
             if text:
@@ -3756,6 +3779,58 @@ def _run_journal_live_snapshot(stream_id: str | None, *, handler=None) -> dict |
         append_thinking_row()
 
     append_thinking_row(force=True)
+
+    if pending_compression_event is not None:
+        compression_payload = pending_compression_event.get("payload")
+        if not isinstance(compression_payload, dict):
+            compression_payload = {}
+        compression_text = str(
+            compression_payload.get("message")
+            or compression_payload.get("text")
+            or compression_payload.get("label")
+            or "Compressing context"
+        ).strip() or "Compressing context"
+        compression_seq = pending_compression_event.get("seq")
+        compression_event_id = pending_compression_event.get("event_id")
+        compression_local_id = f"lifecycle:{stream_id}:compressing"
+        anchor_activity_rows.append(
+            {
+                "row_id": compression_local_id,
+                "order_index": len(anchor_activity_rows),
+                "kind": "lifecycle_status",
+                "role": "lifecycle",
+                "display_hint": "quiet_lifecycle_row",
+                "display_hints": {
+                    "compact_worklog": "quiet_lifecycle_row",
+                    "transparent_stream": "chronological_activity",
+                },
+                "source_event_type": "compressing",
+                "event_id": compression_event_id,
+                "local_id": compression_local_id,
+                "run_id": run_id,
+                "stream_id": stream_id,
+                "seq": compression_seq,
+                "status": "running",
+                "phase": "compressing",
+                "created_at": pending_compression_event.get("created_at", last_ts),
+                "identity": {
+                    "event_id": compression_event_id,
+                    "local_id": compression_local_id,
+                    "run_id": run_id,
+                    "stream_id": stream_id,
+                    "seq": compression_seq,
+                },
+                "group": scene_group(),
+                "text": compression_text,
+                "thinking": None,
+                "tool_call_id": "",
+                "tool": None,
+                "payload": {
+                    **compression_payload,
+                    "text": compression_text,
+                },
+            }
+        )
 
     # Keep a live anchor shell during session-switch replay even before the
     # journal has projected visible prose or tool rows from the first events.

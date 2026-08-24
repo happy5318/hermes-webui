@@ -81,6 +81,181 @@ def _classify(rows):
     return _run(body)
 
 
+def _hydrate_scene(scene):
+    """Drive the real snapshot hydration loop and return applied source types."""
+    body = (
+        "const scene = " + json.dumps(scene) + ";\n"
+        "const applied = [];\n"
+        "const _anchorRegistry = {};\n"
+        "const _anchorApi = {applyAssistantTurnAnchorSourceEvent(_registry, event){"
+        "applied.push(event.source_event_type);}};\n"
+        "const streamId = 'stream-compression-reopen';\n"
+        "const activeSid = 'session-compression-reopen';\n"
+        "let _anchorShadowWarned = false;\n"
+        "const INFLIGHT = {};\n"
+        "eval(extractFunc('_hydrateAnchorRegistryFromActivityScene'));\n"
+        "const hydrated = _hydrateAnchorRegistryFromActivityScene(scene);\n"
+        "process.stdout.write(JSON.stringify({hydrated, applied}));\n"
+    )
+    return _run(body)
+
+
+def _snapshot_for_events(monkeypatch, events):
+    """Build the same live journal snapshot returned during session reopen."""
+    from api import routes
+
+    stream_id = "stream-compression-reopen"
+    monkeypatch.setattr(
+        routes,
+        "find_run_summary",
+        lambda _stream_id: {
+            "session_id": "session-compression-reopen",
+            "run_id": stream_id,
+            "last_seq": len(events),
+            "last_event_id": f"{stream_id}:{len(events)}",
+        },
+    )
+    monkeypatch.setattr(
+        routes,
+        "read_run_events",
+        lambda _session_id, _run_id: {"events": events},
+    )
+    snapshot = routes._run_journal_live_snapshot(stream_id)
+    assert snapshot is not None
+    projected = routes._runtime_journal_snapshot_for_session_payload(snapshot)
+    assert projected is not None
+    return projected
+
+
+def test_reopen_during_real_compression_hydrates_authoritative_divider(monkeypatch):
+    """The snapshot cursor must not consume the only real compression cue."""
+    stream_id = "stream-compression-reopen"
+    snapshot = _snapshot_for_events(
+        monkeypatch,
+        [
+            {
+                "event": "compressing",
+                "type": "compressing",
+                "seq": 1,
+                "event_id": f"{stream_id}:1",
+                "run_id": stream_id,
+                "created_at": 1.0,
+                "payload": {"message": "Compressing context"},
+            }
+        ],
+    )
+
+    assert snapshot["last_seq"] == 1
+    assert snapshot["last_event_id"] == f"{stream_id}:1"
+    rows = snapshot["anchor_activity_scene"]["activity_rows"]
+    assert [row["source_event_type"] for row in rows] == ["compressing"]
+    hydrated = _hydrate_scene(snapshot["anchor_activity_scene"])
+    assert hydrated == {"hydrated": True, "applied": ["compressing"]}
+
+
+def test_reopen_during_ordinary_running_event_hydrates_no_divider(monkeypatch):
+    """A generic running event remains neutral after snapshot hydration."""
+    stream_id = "stream-compression-reopen"
+    snapshot = _snapshot_for_events(
+        monkeypatch,
+        [
+            {
+                "event": "context_status",
+                "type": "context_status",
+                "seq": 1,
+                "event_id": f"{stream_id}:1",
+                "run_id": stream_id,
+                "created_at": 1.0,
+                "payload": {"message": "Working"},
+            }
+        ],
+    )
+
+    assert snapshot["last_seq"] == 1
+    assert snapshot["last_event_id"] == f"{stream_id}:1"
+    hydrated = _hydrate_scene(snapshot["anchor_activity_scene"])
+    assert hydrated == {"hydrated": True, "applied": []}
+
+
+@pytest.mark.parametrize(
+    ("next_event", "expected_applied"),
+    [
+        (
+            {
+                "event": "compressed",
+                "type": "compressed",
+                "payload": {"message": "Context auto-compressed"},
+            },
+            [],
+        ),
+        (
+            {
+                "event": "token",
+                "type": "token",
+                "payload": {"text": "progress after compression"},
+            },
+            ["token"],
+        ),
+    ],
+)
+def test_completed_or_later_progress_supersedes_unmatched_compression_marker(
+    monkeypatch, next_event, expected_applied
+):
+    """Only an active, unmatched compression event survives the snapshot."""
+    stream_id = "stream-compression-reopen"
+    events = [
+        {
+            "event": "compressing",
+            "type": "compressing",
+            "seq": 1,
+            "event_id": f"{stream_id}:1",
+            "run_id": stream_id,
+            "created_at": 1.0,
+            "payload": {"message": "Compressing context"},
+        },
+        {
+            **next_event,
+            "seq": 2,
+            "event_id": f"{stream_id}:2",
+            "run_id": stream_id,
+            "created_at": 2.0,
+        },
+    ]
+    snapshot = _snapshot_for_events(monkeypatch, events)
+    hydrated = _hydrate_scene(snapshot["anchor_activity_scene"])
+    assert hydrated == {"hydrated": True, "applied": expected_applied}
+
+
+def test_empty_progress_event_does_not_supersede_active_compression(monkeypatch):
+    """Empty journal noise is not progress and must not erase the divider."""
+    stream_id = "stream-compression-reopen"
+    snapshot = _snapshot_for_events(
+        monkeypatch,
+        [
+            {
+                "event": "compressing",
+                "type": "compressing",
+                "seq": 1,
+                "event_id": f"{stream_id}:1",
+                "run_id": stream_id,
+                "created_at": 1.0,
+                "payload": {"message": "Compressing context"},
+            },
+            {
+                "event": "token",
+                "type": "token",
+                "seq": 2,
+                "event_id": f"{stream_id}:2",
+                "run_id": stream_id,
+                "created_at": 2.0,
+                "payload": {"text": ""},
+            },
+        ],
+    )
+    rows = snapshot["anchor_activity_scene"]["activity_rows"]
+    assert [row["source_event_type"] for row in rows] == ["compressing"]
+
+
 def test_bare_running_lifecycle_row_is_not_compressing():
     """The regression: a mid-flight lifecycle row must classify as neutral ('')."""
     rows = [
