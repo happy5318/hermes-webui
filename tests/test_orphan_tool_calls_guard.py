@@ -6,10 +6,15 @@ session with HTTP 400 TOOL_USE_RESULT_MISMATCH, and because each failure
 appends another poisoned row the session never recovers on its own.
 """
 import json
+from types import SimpleNamespace
 
 import pytest
 
-from api.streaming import _strip_orphan_tool_calls
+from api.streaming import (
+    _sanitize_messages_for_api,
+    _settle_result_messages,
+    _strip_orphan_tool_calls,
+)
 
 
 def _call(cid):
@@ -48,18 +53,42 @@ class TestPairedCallsSurvive:
 
 
 class TestOrphansRemoved:
+    def test_repair_returns_new_rows_without_mutating_input_rows(self):
+        """Context repair must not delete metadata from the display transcript."""
+        msgs = [_assistant(["orphan"], content="visible answer"), {"role": "user", "content": "next"}]
+        before = json.dumps(msgs, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+
+        repaired = _strip_orphan_tool_calls(msgs)
+
+        assert repaired is not msgs
+        assert json.dumps(msgs, sort_keys=True, ensure_ascii=False, separators=(",", ":")) == before
+        assert "tool_calls" not in repaired[0]
+        assert repaired[0] is not msgs[0], "changed rows must be cloned"
+        assert repaired[1] is msgs[1], "unchanged rows need not be cloned"
+
+    def test_repaired_nested_metadata_is_not_aliased(self):
+        """Copy-on-write must also sever nested tool-call dictionaries."""
+        msgs = [_assistant(["good", "orphan"]), _tool("good")]
+        repaired = _strip_orphan_tool_calls(msgs)
+
+        repaired[0]["tool_calls"][0]["function"]["name"] = "changed-in-context"
+
+        assert msgs[0]["tool_calls"][0]["function"]["name"] == "t"
+
     def test_text_message_with_fully_orphan_calls_loses_field(self):
-        """A final text answer left carrying tool_call ids from earlier turns."""
+        """A final text answer left carrying foreign ids is repaired in the output."""
         poison = [f"toolu_bdrk_{i}" for i in range(6)]
         msgs = [_assistant(poison, content="summary text"), {"role": "user", "content": "next"}]
-        _strip_orphan_tool_calls(msgs)
-        assert "tool_calls" not in msgs[0]
-        assert msgs[0]["content"] == "summary text", "content must be preserved"
+        repaired = _strip_orphan_tool_calls(msgs)
+        assert "tool_calls" not in repaired[0]
+        assert repaired[0]["content"] == "summary text", "content must be preserved"
+        assert [call["id"] for call in msgs[0]["tool_calls"]] == poison
 
     def test_partial_orphans_keep_only_paired(self):
         msgs = [_assistant(["good", "orphan"]), _tool("good")]
-        _strip_orphan_tool_calls(msgs)
-        assert [c["id"] for c in msgs[0]["tool_calls"]] == ["good"]
+        repaired = _strip_orphan_tool_calls(msgs)
+        assert [c["id"] for c in repaired[0]["tool_calls"]] == ["good"]
+        assert [c["id"] for c in msgs[0]["tool_calls"]] == ["good", "orphan"]
 
     def test_duplicate_assistant_between_call_and_result(self):
         """A duplicate row splits an otherwise valid pair apart.
@@ -68,48 +97,71 @@ class TestOrphansRemoved:
         assistant's call is an orphan even though a tool row exists later.
         """
         msgs = [_assistant(["x1"]), _assistant(["x1"], content="dupe"), _tool("x1")]
-        _strip_orphan_tool_calls(msgs)
-        assert "tool_calls" not in msgs[0], "row separated from its result is an orphan"
-        assert [c["id"] for c in msgs[1]["tool_calls"]] == ["x1"], "adjacent row keeps its call"
+        repaired = _strip_orphan_tool_calls(msgs)
+        assert "tool_calls" not in repaired[0], "row separated from its result is an orphan"
+        assert [c["id"] for c in repaired[1]["tool_calls"]] == ["x1"], "adjacent row keeps its call"
+        assert [c["id"] for c in msgs[0]["tool_calls"]] == ["x1"]
 
     def test_tool_result_after_user_turn_does_not_count(self):
         msgs = [_assistant(["a1"]), {"role": "user", "content": "hi"}, _tool("a1")]
-        _strip_orphan_tool_calls(msgs)
-        assert "tool_calls" not in msgs[0]
+        repaired = _strip_orphan_tool_calls(msgs)
+        assert "tool_calls" not in repaired[0]
+        assert [c["id"] for c in msgs[0]["tool_calls"]] == ["a1"]
 
-    def test_trailing_assistant_call_is_exempt(self):
-        """The LAST row is an in-flight turn: its result just hasn't landed yet.
+    def test_trailing_settled_assistant_call_is_repaired(self):
+        """A completed-writeback helper cannot infer in-flight state from position."""
+        msgs = [{"role": "user", "content": "go"}, _assistant(["orphan"])]
+        repaired = _strip_orphan_tool_calls(msgs)
+        assert "tool_calls" not in repaired[1]
+        assert [c["id"] for c in msgs[1]["tool_calls"]] == ["orphan"]
 
-        Seen when a live turn is cut short by a WebUI restart. Only a
-        row followed by something else can be structurally orphaned.
-        """
-        msgs = [{"role": "user", "content": "go"}, _assistant(["pending"])]
-        _strip_orphan_tool_calls(msgs)
-        assert [c["id"] for c in msgs[1]["tool_calls"]] == ["pending"]
+    def test_trailing_settled_assistant_call_cannot_reach_next_provider_request(self):
+        """A settled tail orphan is repaired before the next API projection."""
+        previous = [{"role": "user", "content": "go", "timestamp": 1.0}]
+        result = previous + [_assistant(["orphan"], content="final text")]
+        session = SimpleNamespace(
+            messages=list(previous),
+            context_messages=list(previous),
+            truncation_watermark=None,
+        )
+
+        _settle_result_messages(
+            session,
+            previous,
+            previous,
+            result,
+            "go",
+            "webui",
+            None,
+        )
+
+        assert "tool_calls" not in session.context_messages[-1]
+        next_request = _sanitize_messages_for_api(session.context_messages)
+        assert all(not msg.get("tool_calls") for msg in next_request)
+        assert [call["id"] for call in result[-1]["tool_calls"]] == ["orphan"]
 
     def test_orphan_before_trailing_row_still_stripped(self):
-        """Tail exemption must not shield rows earlier in the array."""
-        msgs = [_assistant(["ghost"], content="text"), _assistant(["pending"])]
-        _strip_orphan_tool_calls(msgs)
-        assert "tool_calls" not in msgs[0], "non-trailing orphan must go"
-        assert [c["id"] for c in msgs[1]["tool_calls"]] == ["pending"], "tail stays"
+        msgs = [_assistant(["ghost"], content="text"), _assistant(["second-ghost"])]
+        repaired = _strip_orphan_tool_calls(msgs)
+        assert "tool_calls" not in repaired[0]
+        assert "tool_calls" not in repaired[1]
 
     def test_json_string_tool_calls_are_parsed(self):
         msgs = [
             {"role": "assistant", "content": "x", "tool_calls": json.dumps([_call("s1")])},
             {"role": "user", "content": "next"},
         ]
-        _strip_orphan_tool_calls(msgs)
-        assert "tool_calls" not in msgs[0]
+        repaired = _strip_orphan_tool_calls(msgs)
+        assert "tool_calls" not in repaired[0]
+        assert isinstance(msgs[0]["tool_calls"], str)
 
 
 class TestIdempotenceAndSafety:
     def test_running_twice_is_stable(self):
         msgs = [_assistant(["a1", "orphan"]), _tool("a1")]
-        _strip_orphan_tool_calls(msgs)
-        once = json.dumps(msgs)
-        _strip_orphan_tool_calls(msgs)
-        assert json.dumps(msgs) == once
+        once = _strip_orphan_tool_calls(msgs)
+        twice = _strip_orphan_tool_calls(once)
+        assert json.dumps(twice) == json.dumps(once)
 
     def test_repaired_output_passes_upstream_contract(self):
         """Post-repair invariant: no assistant call id lacks an adjacent result."""
@@ -119,12 +171,12 @@ class TestIdempotenceAndSafety:
             {"role": "user", "content": "u"},
             _assistant(["c1"]), _tool("c1"),
         ]
-        _strip_orphan_tool_calls(msgs)
-        for i, m in enumerate(msgs):
+        repaired = _strip_orphan_tool_calls(msgs)
+        for i, m in enumerate(repaired):
             calls = m.get("tool_calls") or []
             covered, j = set(), i + 1
-            while j < len(msgs) and msgs[j].get("role") == "tool":
-                covered.add(msgs[j].get("tool_call_id"))
+            while j < len(repaired) and repaired[j].get("role") == "tool":
+                covered.add(repaired[j].get("tool_call_id"))
                 j += 1
             unpaired = {c["id"] for c in calls} - covered
             assert not unpaired, f"index {i} still orphaned: {unpaired}"
