@@ -219,3 +219,85 @@ class TestIdempotenceAndSafety:
         msgs = [{"role": "assistant", "content": "x", "tool_calls": []}]
         _strip_orphan_tool_calls(msgs)
         assert msgs[0]["tool_calls"] == []
+
+
+class TestRecoveredUserTransparency:
+    """#1543 stale-stream recovery inserts a transient ``_recovered`` user row
+    between an assistant's ``tool_calls`` and the first ``tool`` result. A
+    later pass in ``_sanitize_messages_for_api`` / ``_api_safe_message_positions``
+    strips that row, so the adjacency scan must treat it as transparent —
+    otherwise a valid, completed tool pair is misclassified as an orphan and
+    silently lost on the exact recovery path this PR family hardens.
+    """
+
+    def test_recovered_user_before_first_tool_result_does_not_split_pair(self):
+        msgs = [
+            _assistant(["a", "b"]),
+            {"role": "user", "content": "stale", "_recovered": True},
+            _tool("a"),
+            _tool("b"),
+            {"role": "assistant", "content": "done"},
+        ]
+        before = json.dumps(msgs)
+        repaired = _strip_orphan_tool_calls(msgs)
+        assert [c["id"] for c in repaired[0]["tool_calls"]] == ["a", "b"]
+        assert json.dumps(msgs) == before, "input rows must not be mutated"
+
+    def test_recovered_user_between_two_tool_results_keeps_both_calls(self):
+        msgs = [
+            _assistant(["a", "b"]),
+            _tool("a"),
+            {"role": "user", "content": "stale", "_recovered": True},
+            _tool("b"),
+            {"role": "assistant", "content": "done"},
+        ]
+        repaired = _strip_orphan_tool_calls(msgs)
+        assert [c["id"] for c in repaired[0]["tool_calls"]] == ["a", "b"]
+
+    def test_recovered_user_without_following_tool_still_orphans_the_call(self):
+        """Transparency must not rescue a call that genuinely has no result."""
+        msgs = [
+            _assistant(["a", "ghost"]),
+            _tool("a"),
+            {"role": "user", "content": "stale", "_recovered": True},
+            # no tool("ghost") follows → ghost is still a real orphan
+            {"role": "user", "content": "next turn"},
+        ]
+        repaired = _strip_orphan_tool_calls(msgs)
+        assert [c["id"] for c in repaired[0]["tool_calls"]] == ["a"]
+
+    def test_sanitize_for_api_keeps_pair_split_by_recovered_user(self):
+        """End-to-end: the sanitizer path must not silently drop a valid pair."""
+        msgs = [
+            _assistant(["a", "b"]),
+            _tool("a"),
+            {"role": "user", "content": "stale", "_recovered": True},
+            _tool("b"),
+            {"role": "assistant", "content": "done"},
+        ]
+        sanitized = _sanitize_messages_for_api(msgs)
+        # First surviving row is the assistant carrying the full pair.
+        assert sanitized[0]["role"] == "assistant"
+        assert [c["id"] for c in sanitized[0]["tool_calls"]] == ["a", "b"]
+
+    def test_api_safe_message_positions_keeps_pair_split_by_recovered_user(self):
+        """_api_safe_message_positions delegates to _strip_orphan_tool_calls;
+        the same transparency rule must apply on this projection path.
+        """
+        from api.streaming import _api_safe_message_positions
+        msgs = [
+            _assistant(["a", "b"]),
+            _tool("a"),
+            {"role": "user", "content": "stale", "_recovered": True},
+            _tool("b"),
+            {"role": "assistant", "content": "done"},
+        ]
+        out = _api_safe_message_positions(msgs)
+        # First surviving row is the assistant carrying the full pair, and
+        # both tool results survive the projection.
+        assert out[0][1]["role"] == "assistant"
+        assert [c["id"] for c in out[0][1]["tool_calls"]] == ["a", "b"]
+        surviving_tool_ids = [
+            row[1].get("tool_call_id") for row in out if row[1].get("role") == "tool"
+        ]
+        assert surviving_tool_ids == ["a", "b"]
