@@ -5733,7 +5733,20 @@ def _strip_orphan_tool_calls(messages):
         probe = idx + 1
         while probe < len(messages):
             following = messages[probe]
-            if not isinstance(following, dict) or following.get("role") != "tool":
+            if not isinstance(following, dict):
+                break
+            # A temporary ``_recovered`` user row is materialized by the #1543
+            # stale-stream recovery path between an assistant's ``tool_calls``
+            # and their ``tool`` results. A later pass in
+            # ``_sanitize_messages_for_api`` / ``_api_safe_message_positions``
+            # drops that row from the final projection, so treat it as
+            # transparent here — otherwise a valid, completed tool pair is
+            # misclassified as an orphan and silently lost on exactly the
+            # recovery path this repair is meant to harden.
+            if following.get("role") == "user" and following.get("_recovered"):
+                probe += 1
+                continue
+            if following.get("role") != "tool":
                 break
             covered.add(str(following.get("tool_call_id") or ""))
             probe += 1
