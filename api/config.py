@@ -5851,6 +5851,20 @@ def _static_models_catalog_without_live_probes() -> dict:
 
         groups.sort(key=_group_sort_key)
 
+        # Alphabetize model entries within each provider group (case-insensitive,
+        # stable). Previously models kept insertion order from config/live
+        # /v1/models probes, so a group like newapi showed jd-* / sn-* / sub-*
+        # intermixed in scramble (user request 2026-09-05).
+        for _group in groups:
+            _group_models = _group.get("models")
+            if isinstance(_group_models, list) and len(_group_models) > 1:
+                try:
+                    _group_models.sort(
+                        key=lambda _m: str((_m or {}).get("id") or "").lower()
+                    )
+                except Exception:
+                    pass
+
         model_aliases: dict[str, str] = {}
         try:
             raw_aliases = cfg.get("model", {}).get("aliases", {})
@@ -8337,6 +8351,19 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                 return (2, pid)
             return (3, pid)
         groups.sort(key=_group_sort_key)
+
+        # Alphabetize model entries within each provider group (case-insensitive,
+        # stable). Mirrors the static catalog path so live /v1/models probe
+        # results are also sorted by model id (user request 2026-09-05).
+        for _group in groups:
+            _group_models = _group.get("models")
+            if isinstance(_group_models, list) and len(_group_models) > 1:
+                try:
+                    _group_models.sort(
+                        key=lambda _m: str((_m or {}).get("id") or "").lower()
+                    )
+                except Exception:
+                    pass
 
         # 12. Include model aliases so the WebUI frontend can resolve them.
         model_aliases: dict[str, str] = {}
