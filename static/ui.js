@@ -9299,23 +9299,63 @@ function _playOpenaiTts(text, btn){
     if(btn)btn.dataset.speaking='0';
     if(msg&&typeof showToast==='function') showToast(msg,4000,'error');
   };
-  fetch(new URL('api/tts', document.baseURI || location.href).href, {
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({text:text, engine:'openai'})
-  })
-  .then(function(r){
-    if(!r.ok){
-      return r.json().catch(function(){return {};}).then(function(j){
-        throw new Error((j&&j.error)||('TTS request failed: '+r.status));
-      });
+  const chunks=_splitForTTS(text,150);
+  if(!chunks.length){ _fail('No text to speak'); return; }
+
+  // Prefetch pipeline: fetch chunk N+1 while playing chunk N.
+  // Uses inline Web Audio playback (not _playAudioBuf) because
+  // _playAudioBuf clears _ttsSpeaking on end, which would break
+  // the chunk chain — we need _ttsSpeaking to stay true between chunks
+  // so src.onended can distinguish natural end (continue) from stopTTS (halt).
+  var _nextBufPromise=null;
+  function _fetchChunk(i){
+    return fetch(new URL('api/tts', document.baseURI || location.href).href, {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({text:chunks[i], engine:'openai'})
+    })
+    .then(function(r){
+      if(!r.ok){
+        return r.json().catch(function(){return {};}).then(function(j){
+          throw new Error((j&&j.error)||('TTS request failed: '+r.status));
+        });
+      }
+      return r.arrayBuffer();
+    });
+  }
+  function _playChunk(i){
+    if(!_ttsSpeaking){ return; }
+    if(i>=chunks.length){
+      _ttsSpeaking=false;_playingEdgeAudio=null;
+      if(btn)btn.dataset.speaking='0';
+      return;
     }
-    return r.arrayBuffer();
-  })
-  .then(function(buf){
-    return _playAudioBuf(buf, btn, 'OpenAI TTS');
-  })
-  .catch(function(e){ _fail((e&&e.message)||'OpenAI TTS failed'); });
+    var bufPromise=_nextBufPromise||_fetchChunk(i);
+    bufPromise.then(function(buf){
+      if(!_ttsSpeaking) return;
+      // Prefetch next chunk while playing this one
+      if(i+1<chunks.length){ _nextBufPromise=_fetchChunk(i+1); }
+      var ctx=_getTtsAudioCtx();
+      if(!ctx){ _fail('Web Audio API not available'); return; }
+      ctx.decodeAudioData(buf.slice(0), function(audioBuffer){
+        if(!_ttsSpeaking) return;
+        var src=ctx.createBufferSource();
+        src.buffer=audioBuffer;
+        src.connect(ctx.destination);
+        _playingEdgeAudio=src;
+        // stopTTS() sets _ttsSpeaking=false then calls src.stop(),
+        // which fires onended. Natural end keeps _ttsSpeaking=true.
+        src.onended=function(){
+          _playingEdgeAudio=null;
+          if(_ttsSpeaking) _playChunk(i+1);
+        };
+        src.start(0);
+      }, function(e){
+        _fail('OpenAI TTS error: '+(e&&e.message||e));
+      });
+    }).catch(function(e){ _fail((e&&e.message)||'OpenAI TTS failed'); });
+  }
+  _playChunk(0);
 }
 
 // ── Shared AudioContext for TTS playback (no blob URLs needed) ──
