@@ -4726,7 +4726,15 @@ function renderModelDropdown(){
         configuredBySemanticKey.set(semanticKey,candidate);
       }
     }
-    const configuredModels=_sortPickerEntries([...configuredBySemanticKey.values()]);
+    // Semantic rank first (primary < fallback N < other configured), then
+    // alphabetical within the same rank.  A pure sort by model id would
+    // let a fallback float above the primary just because its id sorts
+    // earlier, and would strand `_configuredRank` as dead code.
+    const configuredModels=[...configuredBySemanticKey.values()].sort((a,b)=>{
+      const rankDiff=_configuredRank(a.badge)-_configuredRank(b.badge);
+      if(rankDiff!==0) return rankDiff;
+      return _compareModelPickerEntries(a,b);
+    });
     const configuredIds=new Set(configuredModels.map(m=>m.value));
     const configuredSemanticKeys=new Set(configuredModels.map(m=>`${_configuredProviderKey(m)}::${_configuredModelKey(m)}`));
     const _effectiveHiddenCount=(groupKey)=>_modelData.filter(m=>
