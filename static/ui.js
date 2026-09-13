@@ -9175,6 +9175,10 @@ function _splitForTTS(text, maxChars){
 
 let _ttsSpeaking=false;
 let _ttsGeneration=0;
+// Minimum gap between consecutive OpenAI TTS synthesis requests, matching the
+// server-side per-client window in api/routes.py (_TtsRateLimiter, 2 s).
+// Overridable (small values) by tests that drive _playOpenaiTts under node.
+let _openaiTtsMinGapMs=2000;
 let _ttsCurrentUtterance=null;
 let _ttsChunkQueue=[];
 let _ttsChunkIndex=0;
@@ -9371,6 +9375,21 @@ function _playElevenLabsTts(text, btn){
 
 function _playOpenaiTts(text, btn){
   if(btn) btn.dataset.speaking='1';
+  // Replacement start: stop any actively playing Web Audio source before
+  // taking ownership. speakMessage() already calls stopTTS() first, but
+  // autoReadLastAssistant() calls _playOpenaiTts() directly — without this
+  // the old playback keeps sounding while the new one starts, and the old
+  // source's stale onended could erase the new playback's handle.
+  if(_playingEdgeAudio){
+    try{
+      if(typeof _playingEdgeAudio.stop==='function'){
+        _playingEdgeAudio.stop(); _playingEdgeAudio.disconnect();
+      }else{
+        _playingEdgeAudio.pause(); _playingEdgeAudio.currentTime=0;
+      }
+    }catch(_){}
+    _playingEdgeAudio=null;
+  }
   // Generation token: every new playback invalidates all in-flight
   // callbacks of prior plays. `_ttsSpeaking` alone cannot distinguish
   // playback A from playback B (a stop→start gap lets a late fetch or
@@ -9391,10 +9410,8 @@ function _playOpenaiTts(text, btn){
   // the chunk chain — we need _ttsSpeaking to stay true between chunks
   // so src.onended can distinguish natural end (continue) from stopTTS (halt).
   var _nextBufPromise=null;
-  function _fetchChunk(i){
-    // Settle every fetch into {ok,buf}/{ok:false,err} immediately, so an
-    // abandoned prefetch can never surface an unhandled rejection.  Errors
-    // are only surfaced when that chunk actually becomes current.
+  var _lastFetchRequestTs=0;
+  function _rawFetch(i){
     return fetch(new URL('api/tts', document.baseURI || location.href).href, {
       method:'POST',
       headers:{'Content-Type':'application/json'},
@@ -9413,6 +9430,26 @@ function _playOpenaiTts(text, btn){
       function(err){ return {ok:false, err:err}; }
     );
   }
+  function _fetchChunk(i){
+    // Pace requests to the server's per-client TTS rate limit
+    // (api/routes.py _TtsRateLimiter: one request per 2 s window). Sending
+    // the prefetched chunk N+1 immediately after chunk N returns would hit
+    // HTTP 429 whenever a synthesis finishes inside the window, stopping
+    // playback after the first chunk. A delayed request still carries the
+    // generation guard, so a cancelled playback never issues a late request.
+    var wait=_openaiTtsMinGapMs-(Date.now()-_lastFetchRequestTs);
+    if(_lastFetchRequestTs===0||wait<=0){
+      _lastFetchRequestTs=Date.now();
+      return _rawFetch(i);
+    }
+    return new Promise(function(resolve){
+      setTimeout(function(){
+        if(gen!==_ttsGeneration){ resolve({ok:false, err:new Error('aborted')}); return; }
+        _lastFetchRequestTs=Date.now();
+        resolve(_rawFetch(i));
+      }, wait);
+    });
+  }
   function _playChunk(i){
     if(!_ttsSpeaking||gen!==_ttsGeneration){ return; }
     if(i>=chunks.length){
@@ -9421,35 +9458,59 @@ function _playOpenaiTts(text, btn){
       return;
     }
     var bufPromise=_nextBufPromise||_fetchChunk(i);
-    bufPromise.then(function(res){
+    bufPromise
+    .then(function(res){
       if(!_ttsSpeaking||gen!==_ttsGeneration) return;
       if(!res.ok){ _fail((res.err&&res.err.message)||'OpenAI TTS failed'); return; }
-      var buf=res.buf;
-      // Prefetch next chunk while playing this one
-      if(i+1<chunks.length){ _nextBufPromise=_fetchChunk(i+1); }
       var ctx=_getTtsAudioCtx();
       if(!ctx){ _fail('Web Audio API not available'); return; }
-      ctx.decodeAudioData(buf.slice(0), function(audioBuffer){
-        if(!_ttsSpeaking||gen!==_ttsGeneration) return;
-        var src=ctx.createBufferSource();
-        src.buffer=audioBuffer;
-        src.connect(ctx.destination);
-        _playingEdgeAudio=src;
-        // stopTTS() bumps _ttsGeneration and sets _ttsSpeaking=false, then
-        // calls src.stop(), which fires onended. Natural end keeps both
-        // unchanged, so onended can distinguish continue from halt.
-        src.onended=function(){
-          _playingEdgeAudio=null;
-          if(_ttsSpeaking&&gen===_ttsGeneration) _playChunk(i+1);
-        };
-        src.start(0);
+      var buf;
+      try{ buf=res.buf.slice(0); }catch(e){
+        _fail('OpenAI TTS error: '+(e&&e.message||e)); return;
+      }
+      // Prefetch next chunk while playing this one (paced via _fetchChunk)
+      if(i+1<chunks.length){ _nextBufPromise=_fetchChunk(i+1); }
+      ctx.decodeAudioData(buf, function(audioBuffer){
+        // Synchronous Web Audio construction (createBufferSource, connect,
+        // start) can throw; route every failure through the generation-aware
+        // terminal handler so speaking state is never left dangling.
+        try{
+          if(!_ttsSpeaking||gen!==_ttsGeneration) return;
+          var src=ctx.createBufferSource();
+          src.buffer=audioBuffer;
+          src.connect(ctx.destination);
+          _playingEdgeAudio=src;
+          // stopTTS() bumps _ttsGeneration and sets _ttsSpeaking=false, then
+          // calls src.stop(), which fires onended. Natural end keeps both
+          // unchanged, so onended can distinguish continue from halt. The
+          // ownership guard keeps a stale onended from a replaced source
+          // from erasing the new playback's active handle.
+          src.onended=function(){
+            if(_playingEdgeAudio===src){ _playingEdgeAudio=null; }
+            try{ src.disconnect(); }catch(_){}
+            if(_ttsSpeaking&&gen===_ttsGeneration) _playChunk(i+1);
+          };
+          src.start(0);
+        }catch(e){
+          if(_ttsSpeaking&&gen===_ttsGeneration){
+            _fail('OpenAI TTS error: '+(e&&e.message||e));
+          }
+        }
       }, function(e){
-        if(gen!==_ttsGeneration) return;
+        if(!_ttsSpeaking||gen!==_ttsGeneration) return;
         _fail('OpenAI TTS error: '+(e&&e.message||e));
       });
+    })
+    .catch(function(e){
+      // Terminal guard: any unexpected failure in this chunk's chain must
+      // clear speaking state, but only when this generation is still current.
+      if(_ttsSpeaking&&gen===_ttsGeneration){
+        _fail('OpenAI TTS error: '+(e&&e.message||e));
+      }
     });
   }
-  _playChunk(0);
+  try{ _playChunk(0); }
+  catch(e){ _fail('OpenAI TTS error: '+(e&&e.message||e)); }
 }
 
 // ── Shared AudioContext for TTS playback (no blob URLs needed) ──
