@@ -1584,6 +1584,12 @@ window.renderTranscript=function(container, messages, opts){
   // right after the stop/start boundary). Stale watchdogs compare against it
   // so a replacement playback never has the mic reopened underneath it.
   let _voiceTtsGenStart=0;
+  // Delayed mic rearm scheduled by a playback's terminal callbacks. Owned by
+  // the generation that scheduled it: a stale timer from playback A must not
+  // reopen the mic underneath a replacement playback B. Cleared on
+  // replacement/deactivation (defense in depth); the timer re-checks
+  // active+speaking+generation at execution time — the required guard.
+  let _voiceMicRearmTimer=null;
   // Configurable via localStorage keys (set from dev console or a future settings panel).
   //   hermes-voice-silence-ms, pause duration before auto-send (ms, default 1800)
   //   hermes-voice-continuous, keep mic open across natural pauses ("true"/"false", default false)
@@ -1601,6 +1607,26 @@ window.renderTranscript=function(container, messages, opts){
       clearTimeout(_browserTtsWatchdog);
       _browserTtsWatchdog=null;
     }
+  }
+
+  // Owner-aware delayed mic rearm for every playback terminal callback.
+  // Captures the playback generation at schedule time; when the timer fires
+  // it requires voice mode to still be active+speaking AND the same
+  // generation to still own TTS, so a stale terminal callback from playback
+  // A can never construct SpeechRecognition while a replacement playback B
+  // is starting. Replacement/deactivation clear it as defense in depth.
+  function _clearVoiceMicRearm(){
+    if(_voiceMicRearmTimer){ clearTimeout(_voiceMicRearmTimer); _voiceMicRearmTimer=null; }
+  }
+  function _scheduleVoiceMicRearm(delayMs){
+    const _gen=_ttsGeneration;
+    _clearVoiceMicRearm();
+    _voiceMicRearmTimer=setTimeout(function(){
+      _voiceMicRearmTimer=null;
+      if(!_voiceModeActive||_voiceModeState!=='speaking') return;
+      if(_ttsGeneration!==_gen) return;
+      _startListening();
+    },delayMs);
   }
 
   function _armBrowserTtsRecovery(clean, rate){
@@ -1786,6 +1812,7 @@ window.renderTranscript=function(container, messages, opts){
     // watchdog cannot reopen the mic under the new playback.
     if(typeof stopTTS==='function') stopTTS();
     _clearBrowserTtsRecovery();
+    _clearVoiceMicRearm();
     _browserTtsSuppressNextErrorRearm=false;
     // Snapshot for this turn's continuations (browser callbacks + watchdog):
     // any later stop/replacement invalidates it.
@@ -1817,27 +1844,27 @@ window.renderTranscript=function(container, messages, opts){
             URL.revokeObjectURL(url);
             if(!_owns()) return;
             _ttsSpeaking=false;
-            if(_voiceModeActive) setTimeout(function(){_startListening();},500);
+            _scheduleVoiceMicRearm(500);
           };
           audio.onerror=function(){
             if(_playingEdgeAudio===audio) _playingEdgeAudio=null;
             URL.revokeObjectURL(url);
             if(!_owns()) return;
             _ttsSpeaking=false;
-            if(_voiceModeActive) setTimeout(function(){_startListening();},1000);
+            _scheduleVoiceMicRearm(1000);
           };
           audio.play().catch(function(){
             if(_playingEdgeAudio===audio) _playingEdgeAudio=null;
             URL.revokeObjectURL(url);
             if(!_owns()) return;
             _ttsSpeaking=false;
-            if(_voiceModeActive) setTimeout(function(){_startListening();},1000);
+            _scheduleVoiceMicRearm(1000);
           });
         })
         .catch(function(){
           if(!_owns()) return;
           _ttsSpeaking=false;
-          if(_voiceModeActive) setTimeout(function(){_startListening();},1000);
+          _scheduleVoiceMicRearm(1000);
         });
       return;
     }
@@ -1864,27 +1891,27 @@ window.renderTranscript=function(container, messages, opts){
           URL.revokeObjectURL(url);
           if(!_owns()) return;
           _ttsSpeaking=false;
-          if(_voiceModeActive) setTimeout(()=>_startListening(),500);
+          _scheduleVoiceMicRearm(500);
         };
         audio.onerror = () => {
           if(_playingEdgeAudio===audio) _playingEdgeAudio=null;
           URL.revokeObjectURL(url);
           if(!_owns()) return;
           _ttsSpeaking=false;
-          if(_voiceModeActive) setTimeout(()=>_startListening(),1000);
+          _scheduleVoiceMicRearm(1000);
         };
         audio.play().catch(e => {
           if(_playingEdgeAudio===audio) _playingEdgeAudio=null;
           URL.revokeObjectURL(url);
           if(!_owns()) return;
           _ttsSpeaking=false;
-          if(_voiceModeActive) setTimeout(()=>_startListening(),1000);
+          _scheduleVoiceMicRearm(1000);
         });
       })
       .catch(() => {
         if(!_owns()) return;
         _ttsSpeaking=false;
-        if(_voiceModeActive) setTimeout(()=>_startListening(),1000);
+        _scheduleVoiceMicRearm(1000);
       });
       return;
     }
@@ -1910,27 +1937,27 @@ window.renderTranscript=function(container, messages, opts){
           URL.revokeObjectURL(url);
           if(!_owns()) return;
           _ttsSpeaking=false;
-          if(_voiceModeActive) setTimeout(()=>_startListening(),500);
+          _scheduleVoiceMicRearm(500);
         };
         audio.onerror = () => {
           if(_playingEdgeAudio===audio) _playingEdgeAudio=null;
           URL.revokeObjectURL(url);
           if(!_owns()) return;
           _ttsSpeaking=false;
-          if(_voiceModeActive) setTimeout(()=>_startListening(),1000);
+          _scheduleVoiceMicRearm(1000);
         };
         audio.play().catch(() => {
           if(_playingEdgeAudio===audio) _playingEdgeAudio=null;
           URL.revokeObjectURL(url);
           if(!_owns()) return;
           _ttsSpeaking=false;
-          if(_voiceModeActive) setTimeout(()=>_startListening(),1000);
+          _scheduleVoiceMicRearm(1000);
         });
       })
       .catch(() => {
         if(!_owns()) return;
         _ttsSpeaking=false;
-        if(_voiceModeActive) setTimeout(()=>_startListening(),1000);
+        _scheduleVoiceMicRearm(1000);
       });
       return;
     }
@@ -1964,27 +1991,27 @@ window.renderTranscript=function(container, messages, opts){
           URL.revokeObjectURL(url);
           if(!_owns()) return;
           _ttsSpeaking=false;
-          if(_voiceModeActive) setTimeout(()=>_startListening(),500);
+          _scheduleVoiceMicRearm(500);
         };
         audio.onerror = () => {
           if(_playingEdgeAudio===audio) _playingEdgeAudio=null;
           URL.revokeObjectURL(url);
           if(!_owns()) return;
           _ttsSpeaking=false;
-          if(_voiceModeActive) setTimeout(()=>_startListening(),1000);
+          _scheduleVoiceMicRearm(1000);
         };
         audio.play().catch(e => {
           if(_playingEdgeAudio===audio) _playingEdgeAudio=null;
           URL.revokeObjectURL(url);
           if(!_owns()) return;
           _ttsSpeaking=false;
-          if(_voiceModeActive) setTimeout(()=>_startListening(),1000);
+          _scheduleVoiceMicRearm(1000);
         });
       })
       .catch(() => {
         if(!_owns()) return;
         _ttsSpeaking=false;
-        if(_voiceModeActive) setTimeout(()=>_startListening(),1000);
+        _scheduleVoiceMicRearm(1000);
       });
       return;
     }
@@ -2009,7 +2036,7 @@ window.renderTranscript=function(container, messages, opts){
       _browserTtsSuppressNextErrorRearm=false;
       _clearBrowserTtsRecovery();
       // After speaking, go back to listening
-      if(_voiceModeActive&&_voiceModeState==='speaking') setTimeout(()=>_startListening(),500);
+      _scheduleVoiceMicRearm(500);
     };
     utter.onerror=()=>{
       if(_ttsGeneration!==_voiceGenStart) return;
@@ -2018,7 +2045,7 @@ window.renderTranscript=function(container, messages, opts){
         _browserTtsSuppressNextErrorRearm=false;
         return;
       }
-      if(_voiceModeActive) setTimeout(()=>_startListening(),1000);
+      _scheduleVoiceMicRearm(1000);
     };
 
     _armBrowserTtsRecovery(clean, utter.rate);
@@ -2026,7 +2053,7 @@ window.renderTranscript=function(container, messages, opts){
       speechSynthesis.speak(utter);
     }catch(_){
       _clearBrowserTtsRecovery();
-      if(_voiceModeActive) setTimeout(()=>_startListening(),1000);
+      _scheduleVoiceMicRearm(1000);
     }
   }
 
@@ -2094,6 +2121,7 @@ window.renderTranscript=function(container, messages, opts){
     bar.style.display='none';
     clearTimeout(_silenceTimer);
     _clearBrowserTtsRecovery();
+    _clearVoiceMicRearm();
     try{ if(_recognition) _recognition.abort(); }catch(_){}
     _recognition=null;
     if(typeof stopTTS==='function') stopTTS();
