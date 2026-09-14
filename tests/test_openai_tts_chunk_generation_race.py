@@ -1,65 +1,54 @@
-"""Behavioral race tests for the OpenAI-compatible TTS chunk chain.
+"""Behavioral race tests for the OpenAI-compatible TTS playback paths.
 
-Reviewer feedback (nesquena-hermes on #7529): `_ttsSpeaking` is a single
-global boolean and cannot distinguish playback A from playback B.  A
-stop→start gap lets a late fetch or `onended` callback from A resume the
-cancelled chain under B.  Round-3 review added four more objective blockers:
+Reviewer feedback (nesquena-hermes on #7529):
 
-  1. The prefetch pipeline must pace requests to the server's per-client
-     2 s TTS rate limit (api/routes.py _TtsRateLimiter) or a fast synthesis
-     makes the prefetched chunk N+1 hit HTTP 429 and playback stops after
-     chunk one.
-  2. Automatic replacement (autoReadLastAssistant calls _playOpenaiTts()
-     without stopping the current source) can overlap audio and lose the
-     active handle.
-  3. Synchronous Web Audio failures (createBufferSource/connect/start
-     throwing) must not leave speaking state dangling.
-  4. The behavioral driver must cover those schedules, not just
-     stop→start transitions.
+  * Round 2: `_ttsSpeaking` is a single global boolean and cannot distinguish
+    playback A from playback B — a stop→start gap lets a late fetch or
+    `onended` callback from A resume the cancelled chain under B.
+  * Round 3: prefetch must be paced to the server's per-client 2 s TTS rate
+    limit (api/routes.py _TtsRateLimiter); auto replacement must stop the
+    prior source; synchronous Web Audio failures must not dangle state.
+  * Round 4: pacing must be shared ACROSS generations and engines; automatic
+    replacement must go through the canonical stop boundary; terminal failure
+    must invalidate scheduled work.
+  * Round 5: every server-backed TTS request must go through one scheduler
+    that reserves/rechecks the shared slot at send time with a bounded,
+    owner-aware 429 retry; every playback engine and continuation needs one
+    generation/owner token; voice-mode `_speakResponse()` must enter the same
+    stop/start boundary; tests must drive the real base + voice-mode entry
+    points, all cross-engine pacing directions, and stale Edge/ElevenLabs/
+    extension completions after stop→start.
 
-Round-4 review added three more objective blockers:
+The driver extracts the REAL functions from static/ui.js and static/boot.js
+(`_playOpenaiTts`, `_playEdgeTtsChunked`, `_playElevenLabsTts`, `speakMessage`,
+`autoReadLastAssistant`, `_speakResponse`, the shared scheduler helpers, …)
+and runs them under node with controllable fetch promises, fake audio sources
+and a fake Audio element:
 
-  1. The pacing clock was per-playback: a replacement playback reset it to
-     zero and issued its first request inside the previous playback's
-     server window (HTTP 429). Pacing must be shared across playback
-     generations AND across engines (the server limiter is per-client, so
-     an Edge/ElevenLabs request occupies the same window).
-  2. Automatic replacement still bypassed the canonical stop boundary:
-     autoReadLastAssistant() dispatched straight to each engine, so
-     browser speech was not cancelled and manual buttons stayed stuck in
-     the speaking state.
-  3. Terminal failure could still launch a later network request: the
-     prefetch timer was created before decode/construct/start succeeded,
-     and `_fail` did not invalidate the generation, so a paced timer could
-     fire a follow-on request after a terminal error. `AudioContext.resume()`
-     rejection was also unobserved.
-
-These tests drive the real extracted functions under node with controllable
-fetch promises and fake audio sources and assert the generation/pacing/
-ownership guards:
-
-  1. Start A, leave its first fetch pending, stop A, start B, then resolve
-     A; assert no A source starts. B's first request must wait for the
-     pacing window instead of issuing immediately.
-  2. Start A, prefetch A2 (paced), stop A, start B, fire A1 `onended`;
-     assert A2 never issues a request and B remains the active source.
-  3. Reject an abandoned prefetch and assert there is no
-     `unhandledrejection` (prefetches settle into {ok}/{err} immediately).
-  4. Automatic replacement: play A, call _playOpenaiTts() for B with no
-     intervening stop; assert A is stopped, B's first request is paced,
-     B owns the active handle, a stale A `onended` cannot erase B, and a
-     later stopTTS() stops B.
-  5. Synchronous AudioContext/source failures clear speaking state via the
-     terminal handler, and no follow-on request fires past the pacing
-     window (failure-matrix).
-  6. A prior request from another TTS engine occupies the client window:
-     the first OpenAI request waits instead of issuing immediately.
-  7. decodeAudioData error: terminal handler clears state and zero
-     follow-on requests fire past the pacing window.
-  8. AudioContext.resume() rejection is observed and routed to the
-     terminal handler, with zero follow-on requests.
-  9. HTTP 429 is retried (bounded) after the pacing window and playback
-     succeeds.
+  1-3.  generation guards across stop→start / prefetch pacing / no unhandled
+        rejections for abandoned prefetches.
+  4-5.  direct replacement stops the prior source and keeps ownership;
+        synchronous Web Audio failures are terminal, zero follow-on requests.
+  6.    cross-engine pacing both directions through the real engine paths
+        (Edge→OpenAI, OpenAI→Edge).
+  7-10. decode failure, resume rejection, bounded 429 retry, start() throw.
+  11.   real base entry point: autoReadLastAssistant() replaces an active
+        Edge playback — canonical boundary, paced OpenAI request, stale Edge
+        completion cannot start audio or clobber the new owner.
+  12.   real voice-mode entry point: _speakResponse() replaces an active
+        OpenAI playback — stop boundary, paced request, stale completion
+        cannot clear the new playback's handle.
+  13-14. remaining cross-engine pacing directions (OpenAI↔ElevenLabs,
+        ElevenLabs↔Edge) plus voice-mode after a live Edge request, with a
+        stale voice fetch that must not start audio.
+  15.   stale ElevenLabs completion after stop→start must not decode/start,
+        and a stale started source's late onended must not clear the newer
+        playback's handle/state (_playAudioBuf cleanup ownership guard).
+  16.   stale extension-engine synth completion after stop→start.
+  17.   bounded 429 retry on the Edge and ElevenLabs senders.
+  18.   voice-mode browser playback: a replaced utterance's late onend must
+        not reopen the mic, and a stale watchdog must not fire after a
+        replacement claimed the turn.
 """
 from __future__ import annotations
 
@@ -76,27 +65,28 @@ NODE = shutil.which("node")
 _DRIVER = r'''
 const fs = require('fs');
 const ui = fs.readFileSync(process.argv[2], 'utf8');
+const boot = fs.readFileSync(process.argv[3], 'utf8');
 
-function extractFunction(name) {
+function extractFunction(src, name) {
   const re = new RegExp('function\\s+' + name + '\\s*\\(');
-  const start = ui.search(re);
+  const start = src.search(re);
   if (start < 0) throw new Error(name + ' not found');
-  let i = ui.indexOf('{', ui.indexOf(')', start));
+  let i = src.indexOf('{', src.indexOf(')', start));
   let depth = 1;
   i += 1;
-  while (depth > 0 && i < ui.length) {
-    if (ui[i] === '{') depth += 1;
-    else if (ui[i] === '}') depth -= 1;
+  while (depth > 0 && i < src.length) {
+    if (src[i] === '{') depth += 1;
+    else if (src[i] === '}') depth -= 1;
     i += 1;
   }
-  return ui.slice(start, i);
+  return src.slice(start, i);
 }
 
-// ---- module-level state the extracted functions touch ----
+// ---- module-level state the extracted ui.js functions touch ----
 let _ttsSpeaking = false;
 let _ttsGeneration = 0;
-let _openaiTtsMinGapMs = 2000;
-let _openaiTtsLastRequestTs = 0;
+let _ttsRequestMinGapMs = 2000;
+let _ttsLastRequestTs = 0;
 let _ttsCurrentUtterance = null;
 let _ttsChunkQueue = [];
 let _ttsChunkIndex = 0;
@@ -104,21 +94,32 @@ let _ttsActiveBtn = null;
 let _playingEdgeAudio = null;
 let _ttsAudioCtx = null;
 
+// ---- stand-ins for the boot.js voice-mode closure ----
+let _voiceModeActive = false;
+let _voiceModeState = 'idle';
+let _voiceModeThinkingSid = null;
+let _voiceTtsGenStart = 0;
+let _browserTtsKeepAlive = null;
+let _browserTtsWatchdog = null;
+let _browserTtsSuppressNextErrorRearm = false;
+let _startListeningCalls = 0;
+function _startListening(){ _startListeningCalls++; }
+function _setState(state){ _voiceModeState = state; }
+const S = { session: { session_id: 's1' } };
+function t(key){ return key; }
+
 // ---- controllable fakes ----
 const toasts = [];
-function showToast(msg) { toasts.push(msg); }
+function showToast(msg){ toasts.push(String(msg)); }
 
 let fetchCalls = [];
-function resetFetch() { fetchCalls = []; }
-globalThis.fetch = function (url, opts) {
-  return new Promise((resolve, reject) => {
-    fetchCalls.push({ resolve, reject, url, opts });
-  });
+globalThis.fetch = function(url, opts){
+  return new Promise((resolve, reject) => { fetchCalls.push({ resolve, reject, url, opts }); });
 };
 
 const startedSources = [];
 class FakeAudioContext {
-  constructor() {
+  constructor(){
     this.state = 'running';
     this.destination = {};
     this._decode = null;
@@ -127,81 +128,148 @@ class FakeAudioContext {
     this.throwOnStart = false;
     this.rejectResume = false;
   }
-  resume() {
+  resume(){
     if (this.rejectResume) return Promise.reject(new Error('resume denied'));
     this.state = 'running';
     return Promise.resolve();
   }
-  decodeAudioData(buf, ok, err) { this.decodeCalls += 1; this._decode = { ok, err }; }
-  createBufferSource() {
+  decodeAudioData(buf, ok, err){ this.decodeCalls += 1; this._decode = { ok, err }; }
+  createBufferSource(){
     if (this.throwOnCreateSource) throw new Error('boom: createBufferSource');
     const ctx = this;
     const src = {
       buffer: null,
-      connect() {},
-      start() {
-        if (ctx.throwOnStart) throw new Error('boom: start');
-        this.started = true;
-      },
-      stop() { this.stopped = true; },
-      disconnect() { this.disconnected = true; },
+      connect(){},
+      start(){ if (ctx.throwOnStart) throw new Error('boom: start'); this.started = true; },
+      stop(){ this.stopped = true; },
+      disconnect(){ this.disconnected = true; },
       onended: null,
     };
     startedSources.push(src);
     return src;
   }
 }
-const window = { AudioContext: FakeAudioContext };
-const document = { baseURI: 'http://localhost/', querySelectorAll() { return []; } };
-const location = { href: 'http://localhost/' };
 
-eval(['_splitForTTS', '_playOpenaiTts', '_getTtsAudioCtx', '_playAudioBuf', 'stopTTS', '_noteTtsRequestSent']
-  .map(extractFunction).join('\n'));
+const audioEls = [];
+class FakeAudio {
+  constructor(url){
+    this.url = url; this.played = false; this.paused = false;
+    this.onended = null; this.onerror = null; this.currentTime = 0;
+    audioEls.push(this);
+  }
+  play(){ this.played = true; return Promise.resolve(); }
+  pause(){ this.paused = true; }
+}
+const Audio = FakeAudio;
+
+let _urlCounter = 0;
+class FakeURL {
+  constructor(path, base){ this.href = (base || '') + path; }
+}
+FakeURL.createObjectURL = () => 'blob:fake-' + (++_urlCounter);
+FakeURL.revokeObjectURL = () => {};
+const URL = FakeURL;
+class Blob { constructor(parts){ this.parts = parts; } }
+
+const speechSynthesis = {
+  cancelCalls: 0, speakCalls: [], speaking: false,
+  cancel(){ this.cancelCalls += 1; },
+  speak(u){ this.speakCalls.push(u); this.speaking = true; },
+  getVoices(){ return []; },
+  pause(){}, resume(){},
+};
+class FakeUtterance {
+  constructor(text){
+    this.text = text; this.onend = null; this.onerror = null;
+    this.rate = 1; this.pitch = 1; this.voice = null;
+  }
+}
+const SpeechSynthesisUtterance = FakeUtterance;
+
+const _ls = {};
+const localStorage = {
+  getItem(k){ return Object.prototype.hasOwnProperty.call(_ls, k) ? _ls[k] : null; },
+  setItem(k, v){ _ls[k] = String(v); },
+};
+
+let domRows = [];
+let speakingBtns = [];
+const document = {
+  baseURI: 'http://localhost/',
+  querySelectorAll(sel){
+    if (sel.indexOf('data-speaking') >= 0) return speakingBtns;
+    if (sel.indexOf('assistant') >= 0) return domRows;
+    return [];
+  },
+};
+const location = { href: 'http://localhost/' };
+const window = {
+  AudioContext: FakeAudioContext,
+  speechSynthesis,
+  _hermesTtsIsRegistered: () => false,
+  _hermesTtsSynth: () => Promise.resolve(new ArrayBuffer(8)),
+};
+
+eval(['_splitForTTS', '_stripForTTS', '_beginTtsPlayback', '_ownsTtsPlayback', '_noteTtsRequestSent',
+  '_ttsRequestWaitMs', '_acquireTtsRequestSlot', '_sendTtsRequest', '_stopActivePlaybackAudio',
+  '_getTtsAudioCtx', '_playAudioBuf', '_playOpenaiTts', '_playEdgeTtsChunked', '_playElevenLabsTts',
+  'speakMessage', 'autoReadLastAssistant', 'stopTTS']
+  .map((n) => extractFunction(ui, n)).join('\n'));
+eval(['_speakResponse', '_armBrowserTtsRecovery', '_clearBrowserTtsRecovery']
+  .map((n) => extractFunction(boot, n)).join('\n'));
 
 const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
-
-function resetState() {
-  _ttsSpeaking = false; _ttsGeneration = 0; _ttsCurrentUtterance = null;
-  _ttsChunkQueue = []; _ttsChunkIndex = 0; _ttsActiveBtn = null;
-  _playingEdgeAudio = null; _ttsAudioCtx = null;
-  _openaiTtsLastRequestTs = 0;
-  toasts.length = 0; fetchCalls.length = 0; startedSources.length = 0;
-}
-
+function fakeBtn(){ return { dataset: {} }; }
+function fakeMsgBtn(text){ const row = { dataset: { rawText: text } }; return { dataset: {}, closest: () => row }; }
 const longText = Array(60).fill('这是一段足够长的用于测试分块播放的中文文本段落。').join('');
-const okResp = () => Promise.resolve({ ok: true, arrayBuffer: () => Promise.resolve(new ArrayBuffer(8)) });
+const okResp = () => Promise.resolve({ ok: true, status: 200, arrayBuffer: () => Promise.resolve(new ArrayBuffer(8)) });
 const rateLimitedResp = () => Promise.resolve({ ok: false, status: 429, json: () => Promise.resolve({}) });
+
+function resetState(){
+  _ttsSpeaking = false; _ttsGeneration = 0; _ttsRequestMinGapMs = 200; _ttsLastRequestTs = 0;
+  _ttsCurrentUtterance = null; _ttsChunkQueue = []; _ttsChunkIndex = 0; _ttsActiveBtn = null;
+  _playingEdgeAudio = null; _ttsAudioCtx = null;
+  _voiceModeActive = false; _voiceModeState = 'idle'; _voiceModeThinkingSid = null;
+  _voiceTtsGenStart = 0;
+  if (_browserTtsWatchdog) { clearTimeout(_browserTtsWatchdog); _browserTtsWatchdog = null; }
+  if (_browserTtsKeepAlive) { clearInterval(_browserTtsKeepAlive); _browserTtsKeepAlive = null; }
+  _browserTtsSuppressNextErrorRearm = false; _startListeningCalls = 0;
+  toasts.length = 0; fetchCalls.length = 0; startedSources.length = 0; audioEls.length = 0;
+  domRows = []; speakingBtns = [];
+  speechSynthesis.cancelCalls = 0; speechSynthesis.speakCalls.length = 0; speechSynthesis.speaking = false;
+  for (const k of Object.keys(_ls)) delete _ls[k];
+  window._hermesTtsIsRegistered = () => false;
+  window._hermesTtsSynth = () => Promise.resolve(new ArrayBuffer(8));
+}
 
 // 1. Start A, leave its first fetch pending, stop A, start B, resolve A.
 //    The generation guard must stop A's chain before it reaches the
 //    AudioContext; resolving A's fetch must NOT create a context or issue
 //    a decode. Only B may decode — and B's first request must wait for
-//    the pacing window (shared clock), not issue immediately inside A's
-//    server cooldown.
+//    the shared pacing window, not issue immediately inside A's cooldown.
 function scenario1() {
   resetState();
-  _openaiTtsMinGapMs = 200;
-  _playOpenaiTts('AAAA', { dataset: {} });
-  if (fetchCalls.length !== 1) throw new Error('s1: A fetch not issued');
-  stopTTS();
-  _playOpenaiTts('BB', { dataset: {} });
-  if (fetchCalls.length !== 1) {
-    throw new Error('s1: B issued during A cooldown (calls=' + fetchCalls.length + ')');
-  }
-  fetchCalls[0].resolve(okResp());                       // late A1 response
-  return sleep(30).then(() => {
-    if (_ttsAudioCtx !== null) {
-      throw new Error('s1: A resumed the chain after stop->start');
+  _playOpenaiTts('AAAA', fakeBtn());
+  return sleep(0).then(() => {
+    if (fetchCalls.length !== 1) throw new Error('s1: A fetch not issued');
+    stopTTS();
+    _playOpenaiTts('BB', fakeBtn());
+    return sleep(0);
+  }).then(() => {
+    if (fetchCalls.length !== 1) {
+      throw new Error('s1: B issued during A cooldown (calls=' + fetchCalls.length + ')');
     }
-    if (startedSources.length !== 0) {
-      throw new Error('s1: A source started after stop->start');
-    }
-    return sleep(250);                                   // pacing window passes
+    fetchCalls[0].resolve(okResp());
+    return sleep(30);
+  }).then(() => {
+    if (_ttsAudioCtx !== null) throw new Error('s1: A resumed the chain after stop->start');
+    if (startedSources.length !== 0) throw new Error('s1: A source started after stop->start');
+    return sleep(250);
   }).then(() => {
     if (fetchCalls.length !== 2) {
       throw new Error('s1: B fetch not issued after cooldown (calls=' + fetchCalls.length + ')');
     }
-    fetchCalls[1].resolve(okResp());           // B decodes normally
+    fetchCalls[1].resolve(okResp());
     return sleep(30);
   }).then(() => {
     if (_ttsAudioCtx === null || _ttsAudioCtx.decodeCalls !== 1) {
@@ -215,43 +283,44 @@ function scenario1() {
   });
 }
 
-// 2. Start A, resolve A1, prefetch A2 (request must be paced to the
-//    server rate window), stop A, start B, fire A1 onended, then let the
-//    stale A2 prefetch lapse: assert A2 is never requested, never decoded,
-//    and B remains the active source. B's own first request is paced too.
+// 2. Start A, resolve A1, prefetch A2 (request must be paced to the shared
+//    rate window), stop A, start B, fire A1 onended, then let the stale A2
+//    prefetch lapse: assert A2 is never requested, never decoded, and B
+//    remains the active source. B's own first request is paced too.
 function scenario2() {
   resetState();
-  _openaiTtsMinGapMs = 200;
-  _playOpenaiTts(longText, { dataset: {} });           // fetch A1 (call 0)
-  fetchCalls[0].resolve(okResp());
-  return sleep(30).then(() => {
+  _playOpenaiTts(longText, fakeBtn());           // fetch A1 (call 0)
+  return sleep(0).then(() => {
+    fetchCalls[0].resolve(okResp());
+    return sleep(30);
+  }).then(() => {
     if (fetchCalls.length !== 1) {
       throw new Error('s2: A2 prefetch was not paced (calls=' + fetchCalls.length + ')');
     }
     const ctxA = _ttsAudioCtx;
     if (!ctxA || !ctxA._decode) throw new Error('s2: A decode not requested');
-    ctxA._decode.ok({});                              // A1 plays; src0 started
+    ctxA._decode.ok({});                           // A1 plays; src0 started
     if (startedSources.length !== 1) throw new Error('s2: A1 source missing');
     stopTTS();
-    _playOpenaiTts('B', { dataset: {} });
-    if (fetchCalls.length !== 1) {
-      throw new Error('s2: B issued during A cooldown (calls=' + fetchCalls.length + ')');
-    }
-    startedSources[0].onended();                      // late A1 onended
-    return sleep(250);                                // pacing window passes
+    _playOpenaiTts('B', fakeBtn());
+    return sleep(0).then(() => {
+      if (fetchCalls.length !== 1) {
+        throw new Error('s2: B issued during A cooldown (calls=' + fetchCalls.length + ')');
+      }
+      startedSources[0].onended();                 // late A1 onended
+      return sleep(250);
+    });
   }).then(() => {
-    // A2's paced timer must have fired but found the generation stale.
-    // B's request goes out only after its own pacing wait.
     if (fetchCalls.length !== 2) {
       throw new Error('s2: unexpected fetch after stop->start (calls=' + fetchCalls.length + ')');
     }
-    fetchCalls[1].resolve(okResp());                  // B plays: then → decodeAudioData
+    fetchCalls[1].resolve(okResp());               // B plays: then -> decodeAudioData
     return sleep(30);
   }).then(() => {
     if (_ttsAudioCtx.decodeCalls !== 2) {
       throw new Error('s2: abandoned A2 was decoded after stop->start (calls=' + _ttsAudioCtx.decodeCalls + ')');
     }
-    _ttsAudioCtx._decode.ok({});                      // B plays; src1 started
+    _ttsAudioCtx._decode.ok({});                   // B plays; src1 started
     if (startedSources.length !== 2) {
       throw new Error('s2: unexpected extra source started: ' + startedSources.length);
     }
@@ -265,20 +334,21 @@ function scenario2() {
 // 3. Reject an abandoned prefetch; no unhandled rejection, no toast.
 function scenario3() {
   resetState();
-  _openaiTtsMinGapMs = 200;
   const unhandled = [];
   const onUnhandled = (e) => { unhandled.push(e); };
   process.on('unhandledRejection', onUnhandled);
-  _playOpenaiTts(longText, { dataset: {} });
-  fetchCalls[0].resolve(okResp());
-  return sleep(30).then(() => {
-    _ttsAudioCtx._decode.ok({});                      // A1 plays; A2 prefetch paced
+  _playOpenaiTts(longText, fakeBtn());
+  return sleep(0).then(() => {
+    fetchCalls[0].resolve(okResp());
+    return sleep(30);
+  }).then(() => {
+    _ttsAudioCtx._decode.ok({});                   // A1 plays; A2 prefetch paced
     if (fetchCalls.length !== 1) throw new Error('s3: A2 prefetch not paced');
-    return sleep(250);                                // A2 request goes out
+    return sleep(250);                             // A2 request goes out
   }).then(() => {
     if (fetchCalls.length !== 2) throw new Error('s3: A2 prefetch missing');
     stopTTS();
-    fetchCalls[1].reject(new Error('network down'));  // abandon the prefetch
+    fetchCalls[1].reject(new Error('network down')); // abandon the prefetch
     return sleep(30);
   }).then(() => {
     process.removeListener('unhandledRejection', onUnhandled);
@@ -288,47 +358,49 @@ function scenario3() {
   });
 }
 
-// 4. Automatic replacement without an intervening stop: A is playing,
-//    _playOpenaiTts() starts B directly (the autoReadLastAssistant path).
-//    A must be stopped/released, B's first request paced, B owns the
-//    active handle, a stale A1 onended must not erase B, and a later
-//    stopTTS() stops B.
+// 4. Direct replacement without an intervening stop: A is playing,
+//    _playOpenaiTts() starts B directly (the auto-read shape). A must be
+//    stopped/released, B's first request paced, B owns the active handle, a
+//    stale A1 onended must not erase B, and a later stopTTS() stops B.
 function scenario4() {
   resetState();
-  _openaiTtsMinGapMs = 200;
-  _playOpenaiTts(longText, { dataset: {} });          // A: fetch A1 (call 0)
-  fetchCalls[0].resolve(okResp());
-  return sleep(30).then(() => {
+  _playOpenaiTts(longText, fakeBtn());          // A: fetch A1 (call 0)
+  return sleep(0).then(() => {
+    fetchCalls[0].resolve(okResp());
+    return sleep(30);
+  }).then(() => {
     if (fetchCalls.length !== 1) throw new Error('s4: A2 not paced yet');
-    _ttsAudioCtx._decode.ok({});                      // A1 plays; src0 started
+    _ttsAudioCtx._decode.ok({});                // A1 plays; src0 started
     if (startedSources.length !== 1) throw new Error('s4: A1 source missing');
-    _playOpenaiTts('BBBB', { dataset: {} });          // auto-replace, no stop
-    if (fetchCalls.length !== 1) {
-      throw new Error('s4: B issued during A cooldown (calls=' + fetchCalls.length + ')');
-    }
+    _playOpenaiTts('BBBB', fakeBtn());          // direct replacement, no stop
     if (!startedSources[0].stopped) throw new Error('s4: A source not stopped on replacement');
     if (!startedSources[0].disconnected) throw new Error('s4: A source not disconnected on replacement');
-    startedSources[0].onended();                      // stale A1 onended before B owns handle
-    return sleep(250);                                // pacing window passes
+    return sleep(0).then(() => {
+      if (fetchCalls.length !== 1) {
+        throw new Error('s4: B issued during A cooldown (calls=' + fetchCalls.length + ')');
+      }
+      startedSources[0].onended();              // stale A1 onended before B owns handle
+      return sleep(250);                        // pacing window passes
+    });
   }).then(() => {
     if (fetchCalls.length !== 2) {
       throw new Error('s4: B fetch not issued after cooldown (calls=' + fetchCalls.length + ')');
     }
-    fetchCalls[1].resolve(okResp());                  // B decodes
+    fetchCalls[1].resolve(okResp());            // B decodes
     return sleep(30);
   }).then(() => {
     if (_ttsAudioCtx.decodeCalls !== 2) {
       throw new Error('s4: decode calls != A1+B1: ' + _ttsAudioCtx.decodeCalls);
     }
-    _ttsAudioCtx._decode.ok({});                      // B plays; src1 started
-    startedSources[0].onended();                      // stale A1 onended after B owns handle
+    _ttsAudioCtx._decode.ok({});                // B plays; src1 started
+    startedSources[0].onended();                // stale A1 onended after B owns handle
     if (_playingEdgeAudio !== startedSources[1]) {
       throw new Error('s4: B does not own the active handle');
     }
     if (startedSources.length !== 2) {
       throw new Error('s4: extra source started: ' + startedSources.length);
     }
-    stopTTS();                                        // must reach B
+    stopTTS();                                  // must reach B
     if (!startedSources[1].stopped) throw new Error('s4: stopTTS did not stop B');
     return 'PASS';
   });
@@ -340,23 +412,24 @@ function scenario4() {
 //    follow-on request may fire past the pacing window (failure-matrix).
 function scenario5() {
   resetState();
-  _openaiTtsMinGapMs = 200;
   const unhandled = [];
   const onUnhandled = (e) => { unhandled.push(e); };
   process.on('unhandledRejection', onUnhandled);
-  _playOpenaiTts(longText, { dataset: {} });
-  fetchCalls[0].resolve(okResp());
-  return sleep(30).then(() => {
+  _playOpenaiTts(longText, fakeBtn());
+  return sleep(0).then(() => {
+    fetchCalls[0].resolve(okResp());
+    return sleep(30);
+  }).then(() => {
     if (!_ttsAudioCtx || !_ttsAudioCtx._decode) throw new Error('s5: decode not requested');
     _ttsAudioCtx.throwOnCreateSource = true;
-    _ttsAudioCtx._decode.ok({});                      // synchronous throw inside callback
+    _ttsAudioCtx._decode.ok({});                // synchronous throw inside callback
     return sleep(30);
   }).then(() => {
     if (_ttsSpeaking !== false) throw new Error('s5: speaking state left dangling');
     if (_playingEdgeAudio !== null) throw new Error('s5: active handle not cleared');
     if (toasts.length === 0) throw new Error('s5: no error toast');
     if (startedSources.length !== 0) throw new Error('s5: a source started despite failure');
-    return sleep(300);                                // advance past the pacing window
+    return sleep(300);                          // advance past the pacing window
   }).then(() => {
     process.removeListener('unhandledRejection', onUnhandled);
     if (unhandled.length !== 0) throw new Error('s5: unhandled rejection: ' + unhandled[0]);
@@ -367,20 +440,44 @@ function scenario5() {
   });
 }
 
-// 6. A prior request from another TTS engine (Edge/ElevenLabs) occupies
-//    the client-wide server window: the first OpenAI request must wait
-//    for the pacing window instead of issuing immediately.
+// 6. Cross-engine pacing through the REAL engine paths, both directions:
+//    (a) a real Edge playback issues its request, then an OpenAI playback
+//        starts inside the window and must wait;
+//    (b) the reverse — an OpenAI request occupies the slot and the next real
+//        Edge playback must wait for it. (The round-4 review flagged that
+//        the previous scenario manually assigned the pacing timestamp; this
+//        one drives the actual Edge/OpenAI request paths.)
 function scenario6() {
   resetState();
-  _openaiTtsMinGapMs = 200;
-  _openaiTtsLastRequestTs = Date.now();               // e.g. Edge engine request just went out
-  _playOpenaiTts('AAAA', { dataset: {} });
-  if (fetchCalls.length !== 0) {
-    throw new Error('s6: first request issued during another engine cooldown');
-  }
-  return sleep(250).then(() => {
+  _playEdgeTtsChunked('AAAA', fakeBtn());      // Edge fetch0: window free -> immediate
+  return sleep(0).then(() => {
+    if (fetchCalls.length !== 1) throw new Error('s6: edge request not issued');
+    fetchCalls[0].resolve(okResp());           // edge chunk plays
+    return sleep(30);
+  }).then(() => {
+    if (audioEls.length !== 1 || !audioEls[0].played) throw new Error('s6: edge audio not playing');
+    _playOpenaiTts('BB', fakeBtn());           // OpenAI start inside edge cooldown
+    return sleep(0);
+  }).then(() => {
     if (fetchCalls.length !== 1) {
-      throw new Error('s6: request not issued after cooldown (calls=' + fetchCalls.length + ')');
+      throw new Error('s6: openai issued during edge cooldown (calls=' + fetchCalls.length + ')');
+    }
+    return sleep(250);                         // window passes
+  }).then(() => {
+    if (fetchCalls.length !== 2) {
+      throw new Error('s6: openai request not issued after cooldown (calls=' + fetchCalls.length + ')');
+    }
+    // (b) reverse direction: a new Edge playback inside the openai cooldown
+    _playEdgeTtsChunked('CC', fakeBtn());
+    return sleep(0).then(() => {
+      if (fetchCalls.length !== 2) {
+        throw new Error('s6: edge#2 issued during openai cooldown (calls=' + fetchCalls.length + ')');
+      }
+      return sleep(250);
+    });
+  }).then(() => {
+    if (fetchCalls.length !== 3) {
+      throw new Error('s6: edge#2 request not issued after cooldown (calls=' + fetchCalls.length + ')');
     }
     return 'PASS';
   });
@@ -390,13 +487,14 @@ function scenario6() {
 //    toasts, and zero follow-on requests fire past the pacing window.
 function scenario7() {
   resetState();
-  _openaiTtsMinGapMs = 200;
   const unhandled = [];
   const onUnhandled = (e) => { unhandled.push(e); };
   process.on('unhandledRejection', onUnhandled);
-  _playOpenaiTts(longText, { dataset: {} });
-  fetchCalls[0].resolve(okResp());
-  return sleep(30).then(() => {
+  _playOpenaiTts(longText, fakeBtn());
+  return sleep(0).then(() => {
+    fetchCalls[0].resolve(okResp());
+    return sleep(30);
+  }).then(() => {
     if (!_ttsAudioCtx || !_ttsAudioCtx._decode) throw new Error('s7: decode not requested');
     _ttsAudioCtx._decode.err(new Error('decode boom')); // decode failure path
     return sleep(30);
@@ -404,7 +502,7 @@ function scenario7() {
     if (_ttsSpeaking !== false) throw new Error('s7: speaking state left dangling');
     if (_playingEdgeAudio !== null) throw new Error('s7: active handle not cleared');
     if (toasts.length === 0) throw new Error('s7: no error toast');
-    return sleep(300);                                // advance past the pacing window
+    return sleep(300);                          // advance past the pacing window
   }).then(() => {
     process.removeListener('unhandledRejection', onUnhandled);
     if (unhandled.length !== 0) throw new Error('s7: unhandled rejection: ' + unhandled[0]);
@@ -419,24 +517,25 @@ function scenario7() {
 //    routed to the terminal handler; zero follow-on requests.
 function scenario8() {
   resetState();
-  _openaiTtsMinGapMs = 200;
   const unhandled = [];
   const onUnhandled = (e) => { unhandled.push(e); };
   process.on('unhandledRejection', onUnhandled);
-  _playOpenaiTts(longText, { dataset: {} });
-  fetchCalls[0].resolve(okResp());
-  return sleep(30).then(() => {
+  _playOpenaiTts(longText, fakeBtn());
+  return sleep(0).then(() => {
+    fetchCalls[0].resolve(okResp());
+    return sleep(30);
+  }).then(() => {
     if (!_ttsAudioCtx || !_ttsAudioCtx._decode) throw new Error('s8: decode not requested');
     _ttsAudioCtx.state = 'suspended';
     _ttsAudioCtx.rejectResume = true;
-    _ttsAudioCtx._decode.ok({});                      // doStart waits on resume()
+    _ttsAudioCtx._decode.ok({});                // doStart waits on resume()
     return sleep(30);
   }).then(() => {
     if (_ttsSpeaking !== false) throw new Error('s8: speaking state left dangling');
     if (_playingEdgeAudio !== null) throw new Error('s8: active handle not cleared');
     if (toasts.length === 0) throw new Error('s8: no error toast');
     if (startedSources.length !== 0) throw new Error('s8: source started despite resume rejection');
-    return sleep(300);                                // advance past the pacing window
+    return sleep(300);                          // advance past the pacing window
   }).then(() => {
     process.removeListener('unhandledRejection', onUnhandled);
     if (unhandled.length !== 0) throw new Error('s8: unhandled rejection: ' + unhandled[0]);
@@ -451,23 +550,24 @@ function scenario8() {
 //    succeeds on the retry and no error toast is shown.
 function scenario9() {
   resetState();
-  _openaiTtsMinGapMs = 200;
-  _playOpenaiTts(longText, { dataset: {} });
-  if (fetchCalls.length !== 1) throw new Error('s9: first fetch not issued');
-  fetchCalls[0].resolve(rateLimitedResp());           // server window still open
-  return sleep(300).then(() => {                      // retry after pacing window
+  _playOpenaiTts(longText, fakeBtn());
+  return sleep(0).then(() => {
+    if (fetchCalls.length !== 1) throw new Error('s9: first fetch not issued');
+    fetchCalls[0].resolve(rateLimitedResp());   // server window still open
+    return sleep(300);                          // retry after pacing window
+  }).then(() => {
     if (fetchCalls.length !== 2) {
       throw new Error('s9: no retry after 429 (calls=' + fetchCalls.length + ')');
     }
     if (toasts.length !== 0) throw new Error('s9: error toast on retriable 429: ' + toasts[0]);
-    fetchCalls[1].resolve(okResp());                  // retry succeeds
+    fetchCalls[1].resolve(okResp());            // retry succeeds
     return sleep(30);
   }).then(() => {
     if (!_ttsAudioCtx || _ttsAudioCtx.decodeCalls !== 1) {
       throw new Error('s9: retried chunk not decoded (calls=' +
         (_ttsAudioCtx && _ttsAudioCtx.decodeCalls) + ')');
     }
-    _ttsAudioCtx._decode.ok({});                      // plays; src0 started
+    _ttsAudioCtx._decode.ok({});                // plays; src0 started
     if (startedSources.length !== 1) {
       throw new Error('s9: source not started after retry: ' + startedSources.length);
     }
@@ -482,16 +582,17 @@ function scenario9() {
 //     requests past the pacing window.
 function scenario10() {
   resetState();
-  _openaiTtsMinGapMs = 200;
   const unhandled = [];
   const onUnhandled = (e) => { unhandled.push(e); };
   process.on('unhandledRejection', onUnhandled);
-  _playOpenaiTts(longText, { dataset: {} });
-  fetchCalls[0].resolve(okResp());
-  return sleep(30).then(() => {
+  _playOpenaiTts(longText, fakeBtn());
+  return sleep(0).then(() => {
+    fetchCalls[0].resolve(okResp());
+    return sleep(30);
+  }).then(() => {
     if (!_ttsAudioCtx || !_ttsAudioCtx._decode) throw new Error('s10: decode not requested');
     _ttsAudioCtx.throwOnStart = true;
-    _ttsAudioCtx._decode.ok({});                      // src created; start() throws
+    _ttsAudioCtx._decode.ok({});                // src created; start() throws
     return sleep(30);
   }).then(() => {
     if (startedSources.length !== 1) throw new Error('s10: source was not created');
@@ -500,7 +601,7 @@ function scenario10() {
     if (_ttsSpeaking !== false) throw new Error('s10: speaking state left dangling');
     if (_playingEdgeAudio !== null) throw new Error('s10: active handle not cleared');
     if (toasts.length === 0) throw new Error('s10: no error toast');
-    return sleep(300);                                // advance past the pacing window
+    return sleep(300);                          // advance past the pacing window
   }).then(() => {
     process.removeListener('unhandledRejection', onUnhandled);
     if (unhandled.length !== 0) throw new Error('s10: unhandled rejection: ' + unhandled[0]);
@@ -511,12 +612,392 @@ function scenario10() {
   });
 }
 
-const scenario = process.argv[3];
+// 11. Production-composed base entry point: autoReadLastAssistant() (the real
+//     ui.js function) replaces an ACTIVE Edge playback. Asserts the canonical
+//     stop boundary (edge audio released, speaking buttons reset), that the
+//     OpenAI request is paced behind the edge request, and that the stale
+//     Edge continuation can neither start audio, issue a follow-on request,
+//     nor clobber the new playback.
+function scenario11() {
+  resetState();
+  let autoReadFetchIdx = -1;
+  const btn = fakeBtn();
+  _playEdgeTtsChunked(longText, btn);          // Edge fetch0: immediate
+  return sleep(0).then(() => {
+    fetchCalls[0].resolve(okResp());
+    return sleep(30);
+  }).then(() => {
+    if (audioEls.length !== 1) throw new Error('s11: edge audio missing');
+    if (!audioEls[0].played) throw new Error('s11: edge audio not playing');
+    btn.dataset.speaking = '1';
+    speakingBtns = [btn];
+    _ls['hermes-tts-engine'] = 'openai';
+    _ls['hermes-tts-auto-read'] = 'true';
+    domRows = [{ dataset: { rawText: 'a short auto-read reply' } }];
+    autoReadFetchIdx = fetchCalls.length;
+    autoReadLastAssistant();                   // the real base entry point
+    if (!audioEls[0].paused) throw new Error('s11: edge audio not released by the stop boundary');
+    if (btn.dataset.speaking !== '0') throw new Error('s11: speaking button not reset by the stop boundary');
+    if (_ttsSpeaking !== true) throw new Error('s11: new playback must own speaking state');
+    return sleep(0).then(() => {
+      if (fetchCalls.length !== autoReadFetchIdx) {
+        throw new Error('s11: openai request issued during edge cooldown (calls=' + fetchCalls.length + ')');
+      }
+      return sleep(250);
+    });
+  }).then(() => {
+    if (fetchCalls.length !== autoReadFetchIdx + 1) {
+      throw new Error('s11: openai request not issued after cooldown (calls=' + fetchCalls.length + ')');
+    }
+    fetchCalls[autoReadFetchIdx].resolve(okResp());
+    return sleep(30);
+  }).then(() => {
+    if (!_ttsAudioCtx || _ttsAudioCtx.decodeCalls !== 1) throw new Error('s11: openai chunk not decoded');
+    _ttsAudioCtx._decode.ok({});
+    if (startedSources.length !== 1) throw new Error('s11: openai source missing');
+    audioEls[0].onended();                     // stale edge completion fires late
+    if (_playingEdgeAudio !== startedSources[0]) {
+      throw new Error('s11: stale edge completion clobbered the openai handle');
+    }
+    if (_ttsSpeaking !== true) throw new Error('s11: stale edge completion cleared speaking state');
+    return sleep(250);                         // would catch a leaked edge chunk request
+  }).then(() => {
+    if (fetchCalls.length !== autoReadFetchIdx + 1) {
+      throw new Error('s11: stale edge completion issued a follow-on request (calls=' + fetchCalls.length + ')');
+    }
+    return 'PASS';
+  });
+}
+
+// 12. Production-composed voice-mode entry point: the real boot.js
+//     _speakResponse() replaces an active OpenAI playback. Asserts it enters
+//     the canonical stop/start boundary (prior chain invalidated, prior
+//     source stopped, manual button reset), that its own request goes
+//     through the shared scheduler (paced), and that the stale prior
+//     continuation can neither start audio, issue requests, nor clear the
+//     new playback's handle/state.
+function scenario12() {
+  resetState();
+  let voiceFetchIdx = -1;
+  const btn = fakeBtn();
+  btn.dataset.speaking = '1';
+  speakingBtns = [btn];
+  _playOpenaiTts(longText, btn);               // manual playback A; fetch0
+  return sleep(0).then(() => {
+    fetchCalls[0].resolve(okResp());
+    return sleep(30);
+  }).then(() => {
+    _ttsAudioCtx._decode.ok({});               // A1 plays; src0 active
+    if (startedSources.length !== 1) throw new Error('s12: A1 source missing');
+    _voiceModeActive = true;
+    _voiceModeState = 'thinking';
+    _voiceModeThinkingSid = null;
+    _ls['hermes-tts-engine'] = 'openai';
+    domRows = [{ dataset: { rawText: longText } }];
+    voiceFetchIdx = fetchCalls.length;         // 1
+    _speakResponse();                          // the real voice-mode entry
+    if (!startedSources[0].stopped) throw new Error('s12: prior source not stopped by the stop boundary');
+    if (btn.dataset.speaking !== '0') throw new Error('s12: manual button not reset by the stop boundary');
+    if (_voiceModeState !== 'speaking') throw new Error('s12: voice state not speaking');
+    return sleep(0).then(() => {
+      if (fetchCalls.length !== voiceFetchIdx) {
+        throw new Error('s12: voice request issued during cooldown (calls=' + fetchCalls.length + ')');
+      }
+      return sleep(250);
+    });
+  }).then(() => {
+    if (fetchCalls.length !== voiceFetchIdx + 1) {
+      throw new Error('s12: voice request not issued after cooldown (calls=' + fetchCalls.length + ')');
+    }
+    fetchCalls[voiceFetchIdx].resolve(okResp());
+    return sleep(30);
+  }).then(() => {
+    if (audioEls.length !== 1) throw new Error('s12: voice audio not created');
+    if (!audioEls[0].played) throw new Error('s12: voice audio not played');
+    if (_playingEdgeAudio !== audioEls[0]) throw new Error('s12: voice audio not the active handle');
+    startedSources[0].onended();               // stale prior completion fires late
+    if (_playingEdgeAudio !== audioEls[0]) throw new Error('s12: stale completion clobbered the handle');
+    if (_ttsSpeaking !== true) throw new Error('s12: stale completion cleared speaking state');
+    return sleep(250);                         // would catch a leaked follow-on request
+  }).then(() => {
+    if (fetchCalls.length !== voiceFetchIdx + 1) {
+      throw new Error('s12: stale completion issued a follow-on request (calls=' + fetchCalls.length + ')');
+    }
+    return 'PASS';
+  });
+}
+
+// 13. Cross-engine pacing through the real engine paths: OpenAI→ElevenLabs
+//     and ElevenLabs→OpenAI — each direction must wait for the shared slot,
+//     and an abandoned (replaced) completion must not start audio.
+function scenario13() {
+  resetState();
+  _playOpenaiTts('AAAA', fakeBtn());           // fetch0 (immediate)
+  _playElevenLabsTts('BBBB', fakeBtn());       // must wait (openai cooldown)
+  return sleep(0).then(() => {
+    if (fetchCalls.length !== 1) {
+      throw new Error('s13: elevenlabs issued during openai cooldown (calls=' + fetchCalls.length + ')');
+    }
+    fetchCalls[0].resolve(okResp());           // abandoned openai completion
+    return sleep(250);
+  }).then(() => {
+    if (fetchCalls.length !== 2) {
+      throw new Error('s13: elevenlabs request not issued after cooldown (calls=' + fetchCalls.length + ')');
+    }
+    _playOpenaiTts('CCCC', fakeBtn());         // reverse: waits for elevenlabs window
+    return sleep(0).then(() => {
+      if (fetchCalls.length !== 2) {
+        throw new Error('s13: openai issued during elevenlabs cooldown (calls=' + fetchCalls.length + ')');
+      }
+      fetchCalls[1].resolve(okResp());         // abandoned elevenlabs completion
+      return sleep(250);
+    });
+  }).then(() => {
+    if (fetchCalls.length !== 3) {
+      throw new Error('s13: openai request not issued after cooldown (calls=' + fetchCalls.length + ')');
+    }
+    if (audioEls.length !== 0) throw new Error('s13: abandoned completion started audio');
+    if (_ttsAudioCtx !== null && _ttsAudioCtx.decodeCalls !== 0) {
+      throw new Error('s13: abandoned completion decoded audio');
+    }
+    return 'PASS';
+  });
+}
+
+// 14. Cross-engine pacing: ElevenLabs→Edge and Edge→ElevenLabs, then the
+//     voice-mode path behind a live Edge request: _speakResponse() must wait
+//     for the shared slot, and its fetch resolved after a stop must not
+//     start audio.
+function scenario14() {
+  resetState();
+  _playElevenLabsTts('AAAA', fakeBtn());       // fetch0 (immediate)
+  _playEdgeTtsChunked('BBBB', fakeBtn());      // must wait (elevenlabs cooldown)
+  return sleep(0).then(() => {
+    if (fetchCalls.length !== 1) {
+      throw new Error('s14: edge issued during elevenlabs cooldown (calls=' + fetchCalls.length + ')');
+    }
+    fetchCalls[0].resolve(okResp());           // abandoned elevenlabs completion
+    return sleep(250);
+  }).then(() => {
+    if (fetchCalls.length !== 2) {
+      throw new Error('s14: edge request not issued after cooldown (calls=' + fetchCalls.length + ')');
+    }
+    _playElevenLabsTts('CCCC', fakeBtn());     // reverse: waits for edge window
+    return sleep(0).then(() => {
+      if (fetchCalls.length !== 2) {
+        throw new Error('s14: elevenlabs#2 issued during edge cooldown (calls=' + fetchCalls.length + ')');
+      }
+      return sleep(250);
+    });
+  }).then(() => {
+    if (fetchCalls.length !== 3) {
+      throw new Error('s14: elevenlabs#2 request not issued after cooldown (calls=' + fetchCalls.length + ')');
+    }
+    fetchCalls[2].resolve(okResp());           // elevenlabs#2 is live but idle (no decode)
+    _voiceModeActive = true;
+    _voiceModeState = 'thinking';
+    _voiceModeThinkingSid = null;
+    _ls['hermes-tts-engine'] = 'edge';
+    domRows = [{ dataset: { rawText: longText } }];
+    const before = fetchCalls.length;          // 3
+    _speakResponse();                          // voice-mode after a live request
+    return sleep(0).then(() => {
+      if (fetchCalls.length !== before) {
+        throw new Error('s14: voice edge request issued inside cooldown (calls=' + fetchCalls.length + ')');
+      }
+      return sleep(250);
+    }).then(() => {
+      if (fetchCalls.length !== before + 1) {
+        throw new Error('s14: voice edge request not issued after cooldown (calls=' + fetchCalls.length + ')');
+      }
+      const voiceFetch = fetchCalls[before];
+      stopTTS();                               // voice playback stopped...
+      voiceFetch.resolve(okResp());            // ...then the late fetch resolves
+      return sleep(30);
+    });
+  }).then(() => {
+    if (audioEls.length !== 0) throw new Error('s14: stale voice fetch started audio');
+    if (startedSources.length !== 0) throw new Error('s14: unexpected source started');
+    return 'PASS';
+  });
+}
+
+// 15. Stale ElevenLabs completions after stop→start:
+//     (a) an in-flight elevenlabs fetch resolved after a replacement must
+//         not decode or start audio;
+//     (b) a stale started source's late onended must not clear the newer
+//         playback's handle/state (_playAudioBuf cleanup ownership guard).
+function scenario15() {
+  resetState();
+  _playElevenLabsTts(longText, fakeBtn());     // A: fetch0 in flight
+  stopTTS();
+  _playOpenaiTts('BBBB', fakeBtn());           // B owns; waits for cooldown
+  return sleep(0).then(() => {
+    if (fetchCalls.length !== 1) throw new Error('s15: B issued during cooldown');
+    fetchCalls[0].resolve(okResp());           // late A completion
+    return sleep(30);
+  }).then(() => {
+    if (_ttsAudioCtx !== null) throw new Error('s15: stale elevenlabs completion created a context');
+    return sleep(250);
+  }).then(() => {
+    if (fetchCalls.length !== 2) throw new Error('s15: B fetch not issued (calls=' + fetchCalls.length + ')');
+    fetchCalls[1].resolve(okResp());
+    return sleep(30);
+  }).then(() => {
+    if (!_ttsAudioCtx || _ttsAudioCtx.decodeCalls !== 1) throw new Error('s15: B decode missing');
+    _ttsAudioCtx._decode.ok({});               // B plays; src0
+    if (_playingEdgeAudio !== startedSources[0]) throw new Error('s15: B not the owner');
+    // (b) play a real elevenlabs clip C, replace it with D, then fire C's
+    // stale onended — D's handle/state must survive
+    _playElevenLabsTts('CCCC', fakeBtn());     // C: claims, waits for window
+    return sleep(250);
+  }).then(() => {
+    if (fetchCalls.length !== 3) throw new Error('s15: C fetch not issued (calls=' + fetchCalls.length + ')');
+    fetchCalls[2].resolve(okResp());
+    return sleep(30);
+  }).then(() => {
+    if (_ttsAudioCtx.decodeCalls !== 2) throw new Error('s15: C decode missing');
+    _ttsAudioCtx._decode.ok({});               // C plays; src1
+    if (startedSources.length !== 2) throw new Error('s15: C source missing');
+    if (_playingEdgeAudio !== startedSources[1]) throw new Error('s15: C not the owner');
+    _playOpenaiTts('DDDD', fakeBtn());         // D replaces C (releases src1); waits
+    return sleep(250);
+  }).then(() => {
+    if (fetchCalls.length !== 4) throw new Error('s15: D fetch not issued (calls=' + fetchCalls.length + ')');
+    fetchCalls[3].resolve(okResp());
+    return sleep(30);
+  }).then(() => {
+    if (_ttsAudioCtx.decodeCalls !== 3) throw new Error('s15: D decode missing');
+    _ttsAudioCtx._decode.ok({});               // D plays; src2
+    if (startedSources.length !== 3) throw new Error('s15: D source missing');
+    if (_playingEdgeAudio !== startedSources[2]) throw new Error('s15: D not the owner');
+    startedSources[1].onended();               // stale C cleanup fires late
+    if (_playingEdgeAudio !== startedSources[2]) throw new Error('s15: stale cleanup clobbered D handle');
+    if (_ttsSpeaking !== true) throw new Error('s15: stale cleanup cleared speaking under D');
+    return 'PASS';
+  });
+}
+
+// 16. Stale extension-engine completion after stop→start: a synth promise
+//     resolved late must not start audio, surface an error, or clear the
+//     newer playback's state.
+function scenario16() {
+  resetState();
+  let resolveSynth = null;
+  window._hermesTtsIsRegistered = (id) => id === 'voicevox';
+  window._hermesTtsSynth = () => new Promise((res) => { resolveSynth = res; });
+  _ls['hermes-tts-engine'] = 'voicevox';
+  const btn = fakeMsgBtn(longText);
+  speakMessage(btn);                           // extension branch: synth pending
+  if (typeof resolveSynth !== 'function') throw new Error('s16: synth not invoked');
+  if (btn.dataset.speaking !== '1') throw new Error('s16: listen button not marked');
+  stopTTS();
+  _playOpenaiTts('BBBB', fakeBtn());           // B owns (free window -> fetch0)
+  return sleep(0).then(() => {
+    if (fetchCalls.length !== 1) throw new Error('s16: B fetch not issued');
+    resolveSynth(new ArrayBuffer(8));          // late extension completion
+    return sleep(30);
+  }).then(() => {
+    if (_ttsAudioCtx !== null) throw new Error('s16: stale synth completion decoded audio');
+    if (startedSources.length !== 0) throw new Error('s16: stale synth completion started a source');
+    if (_ttsSpeaking !== true) throw new Error('s16: stale synth completion cleared speaking');
+    if (toasts.length !== 0) throw new Error('s16: stale synth completion surfaced an error: ' + toasts[0]);
+    fetchCalls[0].resolve(okResp());
+    return sleep(30);
+  }).then(() => {
+    if (!_ttsAudioCtx || _ttsAudioCtx.decodeCalls !== 1) throw new Error('s16: B decode missing');
+    _ttsAudioCtx._decode.ok({});
+    if (_playingEdgeAudio !== startedSources[0]) throw new Error('s16: B not the owner');
+    return 'PASS';
+  });
+}
+
+// 17. Bounded owner-aware 429 retry applies to every sender: a real Edge
+//     request and a real ElevenLabs request are each retried after a 429 and
+//     play once the retry succeeds, with no error toast on the retriable 429.
+function scenario17() {
+  resetState();
+  _playEdgeTtsChunked('AAAA', fakeBtn());
+  return sleep(0).then(() => {
+    fetchCalls[0].resolve(rateLimitedResp());  // 429 -> bounded retry after window
+    return sleep(300);
+  }).then(() => {
+    if (fetchCalls.length !== 2) throw new Error('s17: edge not retried after 429 (calls=' + fetchCalls.length + ')');
+    if (toasts.length !== 0) throw new Error('s17: error toast on retriable edge 429: ' + toasts[0]);
+    fetchCalls[1].resolve(okResp());
+    return sleep(30);
+  }).then(() => {
+    if (audioEls.length !== 1 || !audioEls[0].played) throw new Error('s17: edge audio not played after retry');
+    _playElevenLabsTts('BBBB', fakeBtn());     // waits for the edge window
+    return sleep(0).then(() => {
+      if (fetchCalls.length !== 2) throw new Error('s17: elevenlabs issued inside edge window');
+      return sleep(250);
+    });
+  }).then(() => {
+    if (fetchCalls.length !== 3) throw new Error('s17: elevenlabs fetch not issued (calls=' + fetchCalls.length + ')');
+    fetchCalls[2].resolve(rateLimitedResp());  // 429 again
+    return sleep(300);
+  }).then(() => {
+    if (fetchCalls.length !== 4) throw new Error('s17: elevenlabs not retried after 429 (calls=' + fetchCalls.length + ')');
+    if (toasts.length !== 0) throw new Error('s17: error toast on retriable elevenlabs 429: ' + toasts[0]);
+    fetchCalls[3].resolve(okResp());
+    return sleep(30);
+  }).then(() => {
+    if (!_ttsAudioCtx || _ttsAudioCtx.decodeCalls !== 1) throw new Error('s17: elevenlabs retry not decoded');
+    _ttsAudioCtx._decode.ok({});
+    if (startedSources.length !== 1) throw new Error('s17: elevenlabs source missing');
+    return 'PASS';
+  });
+}
+
+// 18. Voice-mode browser playback: a replaced utterance's late onend must
+//     not reopen the mic, and a watchdog armed under the replaced turn must
+//     not fire after a replacement claimed the generation. Control: on a
+//     turn with no replacement the watchdog still fires. Timeouts are capped
+//     so the 4 s+ watchdog fires quickly; the guard semantics are unchanged.
+function scenario18() {
+  resetState();
+  const realSetTimeout = globalThis.setTimeout;
+  globalThis.setTimeout = (fn, ms, ...rest) => realSetTimeout(fn, Math.min(ms == null ? 0 : ms, 20), ...rest);
+  _voiceModeActive = true;
+  _voiceModeState = 'thinking';
+  _voiceModeThinkingSid = null;
+  _ls['hermes-tts-engine'] = 'browser';
+  domRows = [{ dataset: { rawText: 'hello world reply text' } }];
+  _speakResponse();                            // browser branch: utterance posted
+  const utt = speechSynthesis.speakCalls[0];
+  if (!utt) throw new Error('s18: utterance not spoken');
+  if (_voiceModeState !== 'speaking') throw new Error('s18: state not speaking');
+  _playOpenaiTts('BBBB', fakeBtn());           // replacement claims the turn
+  if (typeof utt.onend === 'function') utt.onend();  // stale utterance completes late
+  return sleep(40).then(() => {
+    if (_startListeningCalls !== 0) throw new Error('s18: stale utterance reopened the mic');
+    return sleep(40);
+  }).then(() => {
+    if (_startListeningCalls !== 0) throw new Error('s18: stale watchdog reopened the mic');
+    // control: fresh turn, no replacement -> the real watchdog must fire
+    _voiceModeState = 'thinking';
+    _speakResponse();
+    const utt2 = speechSynthesis.speakCalls[1];
+    if (!utt2) throw new Error('s18: second utterance not spoken');
+    return sleep(60).then(() => {
+      if (_startListeningCalls !== 1) {
+        throw new Error('s18: watchdog did not fire on the current turn (calls=' + _startListeningCalls + ')');
+      }
+      globalThis.setTimeout = realSetTimeout;
+      return 'PASS';
+    });
+  });
+}
+
+
+const scenario = process.argv[4];
 const runner = {
-  scenario1: scenario1, scenario2: scenario2, scenario3: scenario3,
-  scenario4: scenario4, scenario5: scenario5, scenario6: scenario6,
-  scenario7: scenario7, scenario8: scenario8, scenario9: scenario9,
-  scenario10: scenario10,
+  scenario1: scenario1, scenario2: scenario2, scenario3: scenario3, scenario4: scenario4,
+  scenario5: scenario5, scenario6: scenario6, scenario7: scenario7, scenario8: scenario8,
+  scenario9: scenario9, scenario10: scenario10, scenario11: scenario11, scenario12: scenario12,
+  scenario13: scenario13, scenario14: scenario14, scenario15: scenario15, scenario16: scenario16,
+  scenario17: scenario17, scenario18: scenario18,
 }[scenario];
 if (!runner) throw new Error('unknown scenario: ' + scenario);
 let outcome;
@@ -542,18 +1023,20 @@ if (outcome && typeof outcome.then === 'function') {
 @pytest.mark.parametrize("scenario", [
     "scenario1", "scenario2", "scenario3", "scenario4", "scenario5",
     "scenario6", "scenario7", "scenario8", "scenario9", "scenario10",
+    "scenario11", "scenario12", "scenario13", "scenario14", "scenario15",
+    "scenario16", "scenario17", "scenario18",
 ])
 def test_openai_tts_chunk_chain_race(tmp_path, scenario):
-    """Behavioral race coverage: late callbacks from a stopped playback must
-    never resume the chunk chain under a new playback; requests are paced to
-    the server rate limit across generations and engines; automatic
-    replacement stops the prior source; terminal failures (decode, source
-    construction, resume rejection) leave no follow-on requests; HTTP 429 is
-    retried within bounds."""
+    """Behavioral coverage for the unified TTS request scheduler and the
+    generation/owner tokens: late callbacks from a stopped/replaced playback
+    must never resume a chain, start audio, or clear a newer playback's
+    state; every server-backed request (any engine, any entry point — Listen
+    button, auto-read, voice mode) is paced through the shared slot with a
+    bounded owner-aware 429 retry."""
     driver = tmp_path / "tts_race_driver.js"
     driver.write_text(_DRIVER, encoding="utf-8")
     result = subprocess.run(
-        [NODE, str(driver), str(REPO / "static" / "ui.js"), scenario],
+        [NODE, str(driver), str(REPO / "static" / "ui.js"), str(REPO / "static" / "boot.js"), scenario],
         capture_output=True,
         text=True,
         timeout=60,
