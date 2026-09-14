@@ -9636,31 +9636,74 @@ function _playAudioBuf(arrayBuffer, btn, label, gen){
     return;
   }
   return new Promise(function(resolve){
-    ctx.decodeAudioData(arrayBuffer.slice(0), function(audioBuffer){
-      if(!_owns()){ resolve(); return; }
-      const src=ctx.createBufferSource();
-      src.buffer=audioBuffer;
-      src.connect(ctx.destination);
-      _playingEdgeAudio=src;
-      const _cleanup=function(){
-        try{src.stop();src.disconnect();}catch(_){}
-        if(_owns()){
-          _ttsSpeaking=false;
-          if(_playingEdgeAudio===src) _playingEdgeAudio=null;
-          if(btn)btn.dataset.speaking='0';
-        }
-        resolve();
-      };
-      src.onended=_cleanup;
-      src.start(0);
-    }, function(e){
+    // Terminal settlement shared by every failure path (sync construction
+    // error, resume rejection, decode failure): stop/disconnect any
+    // partially constructed source, clear shared state only while this
+    // generation still owns playback, and always settle the returned
+    // promise so a dead playback can never leave callers hanging.
+    const _settleFailure=function(msg, partialSrc){
+      if(partialSrc){
+        try{ partialSrc.onended=null; partialSrc.stop(); partialSrc.disconnect(); }catch(_){}
+        if(_playingEdgeAudio===partialSrc) _playingEdgeAudio=null;
+      }
       if(_owns()){
         _ttsSpeaking=false;
         if(btn)btn.dataset.speaking='0';
-        showToast(label+' error: '+(e&&e.message||e));
+        if(msg&&typeof showToast==='function') showToast(msg,4000,'error');
       }
-      resolve(); // prevent permanently pending Promise on decode failure
-    });
+      resolve();
+    };
+    const _onDecoded=function(audioBuffer){
+      if(!_owns()){ resolve(); return; }
+      // Synchronous Web Audio construction (createBufferSource, connect,
+      // start) can throw; route every failure through the generation-aware
+      // settlement so no partial source survives and the promise is never
+      // left pending.
+      const _start=function(){
+        if(!_owns()){ resolve(); return; }
+        var src=null;
+        try{
+          src=ctx.createBufferSource();
+          src.buffer=audioBuffer;
+          src.connect(ctx.destination);
+          _playingEdgeAudio=src;
+          const _cleanup=function(){
+            try{src.stop();src.disconnect();}catch(_){}
+            if(_owns()){
+              _ttsSpeaking=false;
+              if(_playingEdgeAudio===src) _playingEdgeAudio=null;
+              if(btn)btn.dataset.speaking='0';
+            }
+            resolve();
+          };
+          src.onended=_cleanup;
+          src.start(0);
+        }catch(e){
+          _settleFailure(label+' error: '+(e&&e.message||e), src);
+        }
+      };
+      // A suspended context (autoplay policy) must resume before start.
+      // Observe the resume promise: rejection is a terminal failure instead
+      // of playback that waits forever with the Listen button stuck (same
+      // owner-aware settlement as the OpenAI chunk path).
+      if(ctx.state==='running'){ _start(); return; }
+      var rp=null;
+      try{ rp=ctx.resume(); }catch(e){ _settleFailure(label+' error: '+(e&&e.message||e), null); return; }
+      if(!rp||typeof rp.then!=='function'){ _start(); return; }
+      rp.then(function(){ _start(); }).catch(function(e){ _settleFailure(label+' error: '+(e&&e.message||e), null); });
+    };
+    try{
+      ctx.decodeAudioData(arrayBuffer.slice(0), _onDecoded, function(e){
+        if(_owns()){
+          _ttsSpeaking=false;
+          if(btn)btn.dataset.speaking='0';
+          showToast(label+' error: '+(e&&e.message||e));
+        }
+        resolve(); // prevent permanently pending Promise on decode failure
+      });
+    }catch(e){
+      _settleFailure(label+' error: '+(e&&e.message||e), null);
+    }
   });
 }
 function stopTTS(){

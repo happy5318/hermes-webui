@@ -18,6 +18,11 @@ Reviewer feedback (nesquena-hermes on #7529):
     stop/start boundary; tests must drive the real base + voice-mode entry
     points, all cross-engine pacing directions, and stale Edge/ElevenLabs/
     extension completions after stop→start.
+  * Round 6: delayed voice-mode mic rearm must be owner-aware — a stale
+    terminal callback's timer must re-check active/speaking/generation at
+    execution time so it cannot reopen the mic underneath a replacement;
+    the shared `_playAudioBuf` path needs the same owner-aware resume/start/
+    error settlement and partial-source cleanup as the OpenAI chunk path.
 
 The driver extracts the REAL functions from static/ui.js and static/boot.js
 (`_playOpenaiTts`, `_playEdgeTtsChunked`, `_playElevenLabsTts`, `speakMessage`,
@@ -49,6 +54,17 @@ and a fake Audio element:
   18.   voice-mode browser playback: a replaced utterance's late onend must
         not reopen the mic, and a stale watchdog must not fire after a
         replacement claimed the turn.
+  19.   voice-mode delayed mic rearm ownership: A's retained rearm timer is
+        drained after a real speakMessage() replacement — the mic must stay
+        closed and B's handle/generation/button state must survive; the
+        no-replacement control rearms exactly once.
+  20.   shared _playAudioBuf (ElevenLabs): rejected AudioContext.resume() is
+        terminal — state/button settled, no source starts, and the returned
+        promise resolves (direct settle probe).
+  21.   shared _playAudioBuf (registered engine): a synchronous
+        createBufferSource throw is terminal and settles.
+  22.   shared _playAudioBuf (ElevenLabs): a synchronous start() throw stops/
+        disconnects the partially constructed source and settles.
 """
 from __future__ import annotations
 
@@ -99,6 +115,7 @@ let _voiceModeActive = false;
 let _voiceModeState = 'idle';
 let _voiceModeThinkingSid = null;
 let _voiceTtsGenStart = 0;
+let _voiceMicRearmTimer = null;
 let _browserTtsKeepAlive = null;
 let _browserTtsWatchdog = null;
 let _browserTtsSuppressNextErrorRearm = false;
@@ -215,7 +232,8 @@ eval(['_splitForTTS', '_stripForTTS', '_beginTtsPlayback', '_ownsTtsPlayback', '
   '_getTtsAudioCtx', '_playAudioBuf', '_playOpenaiTts', '_playEdgeTtsChunked', '_playElevenLabsTts',
   'speakMessage', 'autoReadLastAssistant', 'stopTTS']
   .map((n) => extractFunction(ui, n)).join('\n'));
-eval(['_speakResponse', '_armBrowserTtsRecovery', '_clearBrowserTtsRecovery']
+eval(['_speakResponse', '_armBrowserTtsRecovery', '_clearBrowserTtsRecovery',
+  '_scheduleVoiceMicRearm', '_clearVoiceMicRearm']
   .map((n) => extractFunction(boot, n)).join('\n'));
 
 const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
@@ -231,6 +249,7 @@ function resetState(){
   _playingEdgeAudio = null; _ttsAudioCtx = null;
   _voiceModeActive = false; _voiceModeState = 'idle'; _voiceModeThinkingSid = null;
   _voiceTtsGenStart = 0;
+  if (_voiceMicRearmTimer) { clearTimeout(_voiceMicRearmTimer); _voiceMicRearmTimer = null; }
   if (_browserTtsWatchdog) { clearTimeout(_browserTtsWatchdog); _browserTtsWatchdog = null; }
   if (_browserTtsKeepAlive) { clearInterval(_browserTtsKeepAlive); _browserTtsKeepAlive = null; }
   _browserTtsSuppressNextErrorRearm = false; _startListeningCalls = 0;
@@ -991,6 +1010,198 @@ function scenario18() {
 }
 
 
+// 19. Voice-mode delayed mic rearm ownership. A's real terminal callback
+//     (browser branch) queues the owner-aware rearm timer; the real manual
+//     entry point speakMessage() then replaces playback through the
+//     canonical stopTTS boundary and advances the generation. Draining A's
+//     retained timer must NOT restart listening, and B's handle/generation/
+//     button state must remain intact. Control: on a turn with no
+//     replacement the owner-aware rearm still fires — exactly once.
+function scenario19() {
+  resetState();
+  const realSetTimeout = globalThis.setTimeout;
+  globalThis.setTimeout = (fn, ms, ...rest) => realSetTimeout(fn, Math.min(ms == null ? 0 : ms, 20), ...rest);
+  _voiceModeActive = true;
+  _voiceModeState = 'thinking';
+  _voiceModeThinkingSid = null;
+  _ls['hermes-tts-engine'] = 'browser';
+  domRows = [{ dataset: { rawText: 'first reply text' } }];
+  _speakResponse();                            // A: browser branch, utterance posted
+  const uttA = speechSynthesis.speakCalls[0];
+  if (!uttA) throw new Error('s19: A utterance not spoken');
+  uttA.onend();                                // A ends -> queues owner-aware rearm
+  if (_voiceMicRearmTimer === null) throw new Error('s19: rearm timer not queued');
+  _ls['hermes-tts-engine'] = 'openai';
+  const btn = fakeMsgBtn('replacement text');
+  speakMessage(btn);                           // B replaces via the stopTTS boundary
+  const bGen = _ttsGeneration;
+  if (btn.dataset.speaking !== '1') throw new Error('s19: B listen button not marked');
+  return sleep(60).then(() => {                // drain A's retained timer window
+    if (_startListeningCalls !== 0) throw new Error('s19: stale rearm reopened the mic under B');
+    if (_voiceMicRearmTimer !== null) throw new Error('s19: stale rearm timer still pending');
+    if (_ttsSpeaking !== true) throw new Error('s19: B speaking state lost');
+    if (_ttsGeneration !== bGen) throw new Error('s19: B generation changed');
+    if (btn.dataset.speaking !== '1') throw new Error('s19: B button state lost');
+    if (fetchCalls.length !== 1) throw new Error('s19: B fetch not issued (calls=' + fetchCalls.length + ')');
+    fetchCalls[0].resolve(okResp());           // B is still live and playable
+    return sleep(30);
+  }).then(() => {
+    if (!_ttsAudioCtx || _ttsAudioCtx.decodeCalls !== 1) throw new Error('s19: B decode missing');
+    _ttsAudioCtx._decode.ok({});
+    if (_playingEdgeAudio !== startedSources[0]) throw new Error('s19: B handle lost after stale rearm drain');
+    if (_startListeningCalls !== 0) throw new Error('s19: stale rearm reopened the mic after B start');
+    // Control: fresh turn, no replacement -> the owner-aware rearm fires once.
+    _voiceModeState = 'thinking';
+    _ls['hermes-tts-engine'] = 'browser';
+    domRows = [{ dataset: { rawText: 'second reply text' } }];
+    _speakResponse();
+    const uttC = speechSynthesis.speakCalls[speechSynthesis.speakCalls.length - 1];
+    if (!uttC || uttC === uttA) throw new Error('s19: control utterance not spoken');
+    uttC.onend();
+    return sleep(60);
+  }).then(() => {
+    if (_startListeningCalls !== 1) {
+      throw new Error('s19: control rearm did not fire exactly once (calls=' + _startListeningCalls + ')');
+    }
+    // Defense layers below the generation check: a retained timer must also
+    // re-check activity (3a) and the speaking state (3b) when it fires.
+    _voiceModeState = 'thinking';
+    _speakResponse();
+    const uttD = speechSynthesis.speakCalls[speechSynthesis.speakCalls.length - 1];
+    if (!uttD) throw new Error('s19: phase3a utterance not spoken');
+    uttD.onend();
+    _voiceModeActive = false;                  // 3a: inactive at timer time
+    return sleep(60).then(() => {
+      if (_startListeningCalls !== 1) {
+        throw new Error('s19: rearm fired while voice mode inactive (calls=' + _startListeningCalls + ')');
+      }
+      _voiceModeActive = true;
+      _voiceModeState = 'thinking';
+      _speakResponse();
+      const uttE = speechSynthesis.speakCalls[speechSynthesis.speakCalls.length - 1];
+      if (!uttE) throw new Error('s19: phase3b utterance not spoken');
+      uttE.onend();
+      _voiceModeState = 'listening';           // 3b: not speaking at timer time
+      return sleep(60);
+    });
+  }).then(() => {
+    if (_startListeningCalls !== 1) {
+      throw new Error('s19: rearm fired while voice state not speaking (calls=' + _startListeningCalls + ')');
+    }
+    globalThis.setTimeout = realSetTimeout;
+    return 'PASS';
+  });
+}
+
+// 20. Shared _playAudioBuf path (ElevenLabs): a suspended AudioContext whose
+//     resume() rejects is a terminal failure — speaking state and the Listen
+//     button must be cleared, no source may start, the error must be
+//     surfaced, and the returned promise must settle (direct probe).
+function scenario20() {
+  resetState();
+  const unhandled = [];
+  const onUnhandled = (e) => { unhandled.push(e); };
+  process.on('unhandledRejection', onUnhandled);
+  const btn = fakeBtn();
+  _playElevenLabsTts('AAAA', btn);
+  return sleep(0).then(() => {
+    if (fetchCalls.length !== 1) throw new Error('s20: fetch not issued');
+    fetchCalls[0].resolve(okResp());
+    return sleep(30);
+  }).then(() => {
+    if (!_ttsAudioCtx || !_ttsAudioCtx._decode) throw new Error('s20: decode not requested');
+    _ttsAudioCtx.state = 'suspended';
+    _ttsAudioCtx.rejectResume = true;
+    _ttsAudioCtx._decode.ok({});               // start must wait on resume()
+    return sleep(30);
+  }).then(() => {
+    if (_ttsSpeaking !== false) throw new Error('s20: speaking state left dangling');
+    if (btn.dataset.speaking !== '0') throw new Error('s20: listen button left speaking');
+    if (startedSources.length !== 0) throw new Error('s20: source started despite resume rejection');
+    if (_playingEdgeAudio !== null) throw new Error('s20: active handle not cleared');
+    if (toasts.length === 0) throw new Error('s20: no error toast');
+    // Direct settle probe: the returned promise itself must resolve on the
+    // rejected resume (no dangling chain anywhere on this path).
+    let directSettled = false;
+    const directGen = _beginTtsPlayback();
+    _playAudioBuf(new ArrayBuffer(8), null, 'TTS', directGen).then(function(){ directSettled = true; });
+    _ttsAudioCtx._decode.ok({});
+    return sleep(30).then(() => {
+      if (!directSettled) throw new Error('s20: returned promise not settled after resume rejection');
+      return sleep(20);
+    });
+  }).then(() => {
+    process.removeListener('unhandledRejection', onUnhandled);
+    if (unhandled.length !== 0) throw new Error('s20: unhandled rejection: ' + unhandled[0]);
+    return 'PASS';
+  });
+}
+
+// 21. Shared _playAudioBuf path (registered extension engine): a synchronous
+//     createBufferSource throw is a terminal failure — state/button settled,
+//     error surfaced, no source started, and the promise settles.
+function scenario21() {
+  resetState();
+  const unhandled = [];
+  const onUnhandled = (e) => { unhandled.push(e); };
+  process.on('unhandledRejection', onUnhandled);
+  window._hermesTtsIsRegistered = (id) => id === 'voicevox';
+  window._hermesTtsSynth = () => Promise.resolve(new ArrayBuffer(8));
+  _ls['hermes-tts-engine'] = 'voicevox';
+  const btn = fakeMsgBtn('registered engine text');
+  speakMessage(btn);                           // extension branch: synth -> _playAudioBuf
+  return sleep(0).then(() => {
+    if (!_ttsAudioCtx || !_ttsAudioCtx._decode) throw new Error('s21: decode not requested');
+    _ttsAudioCtx.throwOnCreateSource = true;
+    _ttsAudioCtx._decode.ok({});               // createBufferSource throws sync
+    return sleep(30);
+  }).then(() => {
+    if (_ttsSpeaking !== false) throw new Error('s21: speaking state left dangling');
+    if (btn.dataset.speaking !== '0') throw new Error('s21: listen button left speaking');
+    if (startedSources.length !== 0) throw new Error('s21: source created despite failure');
+    if (_playingEdgeAudio !== null) throw new Error('s21: active handle not cleared');
+    if (toasts.length === 0) throw new Error('s21: no error toast');
+    process.removeListener('unhandledRejection', onUnhandled);
+    if (unhandled.length !== 0) throw new Error('s21: unhandled rejection: ' + unhandled[0]);
+    return 'PASS';
+  });
+}
+
+// 22. Shared _playAudioBuf path (ElevenLabs): a synchronous start() throw
+//     after the source was created must stop/disconnect the partially
+//     constructed source, clear the handle/state, surface the error, and
+//     settle the promise.
+function scenario22() {
+  resetState();
+  const unhandled = [];
+  const onUnhandled = (e) => { unhandled.push(e); };
+  process.on('unhandledRejection', onUnhandled);
+  const btn = fakeBtn();
+  _playElevenLabsTts('AAAA', btn);
+  return sleep(0).then(() => {
+    if (fetchCalls.length !== 1) throw new Error('s22: fetch not issued');
+    fetchCalls[0].resolve(okResp());
+    return sleep(30);
+  }).then(() => {
+    if (!_ttsAudioCtx || !_ttsAudioCtx._decode) throw new Error('s22: decode not requested');
+    _ttsAudioCtx.throwOnStart = true;
+    _ttsAudioCtx._decode.ok({});               // src created; start() throws sync
+    return sleep(30);
+  }).then(() => {
+    if (startedSources.length !== 1) throw new Error('s22: source was not created');
+    if (!startedSources[0].stopped) throw new Error('s22: partial source not stopped');
+    if (!startedSources[0].disconnected) throw new Error('s22: partial source not disconnected');
+    if (_ttsSpeaking !== false) throw new Error('s22: speaking state left dangling');
+    if (btn.dataset.speaking !== '0') throw new Error('s22: listen button left speaking');
+    if (_playingEdgeAudio !== null) throw new Error('s22: active handle not cleared');
+    if (toasts.length === 0) throw new Error('s22: no error toast');
+    process.removeListener('unhandledRejection', onUnhandled);
+    if (unhandled.length !== 0) throw new Error('s22: unhandled rejection: ' + unhandled[0]);
+    return 'PASS';
+  });
+}
+
+
 const scenario = process.argv[4];
 const runner = {
   scenario1: scenario1, scenario2: scenario2, scenario3: scenario3, scenario4: scenario4,
@@ -998,6 +1209,7 @@ const runner = {
   scenario9: scenario9, scenario10: scenario10, scenario11: scenario11, scenario12: scenario12,
   scenario13: scenario13, scenario14: scenario14, scenario15: scenario15, scenario16: scenario16,
   scenario17: scenario17, scenario18: scenario18,
+  scenario19: scenario19, scenario20: scenario20, scenario21: scenario21, scenario22: scenario22,
 }[scenario];
 if (!runner) throw new Error('unknown scenario: ' + scenario);
 let outcome;
@@ -1024,7 +1236,8 @@ if (outcome && typeof outcome.then === 'function') {
     "scenario1", "scenario2", "scenario3", "scenario4", "scenario5",
     "scenario6", "scenario7", "scenario8", "scenario9", "scenario10",
     "scenario11", "scenario12", "scenario13", "scenario14", "scenario15",
-    "scenario16", "scenario17", "scenario18",
+    "scenario16", "scenario17", "scenario18", "scenario19", "scenario20",
+    "scenario21", "scenario22",
 ])
 def test_openai_tts_chunk_chain_race(tmp_path, scenario):
     """Behavioral coverage for the unified TTS request scheduler and the
