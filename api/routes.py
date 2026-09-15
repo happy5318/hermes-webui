@@ -3470,20 +3470,16 @@ def _run_journal_live_snapshot(stream_id: str | None, *, handler=None) -> dict |
         tool_calls.append(call)
 
     def reasoning_echo_tail_matches(text: str) -> bool:
-        candidate = _compact_for_echo_compare(text)
-        if not candidate:
-            return False
         full = _materialize_reasoning_text()
         if not full:
             return False
-        # Suffix test — folding the WHOLE (growing) reasoning transcript per
-        # interim segment ran re.sub over hundreds of KB 100+ times per
-        # rebuild (~1.5s). Fold only a bounded tail: compact() only drops
-        # whitespace, so a window of len(text)*3 characters covers the echo's
-        # non-whitespace characters — the same window contract
-        # _strip_compact_echo_suffix already uses for the reverse operation.
-        tail = full[-max(len(str(text or "")) * 3, 4096):]
-        return _compact_for_echo_compare(tail).endswith(candidate)
+        # Backward compact-suffix walk (no fixed window): linear in the echo
+        # length, allocation-free, and it cannot miss a compact-equivalent
+        # suffix whose raw span is stretched by interior whitespace. The
+        # previous bounded-tail probe folded up to len(text)*3 raw characters
+        # per interim segment - and when its window fell short it dropped the
+        # echo strip, duplicating the interim text in the restored transcript.
+        return _find_compact_echo_suffix_start(full, text) is not None
 
     def strip_reasoning_echo_tail(text: str) -> bool:
         nonlocal reasoning_text, reasoning_dirty, reasoning_first_tool_count
@@ -10631,6 +10627,7 @@ from api.streaming import (
     _materialize_pending_user_turn_before_error,
     generate_session_title_for_session,
     _compact_for_echo_compare,
+    _find_compact_echo_suffix_start,
     _strip_compact_echo_suffix,
 )
 from api.gateway_chat import _run_gateway_chat_streaming, webui_gateway_chat_enabled
