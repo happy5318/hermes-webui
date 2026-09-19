@@ -626,15 +626,58 @@ async function _workspacePathExists(path){
   return (data.entries||[]).some(entry=>entry&&((entry.path===path)||entry.name===name));
 }
 
+// #7239: classify whether the artifact path is inside the active
+// workspace before we strip the workspace prefix and call
+// ``/api/list``. The previous flow always stripped, then called
+// the session-scoped /api/list with the residue as though it
+// were workspace-relative; for an out-of-workspace absolute path
+// that /api/list call fails and the user sees the generic
+// "Could not open file" status. We now branch on the
+// classification: inside-workspace rows continue through the
+// original flow; outside-workspace rows get a localized
+// "outside the active workspace" message and do NOT touch
+// /api/list, /api/file*, or /api/escape/* (those endpoints are
+// session-scoped and would reject the absolute path anyway, but
+// the maintenance contract is to fail-closed without invoking
+// them at all).
+function _isInsideActiveWorkspace(artifactPath, workspace){
+  if(!artifactPath) return false;
+  if(!workspace) return false;
+  // Normalize backslash separators to '/' so the segment-aware
+  // check below works on Windows paths (e.g. "D:\ws\file") as
+  // well as POSIX.
+  const p = String(artifactPath).replace(/\\/g,'/');
+  const ws = String(workspace).replace(/\\/g,'/').replace(/\/+$/,'');
+  if(!ws) return false;
+  // Exact match (the path IS the workspace root, e.g. the user
+  // saved a file at the workspace path itself).
+  if(p === ws) return true;
+  // Prefix match with segment boundary: "/workspace" must not
+  // match "/workspace-other" (the previous startsWith check
+  // would have).
+  if(p.startsWith(ws + '/')) return true;
+  return false;
+}
+
 async function openArtifactPath(path){
   if(!path) return;
   switchWorkspacePanelTab('files');
   // Normalize backslash separators to '/' first — Windows absolute paths
   // (e.g. "D:\workspace\dir\file") otherwise break prefix-strip and the
   // /api/list existence check (which splits on '/').
-  let rel = String(path).replace(/\\/g,'/').replace(/^~\//,'').replace(/^(?:\.\/)+/,'');
-  // Strip workspace prefix so /api/list receives a workspace-relative path.
+  const normalized = String(path).replace(/\\/g,'/').replace(/^~\//,'').replace(/^(?:\.\/)+/,'');
   const ws = (S.session && S.session.workspace || '').replace(/\\/g,'/');
+  // #7239: the artifact is outside the active workspace. Do not
+  // strip the workspace prefix (which would leave the absolute
+  // path unchanged anyway) and do not invoke _workspacePathExists
+  // (which would round-trip through /api/list and fail for an
+  // out-of-workspace path). Surface a localized status instead.
+  if(!_isInsideActiveWorkspace(normalized, ws)){
+    if(typeof setStatus==='function') setStatus(t('file_outside_workspace'));
+    return;
+  }
+  // Strip workspace prefix so /api/list receives a workspace-relative path.
+  let rel = normalized;
   if(ws){
     const normWs = ws.replace(/\/+$/,'') + '/';
     if(rel.startsWith(normWs)) rel = rel.slice(normWs.length);

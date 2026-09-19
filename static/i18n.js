@@ -498,6 +498,7 @@ const LOCALES = {
     save_failed: 'Save failed: ',
     image_load_failed: 'Could not load image',
     file_open_failed: 'Could not open file',
+    file_outside_workspace: 'File is outside the active workspace',
     downloading: (name) => `Downloading ${name}\u2026`,
     double_click_rename: 'Double-click to rename',
     symlink_link_to: 'Symlink → {target}',
@@ -3630,7 +3631,9 @@ const LOCALES = {
     wiki_search_placeholder: 'Search pages...',
     wiki_no_pages: 'No wiki pages found',
     wiki_not_configured: 'Wiki not configured',
-  },
+  
+    file_outside_workspace: 'File is outside the active workspace',
+},
 
   ja: {
     offline_title: '接続が切断されました',
@@ -5440,7 +5443,9 @@ const LOCALES = {
     wiki_search_placeholder: 'ページを検索...',
     wiki_no_pages: 'Wikiページが見つかりません',
     wiki_not_configured: 'Wikiが設定されていません',
-  },
+  
+    file_outside_workspace: 'File is outside the active workspace',
+},
 
   ru: {
     offline_title: 'Соединение потеряно',
@@ -7224,7 +7229,9 @@ const LOCALES = {
     wiki_search_placeholder: 'Искать страницы…',
     wiki_no_pages: 'Страницы wiki не найдены',
     wiki_not_configured: 'Wiki не настроена',
-  },
+  
+    file_outside_workspace: 'File is outside the active workspace',
+},
 
   es: {
     offline_title: 'Conexión perdida',
@@ -8975,7 +8982,9 @@ const LOCALES = {
     wiki_search_placeholder: 'Search pages...',
     wiki_no_pages: 'No wiki pages found',
     wiki_not_configured: 'Wiki not configured',
-  },
+  
+    file_outside_workspace: 'File is outside the active workspace',
+},
 
   de: {
     offline_title: 'Verbindung verloren',
@@ -10720,7 +10729,9 @@ const LOCALES = {
     wiki_search_placeholder: 'Search pages...',
     wiki_no_pages: 'No wiki pages found',
     wiki_not_configured: 'Wiki not configured',
-  },
+  
+    file_outside_workspace: 'File is outside the active workspace',
+},
 
   zh: {
     offline_title: '连接已断开',
@@ -12458,7 +12469,9 @@ const LOCALES = {
     wiki_search_placeholder: '搜索页面...',
     wiki_no_pages: '未找到维基页面',
     wiki_not_configured: '维基未配置',
-  },
+  
+    file_outside_workspace: 'File is outside the active workspace',
+},
 
   // Traditional Chinese (zh-Hant)
   'zh-Hant': {
@@ -15892,7 +15905,9 @@ const LOCALES = {
     wiki_search_placeholder: 'Search pages...',
     wiki_no_pages: 'No wiki pages found',
     wiki_not_configured: 'Wiki not configured',
-  },
+  
+    file_outside_workspace: 'File is outside the active workspace',
+},
   ko: {
     offline_title: '연결이 끊겼습니다',
     offline_browser_detail: '브라우저가 이 장치가 오프라인이라고 보고합니다.',
@@ -17686,7 +17701,9 @@ const LOCALES = {
     wiki_search_placeholder: 'Search pages...',
     wiki_no_pages: 'No wiki pages found',
     wiki_not_configured: 'Wiki not configured',
-  },
+  
+    file_outside_workspace: 'File is outside the active workspace',
+},
 
   fr: {
     offline_title: 'Connexion perdue',
@@ -19464,7 +19481,9 @@ const LOCALES = {
     outline_title: 'Plan',
     outline_empty: 'Pas encore de questions.',
     outline_loading: 'Chargement\u2026',
-  },
+  
+    file_outside_workspace: 'File is outside the active workspace',
+},
 
   cs: {
     _label: 'Čeština',
@@ -21229,7 +21248,9 @@ const LOCALES = {
     tool_action_label: _i18nToolActionLabelCs,
     tool_worklog_summary: _i18nToolWorklogSummaryCs,
     tool_summary_join: _i18nToolSummaryJoinCs,
-  },
+  
+    file_outside_workspace: 'File is outside the active workspace',
+},
   tr: {
 
 
@@ -23029,7 +23050,9 @@ const LOCALES = {
   
   
   
-  },
+  
+    file_outside_workspace: 'File is outside the active workspace',
+},
   pl: {
     offline_title: 'Połączenie utracone',
     offline_browser_detail: 'Twoja przeglądarka zgłasza, że to urządzenie jest offline.',
@@ -24829,7 +24852,9 @@ const LOCALES = {
     checkpoint_diff_title: 'Zmiany w punkcie kontrolnym',
     checkpoint_diff_no_changes: 'Nie znaleziono różnic między tym punktem kontrolnym a obecnym obszarem roboczym.',
     checkpoint_diff_files_changed: (n) => n === 1 ? '1 plik zmieniony' : `${n} zmienionych plików`,
-  },
+  
+    file_outside_workspace: 'File is outside the active workspace',
+},
   vi: {
     offline_title: 'Mất kết nối',
     offline_browser_detail: 'Trình duyệt báo rằng thiết bị này đang ngoại tuyến.',
@@ -26630,6 +26655,8 @@ const LOCALES = {
     yolo_disabled: 'Chế độ YOLO TẮT',
     yolo_pill_label: 'YOLO',
     yolo_pill_title_active: 'Chế độ YOLO đang bật — bấm để tắt',
+
+    file_outside_workspace: 'File is outside the active workspace',
 },
 
 };
