@@ -2984,40 +2984,102 @@ window.addEventListener('visibilitychange',()=>{
 let _dynamicModelLabels={};
 window._configuredModelBadges=window._configuredModelBadges||{};
 
-// Keep every model-picker data boundary on the same deterministic order. The
-// value field is used for picker entries/options; id is the fallback for API
-// model objects and overflow records. Numeric comparison keeps model versions
-// in human order (e.g. 5.10 after 5.9) while remaining case-insensitive.
-function _modelPickerSortValue(entry){
+// ── Locale-independent model-id sort contract (#7528 round-3) ─────────────
+// Shared with api/config.py `_natural_model_id_key`: NO localeCompare, no
+// browser collation. Both sides run the identical token algorithm so ordering
+// is deterministic across Python/JS boundaries:
+//   1. lowercase the id;
+//   2. split into digit runs and text runs (/\d+|[^\d]+/g);
+//   3. digit vs digit: compare numeric value (strip leading zeros, compare
+//      core length then core text), tie-break on raw run text (007 vs 7);
+//   4. text vs text: compare Unicode code points;
+//   5. digit run sorts before text run at the same position;
+//   6. shorter run list sorts first when prefix-identical.
+function _modelPickerContractRuns(value){
+  return String(value==null?'':value).toLowerCase().match(/\d+|[^\d]+/g)||[];
+}
+function _modelPickerCompareRuns(a,b){
+  const ad=/^\d+$/.test(a), bd=/^\d+$/.test(b);
+  if(ad&&bd){
+    const ac=(a.replace(/^0+/,'')||'0'), bc=(b.replace(/^0+/,'')||'0');
+    if(ac.length!==bc.length) return ac.length<bc.length?-1:1;
+    if(ac!==bc) return ac<bc?-1:1;
+    if(a!==b) return a<b?-1:1;
+    return 0;
+  }
+  if(!ad&&!bd){
+    const la=[...a], lb=[...b];
+    const common=Math.min(la.length,lb.length);
+    for(let i=0;i<common;i++){
+      const ca=la[i].codePointAt(0), cb=lb[i].codePointAt(0);
+      if(ca!==cb) return ca<cb?-1:1;
+    }
+    if(la.length!==lb.length) return la.length<lb.length?-1:1;
+    return 0;
+  }
+  return ad?-1:1;
+}
+function _modelPickerCompareContract(a,b){
+  const ra=_modelPickerContractRuns(a), rb=_modelPickerContractRuns(b);
+  const common=Math.min(ra.length,rb.length);
+  for(let i=0;i<common;i++){
+    const c=_modelPickerCompareRuns(ra[i],rb[i]);
+    if(c!==0) return c;
+  }
+  if(ra.length!==rb.length) return ra.length<rb.length?-1:1;
+  return 0;
+}
+// Provider-routing prefix handling: when a provider context IS known, strip
+// ONLY the exact `@${provider}:` prefix (a bare split on ':' would eat a
+// legit model suffix such as `model-a:free`). When it isn't, the common
+// routing prefixes (@custom:, @provider:name:) are stripped once so named
+// custom IDs still sort on the underlying model id.
+function _modelPickerSortableId(entry,providerHint){
   let value=String(entry&&entry.value!=null?entry.value:(entry&&entry.id!=null?entry.id:entry)||'');
   const provider=String(
+    providerHint||
     (entry&&entry.providerId)||
     (entry&&entry.provider_id)||
     (entry&&entry.parentElement&&entry.parentElement.dataset&&entry.parentElement.dataset.provider)||
     ''
   ).trim();
-  // Strip only the known provider prefix. Splitting at every colon would eat
-  // a valid model suffix such as `model-a:free`.
   if(value.startsWith('@')){
-    const prefix=provider?`@${provider}:`:'';
-    if(prefix&&value.toLowerCase().startsWith(prefix.toLowerCase())) value=value.slice(prefix.length);
-    else{
+    if(provider){
+      const prefix=`@${provider}:`;
+      if(value.toLowerCase().startsWith(prefix.toLowerCase())) value=value.slice(prefix.length);
+      else{
+        // Known group provider but a different routed prefix (e.g. legacy
+        // alias) — drop the first routing segment conservatively.
+        const colon=value.indexOf(':');
+        if(colon>=0) value=value.slice(colon+1);
+      }
+    }else{
+      // No provider context: strip a single @...: routing segment so named
+      // custom ids (e.g. @custom:name:model-a:free → name:model-a:free) still
+      // compare on the part after the first colon, preserving model suffix
+      // colons. Mirrors _providerFromModelValue semantics.
       const colon=value.indexOf(':');
       if(colon>=0) value=value.slice(colon+1);
     }
   }
   return value;
 }
-function _compareModelPickerEntries(a,b){
-  const av=_modelPickerSortValue(a);
-  const bv=_modelPickerSortValue(b);
+// Keep the historical name — populated by populateModelDropdown, fallback to static map
+function _modelPickerSortValue(entry,providerHint){
+  return _modelPickerSortableId(entry,providerHint);
+}
+function _compareModelPickerEntries(a,b,providerHint){
+  const av=_modelPickerSortableId(a,providerHint);
+  const bv=_modelPickerSortableId(b,providerHint);
+  const c=_modelPickerCompareContract(av,bv);
+  if(c!==0) return c;
+  // Deterministic tie-break on raw ids (provider-qualified included).
   const rawA=String(a&&a.value!=null?a.value:(a&&a.id!=null?a.id:a)||'');
   const rawB=String(b&&b.value!=null?b.value:(b&&b.id!=null?b.id:b)||'');
-  return av.localeCompare(bv,undefined,{numeric:true,sensitivity:'base'})
-    || rawA.localeCompare(rawB,undefined,{numeric:true,sensitivity:'base'});
+  return _modelPickerCompareContract(rawA,rawB);
 }
-function _sortModelPickerEntries(items){
-  return Array.from(items||[]).sort(_compareModelPickerEntries);
+function _sortModelPickerEntries(items,providerHint){
+  return Array.from(items||[]).sort((a,b)=>_compareModelPickerEntries(a,b,providerHint));
 }
 function _sortModelPickerOptions(group){
   if(!group||!group.children) return;
@@ -3661,13 +3723,13 @@ async function populateModelDropdown(opts={}){
     window._defaultModel=data.default_model||null;
     window._configuredModelBadges=data.configured_model_badges||{};
     window._modelEndpointErrors={};
-    const _sortModelEntries=(items)=>{
+    const _sortModelEntries=(items,providerId)=>{
       const values=Array.from(items||[]);
-      if(typeof _sortModelPickerEntries==='function') return _sortModelPickerEntries(values);
+      if(typeof _sortModelPickerEntries==='function') return _sortModelPickerEntries(values,providerId);
       return values.sort((a,b)=>{
         const av=String(a&&a.id!=null?a.id:a||'').replace(/^@(?:[^:]+:)+/,'');
         const bv=String(b&&b.id!=null?b.id:b||'').replace(/^@(?:[^:]+:)+/,'');
-        return av.localeCompare(bv,undefined,{numeric:true,sensitivity:'base'})||av.localeCompare(bv);
+        return _modelPickerCompareContract(av,bv)||_modelPickerCompareContract(String(a&&a.id||''),String(b&&b.id||''));
       });
     };
     // Keep g.extra_models label hydration in this function for /model and tail selections.
@@ -3703,7 +3765,7 @@ async function populateModelDropdown(opts={}){
         const display=(String(providerId).startsWith('custom:')
           ? String(providerId).slice('custom:'.length)
           : String(providerId))||'Configured';
-        groups.push({provider:display,provider_id:providerId,models:_sortModelEntries(models)});
+        groups.push({provider:display,provider_id:providerId,models:_sortModelEntries(models,providerId)});
       }
       return groups;
     };
@@ -3734,7 +3796,7 @@ async function populateModelDropdown(opts={}){
         og.dataset.modelsEndpointError=JSON.stringify(g.models_endpoint_error);
         if(errorKey) window._modelEndpointErrors[errorKey]=g.models_endpoint_error;
       }
-      for(const m of (Array.isArray(g.models)?_sortModelEntries(g.models):[])){
+      for(const m of (Array.isArray(g.models)?_sortModelEntries(g.models,g.provider_id):[])){
         const opt=document.createElement('option');
         opt.value=m.id;
         opt.textContent=m.label;
@@ -4195,8 +4257,9 @@ function _positionModelDropdown(){
 function _readModelOverflowData(group){
   if(!group||!group.dataset||!group.dataset.extraModels) return [];
   const _sortOverflowModels=(items)=>{
-    if(typeof _sortModelPickerEntries==='function') return _sortModelPickerEntries(items);
-    return Array.from(items||[]).sort((a,b)=>String(a&&a.id||'').localeCompare(String(b&&b.id||''),undefined,{numeric:true,sensitivity:'base'}));
+    const providerId=(group.dataset&&group.dataset.provider)||'';
+    if(typeof _sortModelPickerEntries==='function') return _sortModelPickerEntries(items,providerId);
+    return Array.from(items||[]).sort((a,b)=>_modelPickerCompareContract(String(a&&a.id||''),String(b&&b.id||'')));
   };
   try{
     const parsed=JSON.parse(group.dataset.extraModels);
@@ -4623,6 +4686,30 @@ function renderModelDropdown(){
       // just asked to see more of it) regardless of any prior collapsed state.
       moreEl.remove();
       wrap.style.display='';
+      // Global group re-sort: the in-place reveal above appends overflow rows
+      // before the expander, but every already-visible row keeps its old slot
+      // — so a sorted visible head followed by a sorted overflow tail would
+      // not be globally ordered ([z-*] visible … [a-*] revealed). Re-position
+      // ALL `.model-opt` rows of the group in one picker-order pass so the
+      // fully expanded group is a contiguous alphabetical sequence (#7528).
+      try{
+        const _allRows=Array.from(wrap.querySelectorAll('.model-opt'));
+        const _rowIds=[];
+        for(const _r of _allRows){
+          const _idEl=_r.querySelector('.model-opt-id');
+          const _id=_idEl?_idEl.textContent:'';
+          if(_id) _rowIds.push({row:_r,id:_id});
+        }
+        if(_rowIds.length>1){
+          const _groupProvider=(og.dataset&&og.dataset.provider)||'';
+          _rowIds.sort((x,y)=>{
+            const xKV=x.id.startsWith('@')?{id:x.id,providerId:_groupProvider}:{id:x.id};
+            const yKV=y.id.startsWith('@')?{id:y.id,providerId:_groupProvider}:{id:y.id};
+            return _compareModelPickerEntries(xKV,yKV,_groupProvider);
+          });
+          for(const _pair of _rowIds) wrap.appendChild(_pair.row);
+        }
+      }catch(_se){ /* keep revealed rows even if re-sort fails */ }
       _forceOpenGroups.add(groupKey);
       const heading=wrap.previousElementSibling;
       if(heading&&heading.classList&&heading.classList.contains('model-group')){
