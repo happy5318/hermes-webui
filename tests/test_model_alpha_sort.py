@@ -43,6 +43,10 @@ function extractFunction(name) {
 }
 
 eval([
+  '_modelPickerContractRuns',
+  '_modelPickerCompareRuns',
+  '_modelPickerCompareContract',
+  '_modelPickerSortableId',
   '_modelPickerSortValue',
   '_compareModelPickerEntries',
   '_sortModelPickerEntries',
@@ -259,8 +263,15 @@ function extractFunction(name) {
   return ui.slice(start, i);
 }
 
-eval(['_modelPickerSortValue', '_compareModelPickerEntries', '_sortModelPickerEntries']
-  .map(extractFunction).join('\n'));
+eval([
+  '_modelPickerContractRuns',
+  '_modelPickerCompareRuns',
+  '_modelPickerCompareContract',
+  '_modelPickerSortableId',
+  '_modelPickerSortValue',
+  '_compareModelPickerEntries',
+  '_sortModelPickerEntries',
+].map(extractFunction).join('\n'));
 
 const ids = ['model-10', 'model-2', 'MODEL-1', 'model-9', 'model-10b'];
 const sorted = _sortModelPickerEntries(ids.map(id => ({id: id}))).map(e => e.id);
@@ -323,4 +334,86 @@ def test_configured_section_rank_preserved_before_alpha_sort():
     )
     assert "return _compareModelPickerEntries(a,b);" in snippet, (
         "alpha order must be the tie-breaker within the same rank"
+    )
+
+
+# Node driver exercising the shared locale-independent comparator contract
+# (review round-3 blocker 3: no localeCompare, code-point based, matching
+# api/config.py `_natural_model_id_key`).
+_CONTRACT_DRIVER = r'''
+const fs = require('fs');
+const ui = fs.readFileSync(process.argv[2], 'utf8');
+function extractFunction(name) {
+  const re = new RegExp('function\\s+' + name + '\\s*\\(');
+  const start = ui.search(re);
+  if (start < 0) throw new Error(name + ' not found');
+  let i = ui.indexOf('{', ui.indexOf(')', start));
+  let depth = 1; i += 1;
+  while (depth > 0 && i < ui.length) {
+    if (ui[i] === '{') depth += 1;
+    else if (ui[i] === '}') depth -= 1;
+    i += 1;
+  }
+  return ui.slice(start, i);
+}
+eval([
+  '_modelPickerContractRuns','_modelPickerCompareRuns','_modelPickerCompareContract',
+  '_modelPickerSortableId','_modelPickerSortValue','_compareModelPickerEntries','_sortModelPickerEntries',
+].map(extractFunction).join('\n'));
+const vectors = JSON.parse(process.argv[3]);
+process.stdout.write(JSON.stringify(_sortModelPickerEntries(vectors.map(id => ({id}))).map(e => e.id)));
+'''
+
+
+def _run_contract_driver(tmp_path, ids):
+    driver = tmp_path / "contract_driver.js"
+    driver.write_text(_CONTRACT_DRIVER, encoding="utf-8")
+    result = subprocess.run(
+        [NODE, str(driver), str(REPO / "static" / "ui.js"), json.dumps(ids)],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout)
+
+
+def test_contract_parity_across_boundaries(tmp_path):
+    """Python and JS sort vectors identically under the #7528 round-3
+    locale-independent contract (no localeCompare, no browser collation).
+
+    Vectors cover numeric runs, leading zeros, punctuation, Unicode,
+    case-folding, provider-routing @ prefixes, slashes and long digit runs.
+    """
+    from api.config import _natural_model_id_key
+
+    ids = [
+        "model-10", "model-2", "MODEL-1", "model-9", "model-10b",
+        "007-model", "7-model", "model-007", "model-7",
+        "a-2-b", "a-10-b", "a-2-b-2", "a-2-b-10",
+        "glm-5.3", "glm-5.10", "glm-5.3-flash", "glm-5.30",
+        "v1.0", "v1.0.1", "v1.0.0", "v2.0",
+        "ä-model", "z-model", "A-model", "à-model", "Ω-model",
+        "model_2", "model-2", "model.2", "model 2", "model!2",
+        "@custom:abc:z-model", "@custom:abc:a-model", "plain-z",
+        "foo/bar", "foo/baz", "foo/bar-2", "foo/bar-10",
+    ]
+    backend_order = sorted(ids, key=lambda m: _natural_model_id_key({"id": m}))
+    frontend_order = _run_contract_driver(tmp_path, ids)
+    assert backend_order == frontend_order, (
+        f"contract divergence: backend={backend_order} frontend={frontend_order}"
+    )
+    # Spot-check natural numeric order survived.
+    assert backend_order.index("model-2") < backend_order.index("model-10")
+    assert backend_order.index("v1.0.0") < backend_order.index("v1.0.1") < backend_order.index("v2.0")
+
+
+def test_contract_handles_leading_zeros_and_codepoint_folding(tmp_path):
+    """Leading-zero digit runs tie-break deterministically; Unicode text runs
+    compare by code point on both boundaries."""
+    from api.config import _natural_model_id_key
+
+    ids = ["007-model", "7-model", "model-007", "model-7", "Ω-model", "z-model"]
+    backend_order = sorted(ids, key=lambda m: _natural_model_id_key({"id": m}))
+    frontend_order = _run_contract_driver(tmp_path, ids)
+    assert backend_order == frontend_order, (
+        f"leading-zero/unicode divergence: backend={backend_order} frontend={frontend_order}"
     )

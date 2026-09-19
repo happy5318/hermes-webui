@@ -51,17 +51,104 @@ HOST = os.getenv("HERMES_WEBUI_HOST", "127.0.0.1")
 PORT = int(os.getenv("HERMES_WEBUI_PORT", "8787"))
 
 
-def _natural_model_id_key(_m) -> list:
-    """Natural, case-insensitive sort key for model ids.
+def _natural_model_id_key(_m):
+    """Locale-independent natural sort key for model ids (#7528 round-3).
 
-    Splits digit runs so versioned ids order like the frontend
-    ``localeCompare(..., {numeric:true})`` comparator: ``model-2`` sorts
-    before ``model-10``, while plain lexical Python sorting would emit
-    ``model-10`` first.  Tuple (kind, value) pairs keep text/digit runs
-    comparable at every position.
+    Contract shared with the frontend ``_compareModelPickerEntries`` in
+    ``static/ui.js``: no localeCompare, no browser collation — both sides run
+    the identical token algorithm so ordering is deterministic across Python
+    and JS boundaries:
+
+    1. lowercase the id;
+    2. strip one provider-routing ``@...:`` segment when present (mirrors the
+       frontend ``_modelPickerSortableId`` — a bare lowercase+tokenize would
+       sort ``@custom:abc:z-model`` before ``@custom:abc:a-model`` only after
+       the full raw string, which diverges from the UI);
+    3. split into digit runs and text runs (``\\d+|[^\\d]+``);
+    4. digit run vs digit run: compare numeric value (strip leading zeros,
+       compare core length then core text), tie-break by raw run text so
+       ``007`` vs ``7`` is deterministic;
+    5. text run vs text run: compare Unicode code points;
+    6. digit run sorts before text run at the same position;
+    7. shorter run list sorts first when prefix-identical.
+
+    ``model-2`` sorts before ``model-10`` while plain lexical sort would emit
+    ``model-10`` first. The returned key is a comparable wrapper, so callers
+    keep using ``sort(key=_natural_model_id_key)`` unchanged.
     """
-    _s = str((_m or {}).get("id") or "").lower()
-    return [(0, int(t)) if t.isdigit() else (1, t) for t in re.split(r"(\d+)", _s)]
+    return _NaturalModelKey(_natural_model_routing_stripped((_m or {}).get("id") or ""))
+
+
+def _natural_model_routing_stripped(value) -> str:
+    """Strip one leading ``@provider:`` routing segment, mirroring the
+    frontend's provider-aware ``_modelPickerSortableId`` fallback branch."""
+    _s = str(value or "")
+    if _s.startswith("@"):
+        colon = _s.find(":")
+        if colon >= 0:
+            _s = _s[colon + 1 :]
+    return _s
+
+
+def _natural_model_key_runs(text: str) -> list:
+    return re.findall(r"\d+|[^\d]+", str(text or "").lower())
+
+
+class _NaturalModelKey:
+    """Hash-free, comparison-only sort key implementing the shared contract."""
+
+    __slots__ = ("_runs",)
+
+    def __init__(self, value):
+        self._runs = _natural_model_key_runs(value)
+
+    @staticmethod
+    def _cmp_runs(a: str, b: str) -> int:
+        a_digit = a.isdigit()
+        b_digit = b.isdigit()
+        if a_digit and b_digit:
+            a_core = a.lstrip("0") or "0"
+            b_core = b.lstrip("0") or "0"
+            if len(a_core) != len(b_core):
+                return -1 if len(a_core) < len(b_core) else 1
+            if a_core != b_core:
+                return -1 if a_core < b_core else 1
+            if a != b:
+                return -1 if a < b else 1
+            return 0
+        if not a_digit and not b_digit:
+            for ca, cb in zip(a, b):
+                if ord(ca) != ord(cb):
+                    return -1 if ord(ca) < ord(cb) else 1
+            if len(a) != len(b):
+                return -1 if len(a) < len(b) else 1
+            return 0
+        return -1 if a_digit else 1
+
+    def _cmp(self, other) -> int:
+        common = min(len(self._runs), len(other._runs))
+        for i in range(common):
+            c = self._cmp_runs(self._runs[i], other._runs[i])
+            if c:
+                return c
+        if len(self._runs) != len(other._runs):
+            return -1 if len(self._runs) < len(other._runs) else 1
+        return 0
+
+    def __lt__(self, other):
+        return self._cmp(other) < 0
+
+    def __le__(self, other):
+        return self._cmp(other) <= 0
+
+    def __gt__(self, other):
+        return self._cmp(other) > 0
+
+    def __ge__(self, other):
+        return self._cmp(other) >= 0
+
+    def __eq__(self, other):
+        return isinstance(other, _NaturalModelKey) and self._cmp(other) == 0
 
 
 def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
