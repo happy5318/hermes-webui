@@ -644,10 +644,6 @@ def test_prepare_marker_clean_writeback_preserves_message_metadata():
     any other side fields. Only ``content`` is replaced; everything else
     rides forward so downstream settlement (id assignment, restore, dedupe)
     sees the same row shape as before."""
-    user_with_oob = (
-        "real text\n"
-        "[OUT-OF-BAND USER MESSAGE — ctrl][/OUT-OF-BAND USER MESSAGE]"
-    )
     result_messages = [
         {
             "role": "assistant",
