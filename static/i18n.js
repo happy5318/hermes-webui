@@ -13004,6 +13004,7 @@ const LOCALES = {
     save_failed: '儲存失敗：',
     image_load_failed: '無法載入圖片',
     file_open_failed: '無法開啟檔案',
+    file_outside_workspace: '檔案位於目前工作區之外',
     downloading: (name) => `正在下載 ${name}…`,
     double_click_rename: '按兩下即可重新命名',
     symlink_link_to: 'Symlink → {target}',

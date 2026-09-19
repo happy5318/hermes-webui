@@ -252,7 +252,7 @@ def test_file_outside_workspace_key_in_en_locale():
     locales fall back through ``t()`` to en, but the project-
     wide invariant ``test_*_locale_covers_english_keys``
     requires every locale block to declare every en key, so
-    this test also confirms the key was added to all 14
+    this test also confirms the key was added to all 15
     locales (the runtime fallback would otherwise be a
     silent test-invariant violation)."""
     # En locale must define the key.
@@ -262,11 +262,16 @@ def test_file_outside_workspace_key_in_en_locale():
 def test_file_outside_workspace_key_count_matches_locale_count():
     """Every locale block must declare the new key so the
     ``test_*_locale_covers_english_keys`` invariant keeps
-    passing. The count of ``file_outside_workspace:``
-    occurrences must equal the number of locales (14)."""
-    occurrences = I18N_JS.count("file_outside_workspace:")
-    assert occurrences == 14, (
-        f"expected the new key in all 14 locales, found "
+    passing. The count of per-locale key assignments (4-space
+    indent, single-quoted value) must equal the number of
+    locales (15). The match excludes the one occurrence inside
+    the separate ``_I18N_TOOL_ACTION_TEXT_*`` tool action
+    labels."""
+    occurrences = I18N_JS.count(
+        "    file_outside_workspace: '"
+    )
+    assert occurrences == 15, (
+        f"expected the new key in all 15 locales, found "
         f"{occurrences}; the locale-parity invariant would "
         f"flag the missing locales on the next test run"
     )
