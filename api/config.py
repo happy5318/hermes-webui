@@ -117,7 +117,7 @@ class _NaturalModelKey:
                 return -1 if a < b else 1
             return 0
         if not a_digit and not b_digit:
-            for ca, cb in zip(a, b):
+            for ca, cb in zip(a, b, strict=False):
                 if ord(ca) != ord(cb):
                     return -1 if ord(ca) < ord(cb) else 1
             if len(a) != len(b):

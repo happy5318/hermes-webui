@@ -3726,12 +3726,52 @@ async function populateModelDropdown(opts={}){
     const _sortModelEntries=(items,providerId)=>{
       const values=Array.from(items||[]);
       if(typeof _sortModelPickerEntries==='function') return _sortModelPickerEntries(values,providerId);
+      // Self-contained fallback comparator: must not depend on module-level
+      // picker helpers, which exist in the real page but not in single-function
+      // eval harnesses (test_4737). Use the same locale-independent digit-run
+      // comparison inline so ordering still matches the shared contract.
+      const _compareRaw=(a,b)=>{
+        const _ra=_modelPickerTokenCompareSafe(a,b);
+        if(_ra!==0) return _ra;
+        return String(a)<String(b)?-1:(String(a)>String(b)?1:0);
+      };
       return values.sort((a,b)=>{
         const av=String(a&&a.id!=null?a.id:a||'').replace(/^@(?:[^:]+:)+/,'');
         const bv=String(b&&b.id!=null?b.id:b||'').replace(/^@(?:[^:]+:)+/,'');
-        return _modelPickerCompareContract(av,bv)||_modelPickerCompareContract(String(a&&a.id||''),String(b&&b.id||''));
+        return _compareRaw(av,bv);
       });
     };
+    // Inline digit-run compare for the fallback path; mirrors the shared
+    // contract (see _modelPickerCompareRuns) without module deps.
+    function _modelPickerTokenRunsSafe(_s){
+      return String(_s==null?'':_s).toLowerCase().match(/\d+|[^\d]+/g)||[];
+    }
+    function _modelPickerTokenCompareSafe(a,b){
+      const _ra=_modelPickerTokenRunsSafe(a), _rb=_modelPickerTokenRunsSafe(b);
+      const _common=Math.min(_ra.length,_rb.length);
+      for(let _i=0;_i<_common;_i++){
+        const _x=_ra[_i], _y=_rb[_i];
+        const _xd=/^\d+$/.test(_x), _yd=/^\d+$/.test(_y);
+        if(_xd&&_yd){
+          const _xc=(_x.replace(/^0+/,'')||'0'), _yc=(_y.replace(/^0+/,'')||'0');
+          if(_xc.length!==_yc.length) return _xc.length<_yc.length?-1:1;
+          if(_xc!==_yc) return _xc<_yc?-1:1;
+          if(_x!==_y) return _x<_y?-1:1;
+        }else if(!_xd&&!_yd){
+          const _lxa=[..._x], _lyb=[..._y];
+          const _lk=Math.min(_lxa.length,_lyb.length);
+          for(let _j=0;_j<_lk;_j++){
+            const _cxa=_lxa[_j].codePointAt(0), _cyb=_lyb[_j].codePointAt(0);
+            if(_cxa!==_cyb) return _cxa<_cyb?-1:1;
+          }
+          if(_lxa.length!==_lyb.length) return _lxa.length<_lyb.length?-1:1;
+        }else{
+          return _xd?-1:1;
+        }
+      }
+      if(_ra.length!==_rb.length) return _ra.length<_rb.length?-1:1;
+      return 0;
+    }
     // Keep g.extra_models label hydration in this function for /model and tail selections.
 
     const _synthGroupsFromConfigured=()=>{
