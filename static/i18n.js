@@ -14336,6 +14336,16 @@ const LOCALES = {
     wiki_no_pages: 'No wiki pages found',
     wiki_not_configured: 'Wiki not configured',
 
+    insights_period_7d: '7 天',
+    insights_period_30d: '30 天',
+    insights_period_90d: '90 天',
+    insights_period_365d: '365 天',
+    kanban_bulk_status_aria: '批次狀態',
+    settings_send_key_enter: 'Enter (Shift+Enter 換行)',
+    settings_send_key_ctrl_enter: 'Ctrl+Enter (Enter 換行)',
+    settings_send_key_shift_enter: 'Shift+Enter (Enter 換行)',
+    settings_tts_voice_default_system: '預設系統語音',
+
   },
 
   pt: {
