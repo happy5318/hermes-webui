@@ -12,9 +12,6 @@ snapshotted at settle time.
 """
 from __future__ import annotations
 
-import sys
-import types
-
 from api.media_snapshots import codex_commentary_text
 
 
