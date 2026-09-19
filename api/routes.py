@@ -20467,7 +20467,22 @@ def _session_media_token_allows_path(sid: str, target: Path, allowed_mimes: set[
         role = str(message.get("role") or "").strip().lower()
         if role == "user":
             continue
-        text = _message_content_text(message.get("content"))
+        # #7565: also inspect typed public assistant commentary carried in
+        # ``codex_message_items`` (Agent phase: "commentary"). The
+        # concatenated text below is the union of the existing
+        # top-level extraction and the new commentary-only helper, so
+        # the existing exact-path, owning-session, safe-MIME, URL,
+        # hard-denied, and symlink guards are unchanged. The
+        # commentary helper is fail-closed (outer role must be
+        # assistant; item type/role/phase all constrained; only
+        # textual output_text parts are read).
+        from api.media_snapshots import codex_commentary_text
+        text = "\n".join(
+            fragment for fragment in (
+                _message_content_text(message.get("content")),
+                codex_commentary_text(message),
+            ) if fragment
+        )
         if "MEDIA:" not in text:
             continue
         for ref in _MEDIA_TOKEN_RE.findall(text):
