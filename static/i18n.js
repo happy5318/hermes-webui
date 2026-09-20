@@ -3633,7 +3633,7 @@ const LOCALES = {
     wiki_not_configured: 'Wiki not configured',
   
     file_outside_workspace: 'File is outside the active workspace',
-},
+  },
 
   ja: {
     offline_title: '接続が切断されました',
@@ -5445,7 +5445,7 @@ const LOCALES = {
     wiki_not_configured: 'Wikiが設定されていません',
   
     file_outside_workspace: 'File is outside the active workspace',
-},
+  },
 
   ru: {
     offline_title: 'Соединение потеряно',
@@ -7231,7 +7231,7 @@ const LOCALES = {
     wiki_not_configured: 'Wiki не настроена',
   
     file_outside_workspace: 'File is outside the active workspace',
-},
+  },
 
   es: {
     offline_title: 'Conexión perdida',
@@ -8984,7 +8984,7 @@ const LOCALES = {
     wiki_not_configured: 'Wiki not configured',
   
     file_outside_workspace: 'File is outside the active workspace',
-},
+  },
 
   de: {
     offline_title: 'Verbindung verloren',
@@ -10731,7 +10731,7 @@ const LOCALES = {
     wiki_not_configured: 'Wiki not configured',
   
     file_outside_workspace: 'File is outside the active workspace',
-},
+  },
 
   zh: {
     offline_title: '连接已断开',
@@ -17704,7 +17704,7 @@ const LOCALES = {
     wiki_not_configured: 'Wiki not configured',
   
     file_outside_workspace: 'File is outside the active workspace',
-},
+  },
 
   fr: {
     offline_title: 'Connexion perdue',
@@ -19484,7 +19484,7 @@ const LOCALES = {
     outline_loading: 'Chargement\u2026',
   
     file_outside_workspace: 'File is outside the active workspace',
-},
+  },
 
   cs: {
     _label: 'Čeština',
