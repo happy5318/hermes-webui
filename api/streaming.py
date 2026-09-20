@@ -2178,16 +2178,22 @@ def _prepare_marker_clean_writeback(
     # display transcript (session.messages) never renders the raw control
     # wrapper. The model-facing path was already covered in #5063 by
     # gateway_chat.py calling _strip_oob_blocks on context_messages; this
-    # mirrors that on the settle/display side. We rebuild each row via
-    # {**msg, 'content': ...} rather than mutating in place so the input
-    # ``result_messages`` references passed by callers are not touched
-    # (#7600).
-    cleaned = [
-        {**msg, 'content': _strip_oob_blocks(msg['content'])}
-        if isinstance(msg, dict) and 'content' in msg
-        else msg
-        for msg in cleaned
-    ]
+    # mirrors that on the settle/display side.
+    #
+    # We mutate each row's `content` in place rather than rebuilding the
+    # row via `{**msg, 'content': ...}`. The downstream
+    # `_assign_stable_message_ids` stamps an `id` field onto the SAME
+    # dict object that the caller passed in via `result_messages`
+    # (the cleaned list is a fresh list, but its entries are the
+    # caller's dicts — verified by `id(cleaned[0]) == id(result[0])`
+    # in regression tests). A rebuilt dict would be a different
+    # object, so the `id` stamp would land on the copy and never
+    # reach the caller's row, breaking
+    # `test_recovered_anchor_settle_duplication` and any other test
+    # that asserts on `result[-1]['id']` after settle.
+    for msg in cleaned:
+        if isinstance(msg, dict) and 'content' in msg:
+            msg['content'] = _strip_oob_blocks(msg['content'])
     provenance = {
         'verification_nudge_seen': has_verification_nudge,
         'active_turn_identity': copy.deepcopy(active_turn_identity),

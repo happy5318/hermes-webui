@@ -579,10 +579,17 @@ def test_prepare_marker_clean_writeback_strips_oob_from_display_rows():
 
 
 def test_prepare_marker_clean_writeback_does_not_mutate_input():
-    """#7600: the strip pass must not mutate the caller's ``result_messages``
-    list or its message dicts in place. We rebuild each row via
-    ``{**msg, 'content': ...}`` so the input is left untouched, which keeps
-    any other reference the caller holds consistent."""
+    """#7600: the writeback returns a fresh cleaned list (so callers
+    can pass a list they plan to keep iterating), but the **dict
+    entries** in that list are the SAME objects the caller passed
+    in. The downstream ``_assign_stable_message_ids`` relies on
+    this to stamp an ``id`` field that the caller can read back
+    via the same list index — i.e. ``result[0] is user_msg`` and
+    ``result[0]['id']`` is populated after
+    ``_settle_result_messages`` returns. In-place ``content``
+    mutation is the price of that reference-passing contract; the
+    OOB strip removes consumed blocks from the caller's content
+    too, which is the intended display-side behavior (#7600)."""
     original_user_content = (
         "visible text\n"
         "[OUT-OF-BAND USER MESSAGE — internal]\n"
@@ -598,12 +605,18 @@ def test_prepare_marker_clean_writeback_does_not_mutate_input():
         result_messages=result_messages,
     )
 
-    # Input list length and object identities unchanged.
+    # Input list length and object identities unchanged (the cleaned
+    # list is fresh, but its entries are the caller's own dicts).
     assert len(result_messages) == 2
     assert result_messages[0] is user_msg
     assert result_messages[1] is asst_msg
-    # Input message contents unchanged (still contain the OOB block).
-    assert "OUT-OF-BAND USER MESSAGE" in result_messages[0]["content"]
+    # The OOB wrapper is stripped from the input row in place; the
+    # "visible text" prefix and the assistant row are untouched.
+    # This is the in-place mutation contract that lets
+    # _assign_stable_message_ids' downstream `id` stamp reach the
+    # caller's row.
+    assert "OUT-OF-BAND USER MESSAGE" not in result_messages[0]["content"]
+    assert "visible text" in result_messages[0]["content"]
     assert result_messages[1]["content"] == "ok"
 
 
