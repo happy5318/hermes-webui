@@ -12527,7 +12527,7 @@ const LOCALES = {
     settings_send_key_ctrl_enter: 'Ctrl+Enter (Enter for newline)',
     settings_send_key_shift_enter: 'Shift+Enter (Enter for newline)',
     settings_tts_voice_default_system: 'Default system voice',
-},
+  },
 
   // Traditional Chinese (zh-Hant)
   'zh-Hant': {
@@ -15981,7 +15981,7 @@ const LOCALES = {
     settings_send_key_ctrl_enter: 'Ctrl+Enter (Enter for newline)',
     settings_send_key_shift_enter: 'Shift+Enter (Enter for newline)',
     settings_tts_voice_default_system: 'Default system voice',
-},
+  },
   ko: {
     offline_title: '연결이 끊겼습니다',
     offline_browser_detail: '브라우저가 이 장치가 오프라인이라고 보고합니다.',
@@ -21348,7 +21348,7 @@ const LOCALES = {
     settings_send_key_ctrl_enter: 'Ctrl+Enter (Enter for newline)',
     settings_send_key_shift_enter: 'Shift+Enter (Enter for newline)',
     settings_tts_voice_default_system: 'Default system voice',
-},
+  },
   tr: {
 
 
@@ -23158,7 +23158,7 @@ const LOCALES = {
     settings_send_key_ctrl_enter: 'Ctrl+Enter (Enter for newline)',
     settings_send_key_shift_enter: 'Shift+Enter (Enter for newline)',
     settings_tts_voice_default_system: 'Default system voice',
-},
+  },
   pl: {
     offline_title: 'Połączenie utracone',
     offline_browser_detail: 'Twoja przeglądarka zgłasza, że to urządzenie jest offline.',
@@ -24968,7 +24968,7 @@ const LOCALES = {
     settings_send_key_ctrl_enter: 'Ctrl+Enter (Enter for newline)',
     settings_send_key_shift_enter: 'Shift+Enter (Enter for newline)',
     settings_tts_voice_default_system: 'Default system voice',
-},
+  },
   vi: {
     offline_title: 'Mất kết nối',
     offline_browser_detail: 'Trình duyệt báo rằng thiết bị này đang ngoại tuyến.',
@@ -26779,7 +26779,7 @@ const LOCALES = {
     settings_send_key_ctrl_enter: 'Ctrl+Enter (Enter for newline)',
     settings_send_key_shift_enter: 'Shift+Enter (Enter for newline)',
     settings_tts_voice_default_system: 'Default system voice',
-},
+  },
 
 };
 
