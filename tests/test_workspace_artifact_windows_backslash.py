@@ -51,6 +51,11 @@ def _run_artifact_open(path: str, workspace: str, entries_by_dir: dict) -> dict:
     of entry names /api/list would return, so the existence check is exercised
     with realistic data. Returns the recorded calls (openFile / setStatus).
     """
+    # #7239: openArtifactPath now consults _isInsideActiveWorkspace
+    # before stripping the workspace prefix, so the driver must
+    # inject the helper too. It's a pure function over (path, ws)
+    # with no closure capture, so pasting the body in works.
+    inside_workspace = _extract_function(WORKSPACE_JS, "_isInsideActiveWorkspace")
     open_artifact = _extract_function(WORKSPACE_JS, "openArtifactPath")
     path_exists = _extract_function(WORKSPACE_JS, "_workspacePathExists")
     entries_json = json.dumps(entries_by_dir)
@@ -68,6 +73,7 @@ async function api(url) {{
   calls.push({{api: dir}});
   return {{ entries: (ENTRIES_BY_DIR[dir] || []).map(name => ({{name, path: name}})) }};
 }}
+{inside_workspace}
 {path_exists}
 {open_artifact}
 (async () => {{

@@ -645,10 +645,19 @@ function _isInsideActiveWorkspace(artifactPath, workspace){
   if(!workspace) return false;
   // Normalize backslash separators to '/' so the segment-aware
   // check below works on Windows paths (e.g. "D:\ws\file") as
-  // well as POSIX.
+  // well as POSIX. Tilde and `./` stripping stays in the caller
+  // (openArtifactPath) so all branches see the same normalized
+  // form.
   const p = String(artifactPath).replace(/\\/g,'/');
   const ws = String(workspace).replace(/\\/g,'/').replace(/\/+$/,'');
   if(!ws) return false;
+  // Workspace-relative paths (no leading slash, no Windows drive
+  // letter) are always inside — they cannot escape the workspace
+  // by construction, and the caller (openArtifactPath) feeds them
+  // to /api/list as-is. Treating them as outside would short-circuit
+  // every relative-path click into the "outside workspace" status,
+  // which is a regression of the previous strip+list flow.
+  if(!p.startsWith('/') && !/^[a-zA-Z]:/.test(p)) return true;
   // Exact match (the path IS the workspace root, e.g. the user
   // saved a file at the workspace path itself).
   if(p === ws) return true;
