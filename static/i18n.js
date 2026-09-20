@@ -3649,7 +3649,7 @@ const LOCALES = {
     settings_send_key_ctrl_enter: 'Ctrl+Enter (Enter for newline)',
     settings_send_key_shift_enter: 'Shift+Enter (Enter for newline)',
     settings_tts_voice_default_system: 'Default system voice',
-},
+  },
 
   ja: {
     offline_title: '接続が切断されました',
@@ -5469,7 +5469,7 @@ const LOCALES = {
     settings_send_key_ctrl_enter: 'Ctrl+Enter (Enter for newline)',
     settings_send_key_shift_enter: 'Shift+Enter (Enter for newline)',
     settings_tts_voice_default_system: 'Default system voice',
-},
+  },
 
   ru: {
     offline_title: 'Соединение потеряно',
@@ -7263,7 +7263,7 @@ const LOCALES = {
     settings_send_key_ctrl_enter: 'Ctrl+Enter (Enter for newline)',
     settings_send_key_shift_enter: 'Shift+Enter (Enter for newline)',
     settings_tts_voice_default_system: 'Default system voice',
-},
+  },
 
   es: {
     offline_title: 'Conexión perdida',
@@ -9024,7 +9024,7 @@ const LOCALES = {
     settings_send_key_ctrl_enter: 'Ctrl+Enter (Enter for newline)',
     settings_send_key_shift_enter: 'Shift+Enter (Enter for newline)',
     settings_tts_voice_default_system: 'Default system voice',
-},
+  },
 
   de: {
     offline_title: 'Verbindung verloren',
@@ -10779,7 +10779,7 @@ const LOCALES = {
     settings_send_key_ctrl_enter: 'Ctrl+Enter (Enter for newline)',
     settings_send_key_shift_enter: 'Shift+Enter (Enter for newline)',
     settings_tts_voice_default_system: 'Default system voice',
-},
+  },
 
   zh: {
     offline_title: '连接已断开',
@@ -17785,7 +17785,7 @@ const LOCALES = {
     settings_send_key_ctrl_enter: 'Ctrl+Enter (Enter for newline)',
     settings_send_key_shift_enter: 'Shift+Enter (Enter for newline)',
     settings_tts_voice_default_system: 'Default system voice',
-},
+  },
 
   fr: {
     offline_title: 'Connexion perdue',
@@ -19573,7 +19573,7 @@ const LOCALES = {
     settings_send_key_ctrl_enter: 'Ctrl+Enter (Enter for newline)',
     settings_send_key_shift_enter: 'Shift+Enter (Enter for newline)',
     settings_tts_voice_default_system: 'Default system voice',
-},
+  },
 
   cs: {
     _label: 'Čeština',
