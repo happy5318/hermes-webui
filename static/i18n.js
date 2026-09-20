@@ -3631,8 +3631,7 @@ const LOCALES = {
     wiki_search_placeholder: 'Search pages...',
     wiki_no_pages: 'No wiki pages found',
     wiki_not_configured: 'Wiki not configured',
-  
-    file_outside_workspace: 'File is outside the active workspace',
+    file_outside_workspace: 'Il file si trova fuori dall\'area di lavoro',
   },
 
   ja: {
@@ -5443,8 +5442,7 @@ const LOCALES = {
     wiki_search_placeholder: 'ページを検索...',
     wiki_no_pages: 'Wikiページが見つかりません',
     wiki_not_configured: 'Wikiが設定されていません',
-  
-    file_outside_workspace: 'File is outside the active workspace',
+    file_outside_workspace: 'ファイルが作業ディレクトリ外にあります',
   },
 
   ru: {
@@ -7229,8 +7227,7 @@ const LOCALES = {
     wiki_search_placeholder: 'Искать страницы…',
     wiki_no_pages: 'Страницы wiki не найдены',
     wiki_not_configured: 'Wiki не настроена',
-  
-    file_outside_workspace: 'File is outside the active workspace',
+    file_outside_workspace: 'Файл находится за пределами рабочей области',
   },
 
   es: {
@@ -8982,8 +8979,7 @@ const LOCALES = {
     wiki_search_placeholder: 'Search pages...',
     wiki_no_pages: 'No wiki pages found',
     wiki_not_configured: 'Wiki not configured',
-  
-    file_outside_workspace: 'File is outside the active workspace',
+    file_outside_workspace: 'El archivo está fuera del área de trabajo',
   },
 
   de: {
@@ -10729,8 +10725,7 @@ const LOCALES = {
     wiki_search_placeholder: 'Search pages...',
     wiki_no_pages: 'No wiki pages found',
     wiki_not_configured: 'Wiki not configured',
-  
-    file_outside_workspace: 'File is outside the active workspace',
+    file_outside_workspace: 'Datei befindet sich außerhalb des Arbeitsbereichs',
   },
 
   zh: {
@@ -12469,9 +12464,8 @@ const LOCALES = {
     wiki_search_placeholder: '搜索页面...',
     wiki_no_pages: '未找到维基页面',
     wiki_not_configured: '维基未配置',
-  
-    file_outside_workspace: 'File is outside the active workspace',
-},
+    file_outside_workspace: '文件不在工作区内',
+  },
 
   // Traditional Chinese (zh-Hant)
   'zh-Hant': {
@@ -15906,9 +15900,8 @@ const LOCALES = {
     wiki_search_placeholder: 'Search pages...',
     wiki_no_pages: 'No wiki pages found',
     wiki_not_configured: 'Wiki not configured',
-  
-    file_outside_workspace: 'File is outside the active workspace',
-},
+    file_outside_workspace: 'Arquivo fora da área de trabalho',
+  },
   ko: {
     offline_title: '연결이 끊겼습니다',
     offline_browser_detail: '브라우저가 이 장치가 오프라인이라고 보고합니다.',
@@ -17702,8 +17695,7 @@ const LOCALES = {
     wiki_search_placeholder: 'Search pages...',
     wiki_no_pages: 'No wiki pages found',
     wiki_not_configured: 'Wiki not configured',
-  
-    file_outside_workspace: 'File is outside the active workspace',
+    file_outside_workspace: '파일이 작업 영역 밖에 있습니다',
   },
 
   fr: {
@@ -19482,8 +19474,7 @@ const LOCALES = {
     outline_title: 'Plan',
     outline_empty: 'Pas encore de questions.',
     outline_loading: 'Chargement\u2026',
-  
-    file_outside_workspace: 'File is outside the active workspace',
+    file_outside_workspace: 'Le fichier se trouve hors de l\'espace de travail',
   },
 
   cs: {
@@ -21249,9 +21240,8 @@ const LOCALES = {
     tool_action_label: _i18nToolActionLabelCs,
     tool_worklog_summary: _i18nToolWorklogSummaryCs,
     tool_summary_join: _i18nToolSummaryJoinCs,
-  
-    file_outside_workspace: 'File is outside the active workspace',
-},
+    file_outside_workspace: 'Soubor se nachází mimo pracovní prostor',
+  },
   tr: {
 
 
@@ -23051,9 +23041,8 @@ const LOCALES = {
   
   
   
-  
-    file_outside_workspace: 'File is outside the active workspace',
-},
+    file_outside_workspace: 'Dosya çalışma alanı dışında',
+  },
   pl: {
     offline_title: 'Połączenie utracone',
     offline_browser_detail: 'Twoja przeglądarka zgłasza, że to urządzenie jest offline.',
@@ -24853,9 +24842,8 @@ const LOCALES = {
     checkpoint_diff_title: 'Zmiany w punkcie kontrolnym',
     checkpoint_diff_no_changes: 'Nie znaleziono różnic między tym punktem kontrolnym a obecnym obszarem roboczym.',
     checkpoint_diff_files_changed: (n) => n === 1 ? '1 plik zmieniony' : `${n} zmienionych plików`,
-  
-    file_outside_workspace: 'File is outside the active workspace',
-},
+    file_outside_workspace: 'Plik znajduje się poza obszarem roboczym',
+  },
   vi: {
     offline_title: 'Mất kết nối',
     offline_browser_detail: 'Trình duyệt báo rằng thiết bị này đang ngoại tuyến.',
@@ -26657,8 +26645,8 @@ const LOCALES = {
     yolo_pill_label: 'YOLO',
     yolo_pill_title_active: 'Chế độ YOLO đang bật — bấm để tắt',
 
-    file_outside_workspace: 'File is outside the active workspace',
-},
+    file_outside_workspace: 'Tệp nằm ngoài vùng làm việc',
+  },
 
 };
 
