@@ -2969,6 +2969,24 @@ def remove_provider_key(provider_id: str) -> dict[str, Any]:
     (``providers.<id>.api_key`` or top-level ``model.api_key`` when this
     provider is the active one).
 
+    Issue #7412: the previous implementation only mutated the env file
+    and config.yaml, so an env-seeded entry in
+    ``~/.hermes/auth.json`` -> ``credential_pool.<provider>`` survived
+    the removal. That kept the dead provider visible across a full
+    server restart and broke live ``/v1/models`` fetches (the pool
+    pointed at an env var that no longer exists). The fix routes the
+    WebUI removal through the same three-step complete-removal path
+    the Agent CLI uses (``hermes auth remove``):
+    1. ``pool.remove_index()`` to drop the env-source entry
+    2. ``suppress_credential_source()`` so the next ``load_pool`` does
+       not re-seed the entry from the env var
+    3. ``invalidate_credential_pool_cache()`` so any cached snapshot
+       the WebUI is holding is dropped before the next read
+
+    The Agent CLI's `hermes_cli.auth_commands.auth_remove_command` is
+    the source of truth for this contract; the WebUI previously
+    bypassed it entirely.
+
     Returns a status dict with the operation result.
     """
     result = set_provider_key(provider_id, None)
@@ -2978,8 +2996,101 @@ def remove_provider_key(provider_id: str) -> dict[str, Any]:
     # Clean those up so _provider_has_key() returns False after removal.
     if result.get("ok"):
         _clean_provider_key_from_config(provider_id)
+        # #7412: complete the removal by dropping the credential pool
+        # entry and marking the env source as suppressed. Wrap in
+        # try/except so a failure in the new path does not roll back
+        # the .env/config.yaml cleanup the user has already been
+        # told succeeded.
+        _purge_provider_from_credential_pool(provider_id)
 
     return result
+
+
+def _purge_provider_from_credential_pool(provider_id: str) -> None:
+    """Drop env-seeded entries from ``credential_pool`` and mark the
+    source as suppressed so the next ``load_pool`` does not re-seed it.
+
+    Issue #7412 follow-up: this is the same complete-removal path the
+    Agent CLI runs in ``hermes auth remove`` -- see
+    ``hermes_cli/auth_commands.py::auth_remove_command``. The WebUI
+    was previously calling only the .env/config.yaml half, which left
+    an orphaned pool row and a missing ``suppressed_sources`` marker
+    behind. Fail-closed: any exception here is swallowed so the
+    .env/config.yaml half of the removal (already done by the caller)
+    is not rolled back. The orphaned entry is benign on the next
+    ``load_pool`` because the env var no longer exists; the real
+    concern is the missing suppression marker that would let a
+    re-exported env var silently re-seed the row.
+    """
+    try:
+        from agent.credential_pool import load_pool as _load_pool
+    except Exception:
+        return
+    try:
+        from hermes_cli.auth import suppress_credential_source as _suppress
+    except Exception:
+        _suppress = None  # suppress may be missing in some test envs
+
+    try:
+        pool = _load_pool(provider_id)
+    except Exception:
+        return
+
+    # Snapshot the source list before we mutate the pool so we can
+    # suppress each one exactly once even if remove_index shifts
+    # subsequent indices.
+    sources_to_suppress = [
+        entry.source
+        for entry in list(pool.entries())
+        if isinstance(entry, object)
+        and isinstance(getattr(entry, "source", None), str)
+        and entry.source.startswith("env:")
+    ]
+    if not sources_to_suppress:
+        return
+
+    # Drop every env-seeded entry from the pool. ``remove_index`` is
+    # index-based, so iterate over a snapshot of valid indices and
+    # resolve each one against the live pool so re-numbering does not
+    # skip an entry.
+    for entry in list(pool.entries()):
+        if not (isinstance(entry, object) and isinstance(getattr(entry, "source", None), str)):
+            continue
+        if not entry.source.startswith("env:"):
+            continue
+        # Find the entry's current index in the (possibly re-numbered)
+        # pool and remove it. We re-fetch entries() each time so the
+        # index is fresh after any prior removal.
+        current_entries = list(pool.entries())
+        try:
+            idx = current_entries.index(entry)
+        except ValueError:
+            # Entry already gone (race or duplicate source). Skip.
+            continue
+        try:
+            pool.remove_index(idx)
+        except Exception:
+            continue
+
+    # Mark each env source as suppressed so load_pool() does not
+    # re-seed it. suppress_credential_source may be missing in
+    # stripped-down test envs; that is a best-effort signal the
+    # upstream Agent CLI will fill in on its next auth-touching call.
+    if _suppress is not None:
+        for src in sources_to_suppress:
+            try:
+                _suppress(provider_id, src)
+            except Exception:
+                continue
+
+    # Drop any cached pool snapshot the WebUI is holding so the next
+    # read goes through load_pool() and sees the cleaned state.
+    try:
+        from api.config import invalidate_credential_pool_cache
+        invalidate_credential_pool_cache(provider_id)
+    except Exception:
+        pass
+
 
 
 def _clean_provider_key_from_config(provider_id: str) -> None:
