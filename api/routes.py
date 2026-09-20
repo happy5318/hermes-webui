@@ -23424,7 +23424,17 @@ def _prepare_chat_start_session_for_stream(
             source=effective_source,
         )
     if not defer_save:
-        s.save()
+        try:
+            s.save()
+        except Exception:
+            # #6869 re-gate: a save() throw after writeback-owner registration
+            # would otherwise leak the SESSION_WRITEBACK_OWNERS entry. The
+            # existing compare-and-clear helper is the right primitive — it
+            # only clears if this failed stream still owns the session, so a
+            # successor's claim is never touched. Re-raise so the caller's
+            # launch-abort path can complete the rest of the cleanup.
+            clear_session_writeback_owner_if_owned(s.session_id, stream_id)
+            raise
 
 
 def _cleanup_chat_start_launch_failure(session, stream_id: str) -> None:
@@ -24050,6 +24060,13 @@ def _start_chat_stream_for_session(
     try:
         thr.start()
     except Exception:
+        # #6869 re-gate: the existing launch-abort cleanup covers the
+        # Gateway lifecycle markers but not the per-session writeback
+        # owner registered by _prepare_chat_start_session_for_stream.
+        # A successful thr.start() is what made that registration
+        # load-bearing; if start() raises, the entry is now a leak.
+        # compare-and-clear so a successor's claim is untouched.
+        clear_session_writeback_owner_if_owned(s.session_id, stream_id)
         if backend_is_gateway:
             try:
                 from api.gateway_chat import _finish_gateway_run_starting
