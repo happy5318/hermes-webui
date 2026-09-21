@@ -10,9 +10,7 @@ directly with synthetic filesystem fixtures (no HTTP, no Node boot).
 from __future__ import annotations
 
 import importlib
-import os
 import sys
-import tempfile
 import types
 from pathlib import Path
 
