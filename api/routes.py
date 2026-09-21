@@ -23159,19 +23159,28 @@ def _handle_btw(handler, body):
     ephemeral.active_stream_id = stream_id
     register_session_writeback_owner(ephemeral.session_id, stream_id)
     ephemeral.save()
-    stream = create_stream_channel()
-    register_stream_owner(stream_id, ephemeral.session_id)
-    with STREAMS_LOCK:
-        STREAMS[stream_id] = stream
-    from api.background import track_btw
-    track_btw(body["session_id"], ephemeral.session_id, stream_id, question)
-    thr = threading.Thread(
-        target=_run_agent_streaming,
-        args=(ephemeral.session_id, question, s.model, s.workspace, stream_id, None),
-        kwargs={"ephemeral": True, "model_provider": model_provider},
-        daemon=True,
-    )
-    thr.start()
+    # #6869 re-gate: the remaining steps (channel registration, task tracking,
+    # thread construction and thread start) all run after the writeback owner
+    # was registered, and none of them were guarded. A throw here orphaned the
+    # registries and left the ephemeral session pointing at a dead stream.
+    # Route every one through the shared launch-abort helper.
+    try:
+        stream = create_stream_channel()
+        register_stream_owner(stream_id, ephemeral.session_id)
+        with STREAMS_LOCK:
+            STREAMS[stream_id] = stream
+        from api.background import track_btw
+        track_btw(body["session_id"], ephemeral.session_id, stream_id, question)
+        thr = threading.Thread(
+            target=_run_agent_streaming,
+            args=(ephemeral.session_id, question, s.model, s.workspace, stream_id, None),
+            kwargs={"ephemeral": True, "model_provider": model_provider},
+            daemon=True,
+        )
+        thr.start()
+    except Exception:
+        _abort_launched_stream(ephemeral, stream_id, reset_session=True)
+        raise
     return j(handler, {"stream_id": stream_id, "session_id": ephemeral.session_id, "parent_session_id": body["session_id"]})
 
 
@@ -23210,15 +23219,30 @@ def _handle_background(handler, body):
     bg.active_stream_id = stream_id
     register_session_writeback_owner(bg.session_id, stream_id)
     bg.save()
-    stream = create_stream_channel()
-    register_stream_owner(stream_id, bg.session_id)
-    with STREAMS_LOCK:
-        STREAMS[stream_id] = stream
     task_id = uuid.uuid4().hex[:8]
     from api.background import track_background, complete_background
     parent_sid = body["session_id"]
     bg_sid = bg.session_id
-    track_background(parent_sid, bg_sid, stream_id, task_id, prompt)
+    # #6869 re-gate: the remaining steps (channel registration, task tracking,
+    # thread construction and thread start) all run after the writeback owner
+    # was registered, and none of them were guarded. A throw here orphaned the
+    # registries, left the hidden bg session pointing at a dead stream, and
+    # left the tracked task in `status="running"` forever — the frontend poll
+    # never saw a result. Route every one through the shared launch-abort
+    # helper, and fail the tracked task so the poll can settle.
+    try:
+        stream = create_stream_channel()
+        register_stream_owner(stream_id, bg.session_id)
+        with STREAMS_LOCK:
+            STREAMS[stream_id] = stream
+        track_background(parent_sid, bg_sid, stream_id, task_id, prompt)
+    except Exception:
+        _abort_launched_stream(bg, stream_id, reset_session=True)
+        try:
+            complete_background(parent_sid, task_id, "(background task failed)")
+        except Exception:
+            pass
+        raise
 
     def _run_bg_and_notify():
         """Run the background agent, then mark the tracked task `done` with the
@@ -23267,7 +23291,15 @@ def _handle_background(handler, body):
                 pass
 
     thr = threading.Thread(target=_run_bg_and_notify, daemon=True)
-    thr.start()
+    try:
+        thr.start()
+    except Exception:
+        _abort_launched_stream(bg, stream_id, reset_session=True)
+        try:
+            complete_background(parent_sid, task_id, "(background task failed)")
+        except Exception:
+            pass
+        raise
     return j(handler, {"task_id": task_id, "stream_id": stream_id, "session_id": bg.session_id})
 
 
@@ -23330,6 +23362,100 @@ def _provisional_title_from_prompt(prompt: str, fallback: str = "Untitled") -> s
 _RETAINED_CONTEXT_USER_UNSET = object()
 
 
+def _abort_launched_stream(
+    s,
+    stream_id: str,
+    *,
+    gateway_starting: bool = False,
+    goal_related: bool = False,
+    reset_session: bool = False,
+) -> None:
+    """Unwind every registry a half-launched stream touched (#6869 re-gate).
+
+    A stream that never produced a live worker is indistinguishable from a live
+    one to every consumer that reads the per-session registries: ``STREAMS`` still
+    holds its channel, ``STREAM_SESSION_OWNERS`` still maps its id, and
+    ``SESSION_WRITEBACK_OWNERS`` still names it the session's writeback owner.
+    The dead channel makes every later send for that session return 409, so the
+    session is bricked until the process restarts.
+
+    Call this once from every launch-failure branch (thread construction or
+    ``start()`` failure, and any preparation exception raised after the
+    registrations). It never raises: an abort path must not replace the original
+    failure with a cleanup failure.
+
+    ``reset_session`` also clears the persisted ``active_stream_id``/``pending_*``
+    fields — but only while they still name this stream, and only under the
+    per-session lock, so a successor that was admitted meanwhile is never
+    clobbered.
+    """
+    sid = str(getattr(s, "session_id", "") or "").strip()
+    stream_id = str(stream_id or "").strip()
+    if goal_related:
+        try:
+            STREAM_GOAL_RELATED.pop(stream_id, None)
+        except Exception:
+            logger.debug("Failed to drop goal marker for stream %s", stream_id, exc_info=True)
+    try:
+        with STREAMS_LOCK:
+            STREAMS.pop(stream_id, None)
+    except Exception:
+        logger.debug("Failed to drop stream channel for stream %s", stream_id, exc_info=True)
+    try:
+        unregister_stream_owner(stream_id)
+    except Exception:
+        logger.debug("Failed to drop stream owner for stream %s", stream_id, exc_info=True)
+    try:
+        clear_session_writeback_owner_if_owned(sid, stream_id)
+    except Exception:
+        logger.debug("Failed to clear writeback owner for stream %s", stream_id, exc_info=True)
+    if gateway_starting:
+        try:
+            from api.gateway_chat import (
+                _clear_gateway_run_starting,
+                _finish_gateway_run_starting,
+            )
+
+            _finish_gateway_run_starting(stream_id)
+            _clear_gateway_run_starting(stream_id)
+        except Exception:
+            logger.debug(
+                "Failed to clear compensated gateway start %s",
+                stream_id,
+                exc_info=True,
+            )
+    if not reset_session or not sid or not stream_id:
+        return
+    try:
+        with _get_session_agent_lock(sid):
+            if getattr(s, "active_stream_id", None) != stream_id:
+                # A successor already claimed this session; leave its state alone.
+                return
+            s.active_stream_id = None
+            if hasattr(s, "pending_user_message"):
+                s.pending_user_message = None
+            if hasattr(s, "pending_attachments"):
+                s.pending_attachments = []
+            if hasattr(s, "pending_started_at"):
+                s.pending_started_at = None
+            if hasattr(s, "pending_user_source"):
+                s.pending_user_source = None
+            try:
+                s.save(touch_updated_at=False)
+            except Exception:
+                logger.warning(
+                    "Failed to persist compensated launch-abort for session %s",
+                    sid,
+                    exc_info=True,
+                )
+    except Exception:
+        logger.warning(
+            "Failed to reset session state after launch abort for session %s",
+            sid,
+            exc_info=True,
+        )
+
+
 def _prepare_chat_start_session_for_stream(
     s,
     *,
@@ -23364,77 +23490,79 @@ def _prepare_chat_start_session_for_stream(
     s.model_provider = model_provider
     s.active_stream_id = stream_id
     register_session_writeback_owner(s.session_id, stream_id)
-    s.post_compression_context_tokens_estimate = None
-    s.pending_user_message = msg
-    s.pending_attachments = attachments
-    s.pending_started_at = started_at if started_at is not None else time.time()
-    s.pending_user_source = effective_source
-    s._webui_pending_user_timestamp_identity = None
-    if retained_user is not None:
-        from api.process_event_utils import build_active_turn_token
+    # #6869 re-gate: everything below can raise (retained-row validation,
+    # provisional-title preparation, the eager checkpoint, save()). The
+    # writeback owner is already registered at this point, so any throw here
+    # would orphan it — and leave the in-memory ``active_stream_id``/pending
+    # fields pointing at a stream that never launched, which 409s the session
+    # until restart. Route every one of those failures through the shared
+    # launch-abort helper so the registries and the session reference unwind
+    # together, then re-raise so the caller sees the real error.
+    try:
+        s.post_compression_context_tokens_estimate = None
+        s.pending_user_message = msg
+        s.pending_attachments = attachments
+        s.pending_started_at = started_at if started_at is not None else time.time()
+        s.pending_user_source = effective_source
+        s._webui_pending_user_timestamp_identity = None
+        if retained_user is not None:
+            from api.process_event_utils import build_active_turn_token
 
-        retained_user["timestamp"] = s.pending_started_at
-        active_turn_token = build_active_turn_token(stream_id, s.pending_started_at)
-        retained_user["_active_turn_token"] = active_turn_token
-        if str(effective_source or "").strip().lower() == "fork":
-            retained_user["_fork_child_turn"] = s.session_id
-        if retained_context_user is not _RETAINED_CONTEXT_USER_UNSET:
-            if retained_context_user is not None and not any(
-                row is retained_context_user
-                for row in list(getattr(s, "context_messages", None) or [])
-            ):
-                raise RuntimeError("regeneration retained context row is not installed")
-            if isinstance(retained_context_user, dict):
-                retained_context_user["timestamp"] = s.pending_started_at
-                retained_context_user["_active_turn_token"] = active_turn_token
-                if str(effective_source or "").strip().lower() == "fork":
-                    retained_context_user["_fork_child_turn"] = s.session_id
-        else:
-            retained_id = retained_user.get("id") or retained_user.get("message_id")
-            retained_old_timestamp = retained_user.get("timestamp")
-            retained_old_content = retained_user.get("content")
-            for context_row in reversed(list(getattr(s, "context_messages", None) or [])):
-                if not isinstance(context_row, dict) or context_row.get("role") != "user":
-                    continue
-                context_id = context_row.get("id") or context_row.get("message_id")
-                id_match = retained_id is not None and context_id == retained_id
-                old_shape_match = (
-                    retained_old_timestamp is not None
-                    and context_row.get("timestamp") == retained_old_timestamp
-                    and context_row.get("content") == retained_old_content
-                )
-                if not (id_match or old_shape_match):
-                    continue
-                context_row["timestamp"] = s.pending_started_at
-                context_row["_active_turn_token"] = active_turn_token
-                if str(effective_source or "").strip().lower() == "fork":
-                    context_row["_fork_child_turn"] = s.session_id
-                break
-    current_title = getattr(s, "title", None)
-    if retained_user is None and _is_default_or_empty_session_title(current_title):
-        provisional_title = _provisional_title_from_prompt(msg, current_title or "Untitled")
-        if provisional_title and not _is_default_or_empty_session_title(provisional_title):
-            s.title = provisional_title
-    if retained_user is None and get_webui_session_save_mode() == "eager":
-        _checkpoint_user_message_for_eager_session_save(
-            s,
-            msg,
-            attachments,
-            s.pending_started_at,
-            source=effective_source,
-        )
-    if not defer_save:
-        try:
+            retained_user["timestamp"] = s.pending_started_at
+            active_turn_token = build_active_turn_token(stream_id, s.pending_started_at)
+            retained_user["_active_turn_token"] = active_turn_token
+            if str(effective_source or "").strip().lower() == "fork":
+                retained_user["_fork_child_turn"] = s.session_id
+            if retained_context_user is not _RETAINED_CONTEXT_USER_UNSET:
+                if retained_context_user is not None and not any(
+                    row is retained_context_user
+                    for row in list(getattr(s, "context_messages", None) or [])
+                ):
+                    raise RuntimeError("regeneration retained context row is not installed")
+                if isinstance(retained_context_user, dict):
+                    retained_context_user["timestamp"] = s.pending_started_at
+                    retained_context_user["_active_turn_token"] = active_turn_token
+                    if str(effective_source or "").strip().lower() == "fork":
+                        retained_context_user["_fork_child_turn"] = s.session_id
+            else:
+                retained_id = retained_user.get("id") or retained_user.get("message_id")
+                retained_old_timestamp = retained_user.get("timestamp")
+                retained_old_content = retained_user.get("content")
+                for context_row in reversed(list(getattr(s, "context_messages", None) or [])):
+                    if not isinstance(context_row, dict) or context_row.get("role") != "user":
+                        continue
+                    context_id = context_row.get("id") or context_row.get("message_id")
+                    id_match = retained_id is not None and context_id == retained_id
+                    old_shape_match = (
+                        retained_old_timestamp is not None
+                        and context_row.get("timestamp") == retained_old_timestamp
+                        and context_row.get("content") == retained_old_content
+                    )
+                    if not (id_match or old_shape_match):
+                        continue
+                    context_row["timestamp"] = s.pending_started_at
+                    context_row["_active_turn_token"] = active_turn_token
+                    if str(effective_source or "").strip().lower() == "fork":
+                        context_row["_fork_child_turn"] = s.session_id
+                    break
+        current_title = getattr(s, "title", None)
+        if retained_user is None and _is_default_or_empty_session_title(current_title):
+            provisional_title = _provisional_title_from_prompt(msg, current_title or "Untitled")
+            if provisional_title and not _is_default_or_empty_session_title(provisional_title):
+                s.title = provisional_title
+        if retained_user is None and get_webui_session_save_mode() == "eager":
+            _checkpoint_user_message_for_eager_session_save(
+                s,
+                msg,
+                attachments,
+                s.pending_started_at,
+                source=effective_source,
+            )
+        if not defer_save:
             s.save()
-        except Exception:
-            # #6869 re-gate: a save() throw after writeback-owner registration
-            # would otherwise leak the SESSION_WRITEBACK_OWNERS entry. The
-            # existing compare-and-clear helper is the right primitive — it
-            # only clears if this failed stream still owns the session, so a
-            # successor's claim is never touched. Re-raise so the caller's
-            # launch-abort path can complete the rest of the cleanup.
-            clear_session_writeback_owner_if_owned(s.session_id, stream_id)
-            raise
+    except Exception:
+        _abort_launched_stream(s, stream_id, reset_session=True)
+        raise
 
 
 def _cleanup_chat_start_launch_failure(session, stream_id: str) -> None:
@@ -23605,27 +23733,17 @@ def _start_regeneration_stream_locked(
         )
 
     def _cleanup_owned_start():
-        if goal_related:
-            STREAM_GOAL_RELATED.pop(stream_id, None)
-        with STREAMS_LOCK:
-            STREAMS.pop(stream_id, None)
-        unregister_stream_owner(stream_id)
-        clear_session_writeback_owner_if_owned(s.session_id, stream_id)
-        if gateway_starting:
-            try:
-                from api.gateway_chat import (
-                    _clear_gateway_run_starting,
-                    _finish_gateway_run_starting,
-                )
-
-                _finish_gateway_run_starting(stream_id)
-                _clear_gateway_run_starting(stream_id)
-            except Exception:
-                logger.debug(
-                    "Failed to clear compensated gateway start %s",
-                    stream_id,
-                    exc_info=True,
-                )
+        # #6869 re-gate: same shared launch-abort helper the other three sites
+        # use. This path deliberately does NOT reset the persisted session
+        # fields — the caller's compensation (restore_regeneration_state /
+        # interrupted-journal bookkeeping) owns that, and it must survive a
+        # partially-accepted regeneration.
+        _abort_launched_stream(
+            s,
+            stream_id,
+            gateway_starting=gateway_starting,
+            goal_related=goal_related,
+        )
 
     try:
         applied, retained_context_user = apply_regeneration_plan(
@@ -24035,47 +24153,46 @@ def _start_chat_stream_for_session(
         logger.warning("Failed to append submitted turn journal event", exc_info=True)
     diag.stage("set_last_workspace") if diag else None
     set_last_workspace(workspace, profile=getattr(s, "profile", None))
-    diag.stage("stream_registration") if diag else None
-    stream = create_stream_channel()
-    register_stream_owner(stream_id, s.session_id)
-    with STREAMS_LOCK:
-        STREAMS[stream_id] = stream
-    # #1932: mark stream as goal-related so the streaming hook evaluates the goal.
-    if goal_related:
-        STREAM_GOAL_RELATED[stream_id] = True
-    diag.stage("worker_thread_start") if diag else None
-    worker_target = _run_gateway_chat_streaming if backend_is_gateway else _run_agent_streaming
-    worker_kwargs = {"model_provider": model_provider, "goal_related": goal_related}
-    if moa_config and not backend_is_gateway:
-        worker_kwargs["moa_config"] = moa_config
-    if backend_is_gateway:
-        from api.gateway_chat import _mark_gateway_run_starting
-        _mark_gateway_run_starting(stream_id)
-    thr = threading.Thread(
-        target=worker_target,
-        args=(s.session_id, msg, model, workspace, stream_id, attachments),
-        kwargs=worker_kwargs,
-        daemon=True,
-    )
+    # #6869 re-gate: everything below (channel registration, the Gateway
+    # lifecycle marker, thread construction, thread start) runs after the
+    # writeback owner was registered by _prepare_chat_start_session_for_stream.
+    # A failure here used to leave STREAMS, the stream-owner registry, the
+    # writeback owner and the session's own active_stream_id/pending_* fields
+    # pointing at a stream with no worker — the dead channel makes every later
+    # send for this session return 409 (bricked until restart). Route all of
+    # them through the shared launch-abort helper.
     try:
+        diag.stage("stream_registration") if diag else None
+        stream = create_stream_channel()
+        register_stream_owner(stream_id, s.session_id)
+        with STREAMS_LOCK:
+            STREAMS[stream_id] = stream
+        # #1932: mark stream as goal-related so the streaming hook evaluates the goal.
+        if goal_related:
+            STREAM_GOAL_RELATED[stream_id] = True
+        diag.stage("worker_thread_start") if diag else None
+        worker_target = _run_gateway_chat_streaming if backend_is_gateway else _run_agent_streaming
+        worker_kwargs = {"model_provider": model_provider, "goal_related": goal_related}
+        if moa_config and not backend_is_gateway:
+            worker_kwargs["moa_config"] = moa_config
+        if backend_is_gateway:
+            from api.gateway_chat import _mark_gateway_run_starting
+            _mark_gateway_run_starting(stream_id)
+        thr = threading.Thread(
+            target=worker_target,
+            args=(s.session_id, msg, model, workspace, stream_id, attachments),
+            kwargs=worker_kwargs,
+            daemon=True,
+        )
         thr.start()
     except Exception:
-        # #6869 re-gate: the existing launch-abort cleanup covers the
-        # Gateway lifecycle markers but not the per-session writeback
-        # owner registered by _prepare_chat_start_session_for_stream.
-        # A successful thr.start() is what made that registration
-        # load-bearing; if start() raises, the entry is now a leak.
-        # compare-and-clear so a successor's claim is untouched.
-        clear_session_writeback_owner_if_owned(s.session_id, stream_id)
-        if backend_is_gateway:
-            try:
-                from api.gateway_chat import _finish_gateway_run_starting
-                _finish_gateway_run_starting(stream_id)
-                from api.gateway_chat import _clear_gateway_run_starting
-                _clear_gateway_run_starting(stream_id)
-            except Exception:
-                logger.debug("Failed to record gateway run-start failure for stream %s", stream_id, exc_info=True)
-        _cleanup_chat_start_launch_failure(s, stream_id)
+        _abort_launched_stream(
+            s,
+            stream_id,
+            gateway_starting=backend_is_gateway,
+            goal_related=goal_related,
+            reset_session=True,
+        )
         raise
     response = {
         "stream_id": stream_id,
