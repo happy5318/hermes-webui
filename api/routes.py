@@ -15754,9 +15754,37 @@ def handle_post(handler, parsed) -> bool:
         provider_id = (body.get("provider") or "").strip().lower()
         if not provider_id:
             return bad(handler, "provider is required")
-        result = remove_provider_key(provider_id)
+        # #7412 round-2: bind the Agent-side cleanup transaction
+        # (``load_pool`` / ``suppress_credential_source`` /
+        # ``invalidate_credential_pool_cache``) to the active
+        # request profile so it operates on the same ``auth.json`` the
+        # ``.env``/``config.yaml`` half just mutated. Without this
+        # scope the credential-pool half ran against the
+        # process-default profile and could delete / suppress a
+        # source in the wrong ``auth.json`` (review #7412 finding P1).
+        # Matches the write-scope pattern at
+        # ``/api/models/live`` (``api/routes.py:13945``).
+        from api.profiles import profile_env_for_active_request
+        with profile_env_for_active_request(
+            "/api/providers/delete", logger_override=logger
+        ):
+            result = remove_provider_key(provider_id)
         if not result.get("ok"):
             return bad(handler, result.get("error", "Unknown error"))
+        # Surface a partial-failure warning (round-2 review P2) so
+        # the client can show "credential pool cleanup incomplete"
+        # instead of silently treating the response as a full
+        # success. The ``.env``/``config.yaml`` half is already
+        # committed at this point; we cannot roll it back.
+        cleanup = result.get("cleanup") or {}
+        if cleanup and not cleanup.get("ok"):
+            result["warning"] = (
+                "credential pool cleanup incomplete: "
+                f"skipped={cleanup.get('skipped')!r} "
+                f"pool={cleanup.get('pool')} "
+                f"suppress={cleanup.get('suppress')} "
+                f"cache={cleanup.get('cache')}"
+            )
         return j(handler, result)
 
     if parsed.path == "/api/providers/self-hosted":

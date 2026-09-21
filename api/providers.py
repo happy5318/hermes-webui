@@ -2987,7 +2987,59 @@ def remove_provider_key(provider_id: str) -> dict[str, Any]:
     the source of truth for this contract; the WebUI previously
     bypassed it entirely.
 
-    Returns a status dict with the operation result.
+    **Profile scope (round-2 review):** this helper MUST be called
+    inside ``profile_env_for_active_request`` (or
+    ``profile_env_for_active_request_readonly`` when the caller is
+    read-only) so the Agent-side ``load_pool``/``suppress``/
+    ``invalidate`` resolves the *request* profile's ``auth.json`` and
+    not the process-default one. The DELETE route at
+    ``/api/providers/delete`` wraps the call in the write-scope
+    context manager (matches the ``/api/models/live`` pattern at
+    ``api/routes.py:13945``).
+
+    Returns:
+        Status dict. The top-level ``ok``/``action``/``error`` fields
+        describe the ``.env`` + ``config.yaml`` half. The
+        ``cleanup`` key (only present when the ``.env`` half ran)
+        describes the credential-pool purge outcome:
+
+        ```
+        {
+            "ok": bool,            # True iff the .env half completed
+            "action": "removed",
+            "error": str | None,
+            "cleanup": {
+                "ok": bool,        # True iff all three substeps succeeded
+                "skipped": str | None,  # set when the whole step is skipped
+                                        # (e.g. agent.credential_pool absent)
+                "pool": {
+                    "ok": bool,
+                    "removed": int,    # env-sourced entries dropped
+                    "error": str | None,
+                },
+                "suppress": {
+                    "ok": bool,
+                    "sources": list[str],  # sources marked suppressed
+                    "error": str | None,
+                },
+                "cache": {
+                    "ok": bool,
+                    "error": str | None,
+                },
+            },
+        }
+        ```
+
+    **Failure semantics:** the top-level ``ok`` reflects only the
+    ``.env``/``config.yaml`` half and is the contract the route uses
+    to decide HTTP 200 vs 4xx. The ``cleanup`` outcome is reported
+    separately so a partial pool failure (e.g. ``invalidate_cache``
+    raised) cannot roll back the ``.env`` success AND cannot
+    silently claim full removal: the route surfaces a ``warning``
+    field to the client when ``cleanup.ok`` is false. The
+    earlier (round-1) implementation swallowed every exception and
+    reported ``ok: true`` even when no pool row was dropped;
+    round-2 records each step's outcome on the dict.
     """
     result = set_provider_key(provider_id, None)
 
@@ -2996,17 +3048,18 @@ def remove_provider_key(provider_id: str) -> dict[str, Any]:
     # Clean those up so _provider_has_key() returns False after removal.
     if result.get("ok"):
         _clean_provider_key_from_config(provider_id)
-        # #7412: complete the removal by dropping the credential pool
-        # entry and marking the env source as suppressed. Wrap in
-        # try/except so a failure in the new path does not roll back
-        # the .env/config.yaml cleanup the user has already been
-        # told succeeded.
-        _purge_provider_from_credential_pool(provider_id)
+        # #7412 round-2: complete the removal by dropping the credential
+        # pool entry and marking the env source as suppressed. The
+        # outcome is attached to the result so the route can surface
+        # partial-failure as a `warning` field rather than a silent
+        # ok:true. Failures inside the helper are recorded, not
+        # swallowed: see ``_purge_provider_from_credential_pool``.
+        result["cleanup"] = _purge_provider_from_credential_pool(provider_id)
 
     return result
 
 
-def _purge_provider_from_credential_pool(provider_id: str) -> None:
+def _purge_provider_from_credential_pool(provider_id: str) -> dict[str, Any]:
     """Drop env-seeded entries from ``credential_pool`` and mark the
     source as suppressed so the next ``load_pool`` does not re-seed it.
 
@@ -3015,26 +3068,63 @@ def _purge_provider_from_credential_pool(provider_id: str) -> None:
     ``hermes_cli/auth_commands.py::auth_remove_command``. The WebUI
     was previously calling only the .env/config.yaml half, which left
     an orphaned pool row and a missing ``suppressed_sources`` marker
-    behind. Fail-closed: any exception here is swallowed so the
-    .env/config.yaml half of the removal (already done by the caller)
-    is not rolled back. The orphaned entry is benign on the next
-    ``load_pool`` because the env var no longer exists; the real
-    concern is the missing suppression marker that would let a
-    re-exported env var silently re-seed the row.
+    behind.
+
+    **Profile scope (round-2 review):** this helper resolves
+    ``agent.credential_pool`` / ``hermes_cli.auth`` at call time, so
+    the call site MUST run inside the request profile's
+    ``profile_env_for_active_request`` scope (the DELETE route does
+    this). The helper itself does not re-apply the scope -- it
+    assumes the caller has already done so.
+
+    Returns:
+        Outcome dict with per-step status. See ``remove_provider_key``
+        for the full shape. The top-level ``ok`` is True only if
+        every substep succeeded AND there was at least one
+        env-sourced entry to clean (or zero entries and cache
+        invalidation succeeded).
+
+    **Failure semantics (round-2):** each substep records its own
+    status. A failure in one substep does not short-circuit the
+    others: the helper still attempts ``suppress`` and
+    ``invalidate`` after a ``remove_index`` failure so the worst-case
+    residual state is "suppression marker present, env-source
+    re-seeded on next ``load_pool``" instead of the round-1 worst
+    case "no suppression marker, env-source re-seeded".
     """
+    outcome: dict[str, Any] = {
+        "ok": True,
+        "skipped": None,
+        "pool": {"ok": True, "removed": 0, "error": None},
+        "suppress": {"ok": True, "sources": [], "error": None},
+        "cache": {"ok": True, "error": None},
+    }
+
     try:
         from agent.credential_pool import load_pool as _load_pool
-    except Exception:
-        return
+    except Exception as exc:
+        outcome["ok"] = False
+        outcome["skipped"] = (
+            f"agent.credential_pool unavailable: {type(exc).__name__}"
+        )
+        return outcome
+
+    # ``suppress_credential_source`` may be missing in stripped-down
+    # test envs; treat as best-effort and record the absence on the
+    # outcome (round-1 silently dropped the marker in this case).
+    suppress_fn = None
     try:
-        from hermes_cli.auth import suppress_credential_source as _suppress
+        from hermes_cli.auth import suppress_credential_source as suppress_fn
     except Exception:
-        _suppress = None  # suppress may be missing in some test envs
+        suppress_fn = None
 
     try:
         pool = _load_pool(provider_id)
-    except Exception:
-        return
+    except Exception as exc:
+        outcome["ok"] = False
+        outcome["pool"]["ok"] = False
+        outcome["pool"]["error"] = f"{type(exc).__name__}: {exc}"
+        return outcome
 
     # Snapshot the source list before we mutate the pool so we can
     # suppress each one exactly once even if remove_index shifts
@@ -3047,14 +3137,22 @@ def _purge_provider_from_credential_pool(provider_id: str) -> None:
         and entry.source.startswith("env:")
     ]
     if not sources_to_suppress:
-        return
+        # Nothing pool-side to do; still invalidate the cache so any
+        # stale snapshot is dropped before the next read.
+        _invalidate_pool_cache(provider_id, outcome)
+        return outcome
 
     # Drop every env-seeded entry from the pool. ``remove_index`` is
     # index-based, so iterate over a snapshot of valid indices and
     # resolve each one against the live pool so re-numbering does not
-    # skip an entry.
+    # skip an entry. We continue past individual remove_index failures
+    # so one bad entry does not leave the others behind.
+    removed = 0
     for entry in list(pool.entries()):
-        if not (isinstance(entry, object) and isinstance(getattr(entry, "source", None), str)):
+        if not (
+            isinstance(entry, object)
+            and isinstance(getattr(entry, "source", None), str)
+        ):
             continue
         if not entry.source.startswith("env:"):
             continue
@@ -3069,27 +3167,59 @@ def _purge_provider_from_credential_pool(provider_id: str) -> None:
             continue
         try:
             pool.remove_index(idx)
-        except Exception:
-            continue
+            removed += 1
+        except Exception as exc:
+            outcome["ok"] = False
+            outcome["pool"]["ok"] = False
+            outcome["pool"]["error"] = (
+                outcome["pool"]["error"]
+                or f"remove_index failed: {type(exc).__name__}: {exc}"
+            )
+            # Continue to try the remaining env entries.
+    outcome["pool"]["removed"] = removed
 
     # Mark each env source as suppressed so load_pool() does not
-    # re-seed it. suppress_credential_source may be missing in
-    # stripped-down test envs; that is a best-effort signal the
-    # upstream Agent CLI will fill in on its next auth-touching call.
-    if _suppress is not None:
+    # re-seed it. Continue past individual suppress failures so one
+    # bad source does not leave the others un-suppressed.
+    if suppress_fn is not None:
         for src in sources_to_suppress:
             try:
-                _suppress(provider_id, src)
-            except Exception:
-                continue
+                suppress_fn(provider_id, src)
+                outcome["suppress"]["sources"].append(src)
+            except Exception as exc:
+                outcome["ok"] = False
+                outcome["suppress"]["ok"] = False
+                if outcome["suppress"]["error"] is None:
+                    outcome["suppress"]["error"] = (
+                        f"suppress_credential_source failed for {src}: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+    else:
+        outcome["ok"] = False
+        outcome["suppress"]["ok"] = False
+        outcome["suppress"]["error"] = (
+            "hermes_cli.auth.suppress_credential_source unavailable"
+        )
 
     # Drop any cached pool snapshot the WebUI is holding so the next
     # read goes through load_pool() and sees the cleaned state.
+    _invalidate_pool_cache(provider_id, outcome)
+
+    return outcome
+
+
+def _invalidate_pool_cache(provider_id: str, outcome: dict[str, Any]) -> None:
+    """Invalidate the WebUI-side credential-pool cache, recording any
+    failure on ``outcome['cache']`` so the caller can surface a partial
+    failure to the client. Round-1 silently swallowed this error.
+    """
     try:
         from api.config import invalidate_credential_pool_cache
         invalidate_credential_pool_cache(provider_id)
-    except Exception:
-        pass
+    except Exception as exc:
+        outcome["ok"] = False
+        outcome["cache"]["ok"] = False
+        outcome["cache"]["error"] = f"{type(exc).__name__}: {exc}"
 
 
 
