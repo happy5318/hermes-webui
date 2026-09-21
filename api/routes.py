@@ -14617,7 +14617,6 @@ def handle_get(handler, parsed) -> bool:
         return j(handler, list_scripts())
 
     if parsed.path == "/api/scripts/raw":
-        from urllib.parse import parse_qs
         qs = parse_qs(parsed.query or "")
         name = (qs.get("name") or [None])[0]
         if not name:
