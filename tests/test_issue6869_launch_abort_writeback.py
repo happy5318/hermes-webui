@@ -19,7 +19,7 @@ caller can complete the rest of the cleanup.
 """
 
 import threading
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
 import pytest
 
