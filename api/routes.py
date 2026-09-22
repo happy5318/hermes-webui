@@ -593,7 +593,15 @@ def _request_session_visibility_exempt(method: str, path: str | None) -> bool:
 
 
 def _session_id_visible_to_request_profile(handler, sid, *, emit_error: bool = True) -> bool:
-    """Return whether ``sid`` belongs to the active profile."""
+    """Return whether ``sid`` belongs to the active profile.
+
+    On a profile mismatch, the helper mirrors the detail-load endpoint's
+    contract (#13043, #13493): return ``409 session_profile_mismatch`` for
+    a session owned by a KNOWN other profile, and keep ``404 Session
+    not found`` only for the unknown/legacy None-profile case so the
+    frontend's self-heal (clear stale URL + localStorage) keeps firing
+    for actually-missing sids. ``#7710``.
+    """
     if not isinstance(sid, str) or not sid:
         return True
     if not is_safe_session_id(sid):
@@ -602,9 +610,23 @@ def _session_id_visible_to_request_profile(handler, sid, *, emit_error: bool = T
         session = get_session(sid, metadata_only=True)
     except KeyError:
         return True
-    if not _session_visible_to_active_profile(getattr(session, "profile", None), handler):
+    session_profile = getattr(session, "profile", None) or None
+    if not _session_visible_to_active_profile(session_profile, handler):
         if emit_error:
-            bad(handler, "Session not found", 404)
+            if session_profile:
+                j(handler, {
+                    "error": "Session belongs to a different profile",
+                    "code": "session_profile_mismatch",
+                    "session_id": sid,
+                    "profile": session_profile,
+                }, status=409)
+            else:
+                # Unknown/legacy None-profile sidecar: keep the 404 so the
+                # frontend's self-heal still fires. _profiles_match coerces
+                # None->'default', so a truly missing/legacy session under a
+                # non-default active profile would otherwise emit a useless
+                # 409 with profile=null.
+                bad(handler, "Session not found", 404)
         return False
     return True
 
@@ -5323,7 +5345,21 @@ def _handle_session_anchor_scene(handler, body):
     # this an authenticated request under profile A could persist anchor scenes
     # onto a session owned by profile B (cross-profile write). Reject as 404 —
     # same shape the read path uses — and leave anchor_activity_scenes untouched.
-    if not _session_visible_to_active_profile(getattr(s, "profile", None) or None, handler):
+    # #7710: cross-profile writes are rejected with 409
+    # ``session_profile_mismatch`` so the client can offer to switch
+    # to the owning profile (mirrors the detail-load endpoint's
+    # contract at #13043 / #13493). 404 is preserved for the
+    # None-profile (unknown/legacy) case so the frontend self-heal
+    # path still fires for actually-missing sids.
+    _anchor_session_profile = getattr(s, "profile", None) or None
+    if not _session_visible_to_active_profile(_anchor_session_profile, handler):
+        if _anchor_session_profile:
+            return j(handler, {
+                "error": "Session belongs to a different profile",
+                "code": "session_profile_mismatch",
+                "session_id": sid,
+                "profile": _anchor_session_profile,
+            }, status=409)
         return bad(handler, "Session not found", 404)
     with _get_session_agent_lock(sid):
         idx, message = _find_anchor_scene_message(
@@ -23970,6 +24006,17 @@ def _handle_session_compression_recovery_start(handler, body):
     except KeyError:
         return bad(handler, "Session not found", 404)
     if not _session_visible_to_active_profile(getattr(source, "profile", None), handler):
+        # #7710: same contract as the detail-load endpoint — 409
+        # ``session_profile_mismatch`` for a known other profile,
+        # 404 only for the None-profile self-heal path.
+        _recovery_session_profile = getattr(source, "profile", None)
+        if _recovery_session_profile:
+            return j(handler, {
+                "error": "Session belongs to a different profile",
+                "code": "session_profile_mismatch",
+                "session_id": sid,
+                "profile": _recovery_session_profile,
+            }, status=409)
         return bad(handler, "Session not found", 404)
     recovery = compression_recovery_payload_for_session(source)
     if not recovery:
@@ -24369,6 +24416,17 @@ def _handle_chat_start(handler, body, diag=None):
                 # Empty placeholders can still be retagged when the
                 # requested profile matches the active request profile.
                 s.profile = requested_profile
+            elif session_profile:
+                # #7710: known other profile → 409 ``session_profile_mismatch``
+                # so the client can offer to switch to it (#5419).
+                # 404 is preserved only for the None-profile
+                # (unknown/legacy) self-heal case.
+                return j(handler, {
+                    "error": "Session belongs to a different profile",
+                    "code": "session_profile_mismatch",
+                    "session_id": body.get("session_id", ""),
+                    "profile": session_profile,
+                }, status=409)
             else:
                 return bad(handler, "Session not found", 404)
         # Resolve durable rotations before any workspace/model/pending mutation.
@@ -28597,6 +28655,16 @@ def _handle_session_import_cli(handler, body):
             if requested_profile and not _profiles_match(existing_profile, requested_profile):
                 return bad(handler, "Session not found in CLI store", 404)
         elif not _session_visible_to_active_profile(existing_profile, handler):
+            # #7710: same contract as the detail-load endpoint —
+            # 409 ``session_profile_mismatch`` for a known other
+            # profile, 404 only for the None-profile self-heal path.
+            if existing_profile:
+                return j(handler, {
+                    "error": "Session belongs to a different profile",
+                    "code": "session_profile_mismatch",
+                    "session_id": sid,
+                    "profile": existing_profile,
+                }, status=409)
             return bad(handler, "Session not found in CLI store", 404)
         refresh_profile = requested_profile or existing_profile
         cli_meta = _resolve_cli_import_metadata(
