@@ -6943,8 +6943,8 @@ def _configured_model_badges_from_static_catalog(
     for entry in configured_entries:
         provider = entry["provider"]
         model = entry["model"]
-        raw_candidates = []
-        for candidate in (model, f"{provider}/{model}", f"@{provider}:{model}"):
+        raw_candidates: list[str] = []
+        for candidate in (model, f"@{provider}:{model}"):
             if candidate and candidate not in raw_candidates:
                 raw_candidates.append(candidate)
 
@@ -8618,10 +8618,9 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
             for entry in configured_entries:
                 provider = entry["provider"]
                 model = entry["model"]
-                raw_candidates = []
+                raw_candidates: list[str] = []
                 for candidate in (
                     model,
-                    f"{provider}/{model}",
                     f"@{provider}:{model}",
                 ):
                     if candidate and candidate not in raw_candidates:
