@@ -7898,7 +7898,22 @@ function renderMd(raw){
     // backticks stays protected as a \x00C token and is never rendered as <img>.
     // Must run before _code_stash restore and before _link_stash so the image
     // is not consumed by the [label](url) link regex.
-    t=t.replace(/!\[([^\]]*)\]\(((?:https?:\/\/|file:\/\/|data:image\/)[^\)]+)\)/g,(_,alt,url)=>(typeof _mdImageHtml==='function')?_mdImageHtml(alt,url):`<img src="${url.replace(/"/g,'%22')}" alt="${esc(alt)}" class="msg-media-img" loading="lazy">`);
+    // #7634: Image pass — runs while code stash is active so ![x](url) inside
+    // backticks stays protected as a \x00C token and is never rendered as <img>.
+    // Must run before _code_stash restore and before _link_stash so the image
+    // is not consumed by the [label](url) link regex. The `\s*` between
+    // `]` and `(` accepts an optional whitespace gap (incl. line break) so
+    // Markdown image syntax that was split by the model across a line break
+    // — e.g. when a long local-cache path was wrapped inside the parens —
+    // still renders the image instead of leaking the alt text.  A second
+    // `\s*` AFTER the `(` covers the symmetric "scheme preceded by space"
+    // case (e.g. `]( https://...)`) that the URL-scheme class itself
+    // refuses to absorb — without it the URL group would have to start
+    // immediately after `(`, so a leading space inside the parens would
+    // silently break the match.  We still require the `!` prefix and the
+    // URL scheme (https?://|file://|data:), so plain text that happens to
+    // contain a `]…(` pair cannot be misclassified as an image.
+    t=t.replace(/!\[([^\]]*)\]\s*\(\s*((?:https?:\/\/|file:\/\/|data:image\/)[^\)]+)\)/g,(_,alt,url)=>(typeof _mdImageHtml==='function')?_mdImageHtml(alt,url):`<img src="${url.replace(/"/g,'%22')}" alt="${esc(alt)}" class="msg-media-img" loading="lazy">`);
     // Stash rendered <img> tags so autolink never matches URLs inside src=
     const _img_stash=[];
     t=t.replace(/(<img\b[^>]*>)/g,m=>{_img_stash.push(m);return `\x00G${_img_stash.length-1}\x00`;});
@@ -8087,7 +8102,15 @@ function renderMd(raw){
   // #487: Outer image pass — handles ![alt](url) in plain paragraphs (outside tables/lists).
   // Runs AFTER the table pass (images in table cells are handled by inlineMd() above).
   // Runs BEFORE the outer [label](url) link pass so the image is not consumed as a plain link.
-  s=s.replace(/!\[([^\]]*)\]\(((?:https?:\/\/|file:\/\/|data:image\/)[^\)]+)\)/g,(_,alt,url)=>(typeof _mdImageHtml==='function')?_mdImageHtml(alt,url):`<img src="${url.replace(/"/g,'%22')}" alt="${esc(alt)}" class="msg-media-img" loading="lazy">`);
+  // #487 + #7634: Outer image pass — handles ![alt](url) in plain paragraphs (outside tables/lists).
+  // Runs AFTER the table pass (images in table cells are handled by inlineMd() above).
+  // Runs BEFORE the outer [label](url) link pass so the image is not consumed as a plain link.
+  // The `\s*`s around `(` accept an optional whitespace gap (incl. line break) so a
+  // long local-cache path that the model wrapped across a line break — or a path
+  // preceded by an inline space inside the parens — still renders the image instead
+  // of leaking the alt text.  The URL-scheme class still anchors the match, so a
+  // `]…(` pair in plain text cannot be misclassified as an image.
+  s=s.replace(/!\[([^\]]*)\]\s*\(\s*((?:https?:\/\/|file:\/\/|data:image\/)[^\)]+)\)/g,(_,alt,url)=>(typeof _mdImageHtml==='function')?_mdImageHtml(alt,url):`<img src="${url.replace(/"/g,'%22')}" alt="${esc(alt)}" class="msg-media-img" loading="lazy">`);
   // Outer link pass for labeled links in plain paragraphs (outside table cells).
   // Runs AFTER the table pass so table cells are processed by inlineMd() only.
   // Stash existing <a> tags first to avoid re-linking already-linked URLs.
