@@ -151,14 +151,47 @@ class TestOrphansRemoved:
         repaired = _sanitize_messages_for_api(msgs)
         assert repaired[0]["tool_calls"][0]["call_id"] == "anthropic-1"
 
-    def test_non_adjacent_result_cannot_rescue_earlier_orphan(self):
+    def test_mergeable_assistant_between_call_and_result_keeps_pair(self):
+        """#7237 review: an intervening mergeable assistant row is NOT an
+        orphan signal. The Agent's pass order merges consecutive assistants
+        BEFORE orphan detection, so the sanitizer mirrors it and both the
+        call and its result survive (the old assertion here locked in the
+        data-loss bug and was split per review).
+        """
         msgs = [
             {"role": "assistant", "content": "", "tool_calls": [_call("foreign")]},
             {"role": "assistant", "content": "intervening"},
             {"role": "tool", "tool_call_id": "foreign", "content": "late result"},
         ]
         repaired = _sanitize_messages_for_api(msgs)
-        assert repaired == [{"role": "assistant", "content": "intervening"}]
+        # Merged survivor carries the call; the late result pairs with it.
+        assert any(
+            tc.get("id") == "foreign"
+            for m in repaired for tc in (m.get("tool_calls") or [])
+        ), "merged assistant keeps the call"
+        assert any(
+            m.get("role") == "tool" and m.get("tool_call_id") == "foreign"
+            for m in repaired
+        ), "the late result survives"
+
+    def test_user_boundary_between_call_and_result_still_orphans(self):
+        """Genuine boundary case (split from the old non-adjacent test): a
+        USER row between the call and its result breaks adjacency for real —
+        the call is an orphan and the result is dropped."""
+        msgs = [
+            {"role": "assistant", "content": "", "tool_calls": [_call("foreign")]},
+            {"role": "user", "content": "interrupt"},
+            {"role": "tool", "tool_call_id": "foreign", "content": "late result"},
+        ]
+        repaired = _sanitize_messages_for_api(msgs)
+        assert not any(
+            tc.get("id") == "foreign"
+            for m in repaired for tc in (m.get("tool_calls") or [])
+        ), "call across a user boundary is an orphan"
+        assert not any(
+            m.get("role") == "tool" and m.get("tool_call_id") == "foreign"
+            for m in repaired
+        ), "result across a user boundary is dropped"
 
     def test_orphan_before_trailing_row_still_stripped(self):
         msgs = [_assistant(["ghost"], content="text"), _assistant(["second-ghost"])]

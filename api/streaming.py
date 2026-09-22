@@ -2366,6 +2366,7 @@ def _settle_result_messages(
             previous_context_messages,
             next_context_messages,
             msg_text,
+            active_turn_identity=active_turn_identity,
         )
         next_context_messages = _settle_current_turn_boundary(
             previous_context_messages,
@@ -5915,6 +5916,12 @@ def _sanitize_messages_for_api(
         if sanitized.get('role'):
             clean.append(sanitized)
 
+    # Merge consecutive assistant rows BEFORE positional orphan pairing, so a
+    # legitimate ``assistant(call), assistant(progress), tool(result)`` shape
+    # is seen as the paired shape the Agent's own pass order produces (#7237
+    # review, blocker 2). Mirrors agent repair pass 0.
+    clean = _merge_consecutive_assistant_rows(clean)
+
     # Repair adjacent tool-call/result blocks before validating tool results
     # globally. Otherwise a result belonging to a later, unrelated turn can
     # make an earlier orphan call look answered and survive this projection.
@@ -6075,6 +6082,49 @@ def _api_safe_message_positions(messages):
         if sanitized.get('role'):
             out.append((idx, sanitized))
 
+    # Merge consecutive assistant rows BEFORE positional orphan pairing —
+    # mirror of _sanitize_messages_for_api (Agent pass-0 order, #7237
+    # blocker 2). This path carries (original_index, msg) pairs: the merged
+    # survivor keeps the FIRST row's original index so downstream alignment
+    # (e.g. _restore_reasoning_metadata_before_boundary) still maps onto the
+    # raw list.
+    merged_rows: list = []
+    for idx, msg in out:
+        if not isinstance(msg, dict):
+            merged_rows.append((idx, msg))
+            continue
+        prev_pair = merged_rows[-1] if merged_rows and isinstance(merged_rows[-1][1], dict) else None
+        if (
+            prev_pair is not None
+            and prev_pair[1].get('role') == 'assistant'
+            and msg.get('role') == 'assistant'
+            and not _is_codex_interim_row(msg)
+            and not _is_codex_interim_row(prev_pair[1])
+        ):
+            prev_idx, prev = prev_pair
+            if prev.get('finish_reason') in ('verification_required', 'verify_hook_continue'):
+                merged_rows[-1] = (prev_idx, msg)
+                continue
+            prev_calls = list(prev.get('tool_calls') or [])
+            new_calls = list(msg.get('tool_calls') or [])
+            if new_calls:
+                prev['tool_calls'] = prev_calls + new_calls
+            elif prev_calls:
+                prev['tool_calls'] = prev_calls
+            else:
+                prev.pop('tool_calls', None)
+            prev_content = prev.get('content')
+            new_content = msg.get('content')
+            if isinstance(prev_content, str) and isinstance(new_content, str):
+                joined = '\n'.join(p for p in (prev_content.strip(), new_content.strip()) if p)
+                if joined:
+                    prev['content'] = joined
+            elif not prev_content and new_content is not None:
+                prev['content'] = new_content
+            continue
+        merged_rows.append((idx, msg))
+    out = merged_rows
+
     # Repair adjacent tool-call/result blocks before validating tool results
     # globally, matching _sanitize_messages_for_api.
     original_out = out
@@ -6208,6 +6258,83 @@ def _deduplicate_context_messages(messages):
             seen.add(key)
         deduped.append(msg)
     return deduped
+
+
+
+
+def _is_codex_interim_row(msg):
+    """Mirror agent.agent_runtime_helpers._is_codex_interim (read-only check)."""
+    return bool(
+        (msg.get('codex_reasoning_items') if isinstance(msg, dict) else None)
+        or (msg.get('codex_message_items') if isinstance(msg, dict) else None)
+        or (isinstance(msg, dict) and msg.get('finish_reason') == 'incomplete')
+    )
+
+
+def _merge_consecutive_assistant_rows(messages):
+    """Context-only merge of consecutive assistant rows (Agent pass-0 mirror).
+
+    The Agent's ``repair_message_sequence`` merges consecutive assistant turns
+    BEFORE orphan detection so the merged tool_call-id union is known; the
+    WebUI's outbound sanitizer must mirror that order or a legitimate
+    ``assistant(call), assistant(progress), tool(result)`` shape is
+    misclassified as an orphan and silently dropped (#7237 review, blocker 2).
+
+    Codex interim rows are exempt (they carry their own continuation state),
+    and a provisional verification candidate is superseded, not unioned —
+    both mirroring ``_merge_consecutive_assistants`` in the installed runtime.
+    Copy-on-write: input rows are never mutated; only merged rows are new.
+    Returns a new list.
+    """
+    if not isinstance(messages, list):
+        return messages
+    merged: list = []
+    cloned: set = set()  # indexes into `merged` that are safe to mutate
+    for msg in messages:
+        if not isinstance(msg, dict):
+            merged.append(msg)
+            continue
+        prev = merged[-1] if merged and isinstance(merged[-1], dict) else None
+        if (
+            prev is not None
+            and prev.get('role') == 'assistant'
+            and msg.get('role') == 'assistant'
+            and not _is_codex_interim_row(msg)
+            and not _is_codex_interim_row(prev)
+        ):
+            # Copy-on-write: clone the survivor before the first in-place
+            # merge so input rows are never mutated (same contract as
+            # _strip_orphan_tool_calls).
+            if len(merged) - 1 not in cloned:
+                merged[-1] = copy.deepcopy(prev)
+                cloned.add(len(merged) - 1)
+            prev = merged[-1]
+            if prev.get('finish_reason') in ('verification_required', 'verify_hook_continue'):
+                # Superseded candidate: replace rather than union. The input
+                # row is now shared (not cloned); drop any stale clone mark.
+                merged[-1] = msg
+                cloned.discard(len(merged) - 1)
+                continue
+            # Union tool_calls; drop stale empty tool_calls on the survivor.
+            prev_calls = list(prev.get('tool_calls') or [])
+            new_calls = list(msg.get('tool_calls') or [])
+            if new_calls:
+                prev['tool_calls'] = prev_calls + new_calls
+            elif prev_calls:
+                prev['tool_calls'] = prev_calls
+            else:
+                prev.pop('tool_calls', None)
+            prev_content = prev.get('content')
+            new_content = msg.get('content')
+            if isinstance(prev_content, str) and isinstance(new_content, str):
+                joined = '\n'.join(p for p in (prev_content.strip(), new_content.strip()) if p)
+                if joined:
+                    prev['content'] = joined
+            elif not prev_content and new_content is not None:
+                prev['content'] = new_content
+            continue
+        merged.append(msg)
+    return merged
 
 
 def _strip_orphan_tool_calls(messages):
@@ -6828,8 +6955,27 @@ def _strip_replayed_context_items(existing_messages, candidates):
     return cleaned
 
 
-def _dedupe_replayed_context_messages(previous_context, result_messages, msg_text=None):
-    """Keep model context append-only without replayed blocks/summaries."""
+def _looks_like_current_user_turn_scan(messages, msg_text):
+    """Return the index of the first row that looks like the current user turn.
+
+    Scan companion to ``_looks_like_current_user_turn`` for the settle path:
+    walks ``messages`` and returns the first user row whose workspace-stripped
+    text matches ``msg_text``. Returns None when nothing matches.
+    """
+    for idx, msg in enumerate(messages or []):
+        if _looks_like_current_user_turn(msg, msg_text):
+            return idx
+    return None
+
+
+def _dedupe_replayed_context_messages(previous_context, result_messages, msg_text=None, active_turn_identity=None):
+    """Keep model context append-only without replayed blocks/summaries.
+
+    When the replayed prefix no longer matches the raw pre-turn context and no
+    compression marker explains the rotation, the raw previous context is
+    authoritative: only the current-turn slice (located via the active-turn
+    checkpoint / current user row) is settled on top of it (#7237 blocker 1).
+    """
     previous_context = list(previous_context or [])
     result_messages = list(result_messages or [])
     if not previous_context or not result_messages:
@@ -6896,6 +7042,39 @@ def _dedupe_replayed_context_messages(previous_context, result_messages, msg_tex
             if candidates:
                 candidates = _strip_replayed_context_items(previous_context, candidates)
             return previous_context + candidates
+        # Wholesale replacement of the historical prefix is only legitimate
+        # when the model-context layer explicitly rotated the context (a
+        # compression turn). Any other prefix mismatch — including one caused
+        # by this module's own outbound orphan sanitizer rewriting the replayed
+        # prefix — must NOT persist the projected history: the first local turn
+        # after an orphan repair would otherwise permanently remove the
+        # original call/result pair from session.context_messages (silent
+        # data loss, #7237 review blocker 1). Keep the authoritative raw
+        # pre-turn context and settle only the current-turn slice on top.
+        _has_compression_marker = any(
+            _is_context_compression_marker(m) for m in result_messages
+        )
+        if not _has_compression_marker:
+            _boundary_idx = _find_active_turn_checkpoint_index(
+                result_messages, previous_context, active_turn_identity, msg_text,
+            )
+            if _boundary_idx is None:
+                _boundary_idx = _looks_like_current_user_turn_scan(
+                    result_messages, msg_text,
+                )
+            if _boundary_idx is not None:
+                # Current-turn slice: everything from the boundary row on.
+                _current_slice = result_messages[_boundary_idx:]
+                _current_slice = _strip_replayed_prefix(previous_context, _current_slice)
+                if _current_slice:
+                    _current_slice = _strip_replayed_context_items(previous_context, _current_slice)
+                logger.info(
+                    "Prefix mismatch without compression: keeping raw pre-turn context "
+                    "(%d rows) + current-turn slice (boundary at %d); wholesale "
+                    "acceptance suppressed (#7237 blocker 1)",
+                    len(previous_context), _boundary_idx,
+                )
+                return list(previous_context) + _current_slice
         return result_messages
     candidates = result_messages[len(previous_context):]
     # Strip stale merges only from the new-turn candidate slice so that
