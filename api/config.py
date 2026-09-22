@@ -10504,6 +10504,18 @@ def get_available_models_for_session_visit() -> dict:
         _mark("memory_cache_miss_loading_disk")
         disk_cached = _load_models_cache_from_disk()
         if disk_cached is not None:
+            # Fix #7723: re-stamp the on-disk mtime so the 300 s session-visit
+            # freshness window slides forward on every hit instead of acting
+            # as a one-shot window that permanently forces a live rebuild once
+            # the mtime goes stale. The hit path returns the cached payload
+            # unmodified; only the file mtime advances. Errors are swallowed
+            # so a read-only filesystem or missing file (e.g. another process
+            # pruned the cache between ``_load_models_cache_from_disk`` and
+            # here) never breaks the response path.
+            try:
+                os.utime(cache_path, None)
+            except OSError:
+                pass
             with _available_models_cache_lock:
                 cached = _get_fresh_memory_models_cache(time.monotonic())
                 if cached is not None:
