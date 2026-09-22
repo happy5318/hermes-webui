@@ -202,6 +202,12 @@ _PROTECTED_ENV_KEYS = frozenset({
     'HERMES_WEBUI_ISOLATED_PROFILE',
     # Server-wide sidebar window; a profile .env must not widen the per-request query.
     'HERMES_WEBUI_VISIBLE_SESSION_LIMIT',
+    # #7611: HERMES_WEBUI_INSTANCE_NAME is the deployment's instance label. It is
+    # installation-scoped by definition (it distinguishes Production/Staging/Dev
+    # deployments for every user of that installation), so a per-profile .env must
+    # not be able to rewrite it — otherwise whichever profile loads last wins and
+    # two tabs on one deployment disagree on the label.
+    'HERMES_WEBUI_INSTANCE_NAME',
 })
 
 
