@@ -1232,8 +1232,20 @@ function _renderCronDetail(job){
   if (!title || !body) return;
   title.textContent = job.name || job.schedule_display || '(unnamed)';
   const status = _cronStatusMeta(job);
-  const nextRun = job.next_run_at ? new Date(job.next_run_at).toLocaleString() : t('not_available');
-  const lastRun = job.last_run_at ? new Date(job.last_run_at).toLocaleString() : t('never');
+  // #7140: render `next_run_at` / `last_run_at` in the server's wall-clock
+  // timezone, not the operator's browser zone.  The agent stores these
+  // timestamps in the configured Hermes timezone (e.g. America/Sao_Paulo
+  // for a UTC container), and the cron fires correctly in that zone — but
+  // `new Date(...).toLocaleString()` (without a timezone) renders in the
+  // browser zone, so an operator whose browser is on UTC would see
+  // `1:35 AM` for an `08:00 -03:00` server fire and read it as a
+  // scheduling bug.  `_formatInServerTz()` is the same helper
+  // `static/sessions.js` already exports for the rest of the panels;
+  // using it here pins the cron detail to the server's wall clock
+  // regardless of where the operator opens the WebUI from.
+  const _fmtDate = (typeof _formatInServerTz === 'function') ? _formatInServerTz : (d) => d.toLocaleString();
+  const nextRun = job.next_run_at ? _fmtDate(new Date(job.next_run_at)) : t('not_available');
+  const lastRun = job.last_run_at ? _fmtDate(new Date(job.last_run_at)) : t('never');
   const schedule = job.schedule_display || (job.schedule && job.schedule.expression) || '';
   const skills = Array.isArray(job.skills) && job.skills.length ? job.skills.join(', ') : '—';
   const deliver = job.deliver || 'local';

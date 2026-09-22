@@ -27,6 +27,55 @@ import sys
 import threading
 import time
 import uuid
+# ── server timezone offset (#7140) ─────────────────────────────────────────
+# `time.strftime("%z")` returns the offset of the **process** timezone, not
+# the configured Hermes timezone.  On a typical container deployment the
+# process timezone is UTC, so the operator's WebUI sees cron timestamps
+# in the browser zone (often UTC too) and reads them as scheduling bugs.
+# A first-visit hint to the agent's configured timezone (env override) is
+# the minimum that's needed to make the helper in `static/sessions.js`
+# (`_formatInServerTz`) actually format in the server's wall clock.
+def _server_tz_offset() -> str:
+    """Return the server's wall-clock offset as a string like '+0800' or
+    '-0330', falling back to the process timezone and finally to '+0000'.
+
+    Resolution order:
+      1. ``HERMES_TIMEZONE`` env var (the canonical knob for self-hosted
+         deployments that already configure the agent with a non-UTC zone).
+      2. ``TZ`` env var (the POSIX timezone the OS is configured to;
+         read by libc but not by Python's ``time`` module by default).
+      3. ``time.strftime("%z")`` of the process (which is correct when
+         the container's TZ matches the Hermes timezone, e.g. when the
+         operator launches the WebUI with ``docker run -e TZ=...``).
+    """
+    tz_name = os.environ.get("HERMES_TIMEZONE") or os.environ.get("TZ") or None
+    if tz_name:
+        try:
+            from datetime import datetime as _dt
+            from zoneinfo import ZoneInfo as _ZoneInfo
+            tz = _ZoneInfo(tz_name)
+            offset = _dt.now(tz).utcoffset()
+            if offset is not None:
+                total_min = int(offset.total_seconds() // 60)
+                sign = "+" if total_min >= 0 else "-"
+                total_min = abs(total_min)
+                return f"{sign}{total_min // 60:02d}{total_min % 60:02d}"
+        except Exception:
+            # Unknown IANA name, or zoneinfo missing on this Python build,
+            # or anything else — fall through to the next resolver.
+            pass
+    fallback = time.strftime("%z")
+    return fallback if fallback else "+0000"
+
+
+# ── server timezone offset (#7140) — see `_server_tz_offset` for rationale ──
+def _now_local_str() -> str:  # noqa: ARG001 — placeholder for future profile-tz hook
+    """Reserved for future per-profile timezone hooks.  Currently a no-op
+    so the helper signature can be referenced from docstrings without
+    pulling in a profile branch."""
+    return _server_tz_offset()
+
+
 import http.client
 import socket as _socket
 from collections import defaultdict, deque, OrderedDict
@@ -2692,7 +2741,7 @@ def _session_list_payload_to_response(payload: dict) -> dict:
         "active_profile": payload.get("active_profile"),
         "other_profile_count": int(payload.get("other_profile_count", 0)),
         "server_time": time.time(),
-        "server_tz": time.strftime("%z"),
+        "server_tz": _server_tz_offset(),
     }
     if "webui_session_count" in payload:
         response["webui_session_count"] = int(payload.get("webui_session_count", 0))
