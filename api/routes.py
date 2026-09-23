@@ -16023,21 +16023,47 @@ def handle_post(handler, parsed) -> bool:
             require(body, "session_id", "title")
         except ValueError as e:
             return bad(handler, str(e))
+        sid = body["session_id"]
+        # #7738: pre-validate OUTSIDE the lock (404 / 403 contracts), then
+        # re-resolve the canonical session INSIDE the lock. Between an outside
+        # resolve and the lock acquire, _evict_sessions_over_cap can drop the
+        # resolved object from SESSIONS, so the stale, evicted object's save()
+        # would otherwise clobber a newer save on disk. Mirrors the
+        # SESSIONS.get -> Session.load -> _ensure_full_session_before_mutation
+        # pattern in _persist_generated_session_title.
         try:
-            s = _get_or_materialize_session(body["session_id"])
+            _get_or_materialize_session(sid)
         except KeyError:
             return bad(handler, "Session not found", 404)
         except PermissionError:
             return bad(handler, "Read-only imported sessions cannot be renamed from WebUI", 403)
-        with _get_session_agent_lock(body["session_id"]):
+        with _get_session_agent_lock(sid):
+            with LOCK:
+                latest = SESSIONS.get(sid)
+                if latest is not None and str(getattr(latest, "session_id", "") or "") != sid:
+                    SESSIONS.pop(sid, None)
+                    latest = None
+                elif latest is not None:
+                    SESSIONS.move_to_end(sid)
+            if latest is None:
+                latest = Session.load(sid)
+                if latest is None:
+                    return bad(handler, "Session not found", 404)
+            s = _ensure_full_session_before_mutation(sid, latest)
+            if getattr(s, "read_only", False):
+                return bad(handler, "Read-only imported sessions cannot be renamed from WebUI", 403)
             from api.session_ops import apply_session_title_rename
             apply_session_title_rename(s, body["title"])
             s.save()
+            with LOCK:
+                SESSIONS[sid] = s
+                SESSIONS.move_to_end(sid)
+                _evict_sessions_over_cap()  # #4765: safe LRU eviction (never active/unsaved)
         _sync_session_title_to_insights(s)
         publish_session_list_changed(
             "session_rename",
             profile=getattr(s, "profile", None),
-            session_id=getattr(s, "session_id", body["session_id"]),
+            session_id=getattr(s, "session_id", sid),
         )
         return j(handler, {"session": s.compact()})
 
@@ -17520,8 +17546,31 @@ def handle_post(handler, parsed) -> bool:
                 s.session_key = cli_meta.get("session_key")
                 s.platform = cli_meta.get("platform")
         with _get_session_agent_lock(sid):
+            # #7738: re-resolve the canonical session under the lock so the
+            # object we mutate is the resident one (not a stale, evicted one).
+            # For the in-cache path the outer get_session(sid) above can drop
+            # out of SESSIONS via _evict_sessions_over_cap before this lock is
+            # acquired; for the materialize path the just-saved object could
+            # likewise be evicted by a concurrent cap-1 request. Either way,
+            # the session we archive must be the freshest one.
+            with LOCK:
+                latest = SESSIONS.get(sid)
+                if latest is not None and str(getattr(latest, "session_id", "") or "") != sid:
+                    SESSIONS.pop(sid, None)
+                    latest = None
+                elif latest is not None:
+                    SESSIONS.move_to_end(sid)
+            if latest is None:
+                latest = Session.load(sid)
+                if latest is None:
+                    return bad(handler, "Session not found", 404)
+            s = _ensure_full_session_before_mutation(sid, latest)
             s.archived = bool(body.get("archived", True))
             s.save(touch_updated_at=False)
+            with LOCK:
+                SESSIONS[sid] = s
+                SESSIONS.move_to_end(sid)
+                _evict_sessions_over_cap()  # #4765: safe LRU eviction (never active/unsaved)
         publish_session_list_changed(
             "session_archive",
             profile=getattr(s, "profile", None),
@@ -17535,8 +17584,16 @@ def handle_post(handler, parsed) -> bool:
             require(body, "session_id")
         except ValueError as e:
             return bad(handler, str(e))
+        sid = body["session_id"]
+        # #7738: pre-validate OUTSIDE the lock (404 / 403 contracts) so we can
+        # still answer with a 404 before the lock is acquired. The actual
+        # mutation re-resolves INSIDE the lock (see #7738 same-shape fix as
+        # /api/session/rename) to avoid saving a stale, evicted object over a
+        # newer save. The 1614 project-ownership authorization below reads
+        # s.profile, which is metadata, so it can use the outside-resolved
+        # session without re-introducing the stale-overwrite hazard.
         try:
-            s = _get_or_materialize_session(body["session_id"])
+            s = _get_or_materialize_session(sid)
         except KeyError:
             return bad(handler, "Session not found", 404)
         except PermissionError:
@@ -17567,7 +17624,7 @@ def handle_post(handler, parsed) -> bool:
         # the wait converts that into an actionable HTTP 503 the client can retry.
         # We keep the lock (rather than dropping it for this metadata-only write)
         # because s.save() still races the streaming thread's atomic writer.
-        _move_lock = _get_session_agent_lock(body["session_id"])
+        _move_lock = _get_session_agent_lock(sid)
         if not _move_lock.acquire(timeout=5):
             return j(
                 handler,
@@ -17575,14 +17632,32 @@ def handle_post(handler, parsed) -> bool:
                 status=503,
             )
         try:
+            # #7738: re-resolve the canonical session under the lock so the
+            # object we mutate is the resident one (not a stale, evicted one).
+            with LOCK:
+                latest = SESSIONS.get(sid)
+                if latest is not None and str(getattr(latest, "session_id", "") or "") != sid:
+                    SESSIONS.pop(sid, None)
+                    latest = None
+                elif latest is not None:
+                    SESSIONS.move_to_end(sid)
+            if latest is None:
+                latest = Session.load(sid)
+                if latest is None:
+                    return bad(handler, "Session not found", 404)
+            s = _ensure_full_session_before_mutation(sid, latest)
             s.project_id = target_pid
             s.save()
+            with LOCK:
+                SESSIONS[sid] = s
+                SESSIONS.move_to_end(sid)
+                _evict_sessions_over_cap()  # #4765: safe LRU eviction (never active/unsaved)
         finally:
             _move_lock.release()
         publish_session_list_changed(
             "session_move",
             profile=getattr(s, "profile", None),
-            session_id=getattr(s, "session_id", body["session_id"]),
+            session_id=getattr(s, "session_id", sid),
         )
         return j(handler, {"ok": True, "session": s.compact()})
 
