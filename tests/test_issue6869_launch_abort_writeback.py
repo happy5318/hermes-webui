@@ -449,3 +449,236 @@ def test_source_launch_abort_helper_is_shared_across_all_sites(monkeypatch):
             f"{site} still clears the writeback owner inline instead of using "
             "the shared helper (#6869)"
         )
+
+
+# ---------------------------------------------------------------------------
+# #7680 re-gate (9/22) — BRICK deadlock + wakeup-lost findings.
+# ---------------------------------------------------------------------------
+
+
+def test_abort_with_lock_held_does_not_self_deadlock(monkeypatch):
+    """#7680 finding 1 (BRICK): the abort path inside
+    ``_prepare_chat_start_session_for_stream`` previously re-acquired the
+    per-session lock that the chat-start loop already held — a plain
+    ``threading.Lock`` (not RLock) self-deadlocked, bricking the session
+    until process restart.
+
+    The fix threads ``lock_held=True`` through the abort helper so the reset
+    runs without the redundant ``with`` block. This test reproduces the
+    BRICK with the **real** ``threading.Lock`` returned by
+    ``_get_session_agent_lock`` (the prior launch tests substituted
+    ``threading.RLock`` and missed it) and asserts the helper completes in
+    bounded time.
+    """
+    s = _make_session("brick-repro")
+    stream_id = "stream-brick"
+    real_lock = config._get_session_agent_lock(s.session_id)
+    assert isinstance(real_lock, type(threading.Lock())), (
+        "test guard: the session lock must remain a plain threading.Lock — "
+        "switching to RLock would silently mask this deadlock"
+    )
+
+    # Hold the real lock from the test thread, exactly as the chat-start
+    # loop does. The abort must not block on acquire.
+    acquired = real_lock.acquire(timeout=2.0)
+    assert acquired, "test setup: failed to acquire the real session lock"
+    try:
+        s.active_stream_id = stream_id
+        config.register_session_writeback_owner(s.session_id, stream_id)
+
+        # Bound the abort call. Without ``lock_held=True`` this would
+        # self-deadlock and the test would hit pytest's hang-detector.
+        completed = threading.Event()
+        result_box = {}
+
+        def _run():
+            try:
+                routes._abort_launched_stream(
+                    s, stream_id, reset_session=True, lock_held=True
+                )
+                result_box["ok"] = True
+            except BaseException as exc:  # pragma: no cover — defensive
+                result_box["err"] = exc
+            finally:
+                completed.set()
+
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        assert completed.wait(timeout=2.0), (
+            "abort hung while caller held the session lock — "
+            "_abort_launched_stream re-acquired the same threading.Lock "
+            "and self-deadlocked (#7680 BRICK)"
+        )
+        assert result_box.get("ok"), result_box.get("err")
+    finally:
+        real_lock.release()
+
+    # A follow-up caller must be able to acquire the lock within bounded
+    # time. The previous code path left ``active_stream_id`` set, so the
+    # next chat-start for this session would 409.
+    assert s.active_stream_id is None
+    assert config.SESSION_WRITEBACK_OWNERS.get(s.session_id) is None
+    assert real_lock.acquire(timeout=1.0), (
+        "follow-up caller could not re-acquire the session lock — "
+        "the abort path failed to release state cleanly (#7680)"
+    )
+    real_lock.release()
+
+
+def test_chat_start_with_raising_prep_completes_under_real_lock(monkeypatch):
+    """#7680 finding 1 (BRICK, end-to-end): drive
+    ``_start_chat_stream_for_session`` with the real session lock and a
+    raising ``s.save()``. The handler must return the original error in
+    bounded time — not deadlock — and a follow-up send for the same
+    session must succeed.
+
+    Mirrors the maintainer's repro recipe:
+    ``Codex drove the real handler with a preparation step that raises
+    (for example, ``_checkpoint_user_message_for_eager_session_save`` or
+    ``s.save()`` failing on a full disk or a permissions error)``.
+    """
+    s = _make_session("eager-repro")
+    s.workspace = "/tmp"
+
+    # Force the eager save-mode path so ``_checkpoint_user_message_for_eager_session_save``
+    # is exercised; that helper also calls ``s.save()`` so the same Mock
+    # failure cascades.
+    monkeypatch.setattr(routes, "get_webui_session_save_mode", lambda: "eager")
+
+    # The save failure the maintainer called out: full disk / permissions
+    # error during ``s.save()``. The eager helper also calls ``s.save()``;
+    # making ``s.save`` itself raise is the single point of failure.
+    s.save = Mock(side_effect=RuntimeError("disk full"))
+
+    real_lock = config._get_session_agent_lock(s.session_id)
+    assert isinstance(real_lock, type(threading.Lock()))
+
+    # The chat-start loop holds the lock while it calls
+    # ``_prepare_chat_start_session_for_stream``. Simulate that exactly by
+    # acquiring the real lock from this thread before entry.
+    with real_lock:
+        completed = threading.Event()
+        result_box = {}
+
+        def _run():
+            try:
+                # ``_start_chat_stream_for_session`` tries the lock
+                # itself; under the BRICK repro the lock is already held
+                # by THIS test thread, so the inner attempt would block.
+                # We instead call the inner step directly to assert the
+                # abort path doesn't self-deadlock when the caller is
+                # already inside the lock.
+                routes._prepare_chat_start_session_for_stream(
+                    s,
+                    msg="hello",
+                    attachments=[],
+                    workspace="/tmp",
+                    model="m",
+                    model_provider="p",
+                    stream_id="stream-eager-fail",
+                )
+            except RuntimeError as exc:
+                result_box["err"] = exc
+            finally:
+                completed.set()
+
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        assert completed.wait(timeout=3.0), (
+            "_prepare_chat_start_session_for_stream hung while the session "
+            "lock was held — the abort path re-acquired the same lock and "
+            "self-deadlocked (#7680 BRICK)"
+        )
+        assert isinstance(result_box.get("err"), RuntimeError), (
+            f"expected the original disk-full error to propagate, got: "
+            f"{result_box!r}"
+        )
+
+    # The abort ran, the lock is released, and the session is no longer
+    # bricked: a follow-up send can acquire the lock.
+    assert s.active_stream_id is None
+    assert config.SESSION_WRITEBACK_OWNERS.get(s.session_id) is None
+    assert real_lock.acquire(timeout=1.0), (
+        "session lock still held after the abort — follow-up send would "
+        "hang (#7680 BRICK)"
+    )
+    real_lock.release()
+
+
+def test_abort_preserves_process_wakeup_on_failure(monkeypatch):
+    """#7680 finding 2 (SILENT): a failed worker start on the
+    process-wakeup path left the wakeup drain with nothing to retry —
+    ``PENDING_BG_TASK_COMPLETIONS`` was already consumed upstream, the
+    abort cleared ``pending_user_message``, and the ``submitted`` turn
+    journal event had no terminal sibling. The background result was lost
+    with no retry.
+
+    The fix: when ``preserve_wakeup=True`` is set and the abort happens
+    with a non-empty ``pending_user_message``, the helper re-arms
+    ``PENDING_BG_TASK_COMPLETIONS`` and appends an ``interrupted`` journal
+    event so the drain can deliver the wakeup on its next pass.
+    """
+    import api.turn_journal as turn_journal
+
+    s = _make_session("wakeup-preserve")
+    s.pending_user_message = "[IMPORTANT: bg task completed]"
+    s.active_stream_id = "stream-wakeup-fail"
+    config.register_session_writeback_owner(s.session_id, s.active_stream_id)
+
+    # Capture journal events so we can assert the ``interrupted`` one.
+    captured = []
+
+    def _capture_append(sid, event):
+        captured.append((sid, event))
+        return event
+
+    monkeypatch.setattr(routes, "_rearm_process_wakeup_after_launch_failure",
+                        routes._rearm_process_wakeup_after_launch_failure)
+    monkeypatch.setattr(turn_journal, "append_turn_journal_event", _capture_append)
+
+    # Pre-condition: the marker is NOT in PENDING_BG_TASK_COMPLETIONS yet
+    # (it was consumed upstream before the worker started).
+    assert s.session_id not in config.PENDING_BG_TASK_COMPLETIONS
+
+    routes._abort_launched_stream(
+        s,
+        "stream-wakeup-fail",
+        reset_session=True,
+        lock_held=False,
+        preserve_wakeup=True,
+    )
+
+    # After: the marker is re-armed so the drain will retry on its next
+    # pass, and the journal event closes the ``submitted`` half-open
+    # turn so it does not read as in-flight forever.
+    assert s.session_id in config.PENDING_BG_TASK_COMPLETIONS
+    interrupted = [e for _sid, e in captured if e.get("event") == "interrupted"]
+    assert interrupted, (
+        "aborted wakeup turn did not append an 'interrupted' journal event "
+        "— the 'submitted' sibling would stay half-open (#7680 finding 2)"
+    )
+    assert interrupted[0].get("reason") == "launch_failure"
+    assert interrupted[0].get("stream_id") == "stream-wakeup-fail"
+
+    # The writeback owner and the persisted stream id are still cleared
+    # so a follow-up send does not see the dead channel.
+    assert config.SESSION_WRITEBACK_OWNERS.get(s.session_id) is None
+    assert s.active_stream_id is None
+
+
+def test_abort_without_preserve_wakeup_leaves_marker_alone(monkeypatch):
+    """#7680: ``preserve_wakeup=False`` (the default) must NOT re-arm the
+    drain. A non-wakeup chat-start failure has no business touching
+    ``PENDING_BG_TASK_COMPLETIONS``."""
+    s = _make_session("no-preserve")
+    s.pending_user_message = "regular user message"
+    s.active_stream_id = "stream-no-wakeup"
+
+    routes._abort_launched_stream(
+        s,
+        "stream-no-wakeup",
+        reset_session=True,
+    )
+
+    assert s.session_id not in config.PENDING_BG_TASK_COMPLETIONS
+    assert s.active_stream_id is None

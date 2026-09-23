@@ -23369,6 +23369,8 @@ def _abort_launched_stream(
     gateway_starting: bool = False,
     goal_related: bool = False,
     reset_session: bool = False,
+    lock_held: bool = False,
+    preserve_wakeup: bool = False,
 ) -> None:
     """Unwind every registry a half-launched stream touched (#6869 re-gate).
 
@@ -23388,9 +23390,30 @@ def _abort_launched_stream(
     fields — but only while they still name this stream, and only under the
     per-session lock, so a successor that was admitted meanwhile is never
     clobbered.
+
+    ``lock_held`` is the BRICK-deadlock escape hatch (#7680 re-gate, 9/22): when
+    the caller already holds the per-session lock (e.g. the abort triggered
+    from inside ``_prepare_chat_start_session_for_stream`` while the chat-start
+    loop is still inside ``with session_lock:``), re-acquiring the same plain
+    ``threading.Lock`` would self-deadlock. In that case the reset runs without
+    the ``with`` — the caller-held lock is already the correct serialization
+    point, and a successor cannot have been admitted because the caller has not
+    released it yet. Every other call site leaves ``lock_held`` at its
+    ``False`` default and the original acquire is unchanged.
+
+    ``preserve_wakeup`` (#7680 re-gate, 9/22, finding 2) re-arms the
+    process-wakeup drain for this session if the abort happens between the
+    marker being consumed and the worker actually starting. Without this, a
+    background wakeup that failed on worker construction leaves
+    ``PENDING_BG_TASK_COMPLETIONS`` empty, ``pending_user_message`` cleared,
+    and an unresolved ``submitted`` journal event, so the background result is
+    lost with no retry.
     """
     sid = str(getattr(s, "session_id", "") or "").strip()
     stream_id = str(stream_id or "").strip()
+    # Capture before any reset; the wakeup-rearm helper uses this to decide
+    # whether to re-mark the process-wakeup drain. See ``preserve_wakeup``.
+    pending_user_message = getattr(s, "pending_user_message", None)
     if goal_related:
         try:
             STREAM_GOAL_RELATED.pop(stream_id, None)
@@ -23425,11 +23448,58 @@ def _abort_launched_stream(
                 exc_info=True,
             )
     if not reset_session or not sid or not stream_id:
+        if preserve_wakeup and sid:
+            _rearm_process_wakeup_after_launch_failure(
+                s, sid, stream_id, pending_user_message=pending_user_message,
+            )
+        return
+    # ``lock_held`` branch: skip the ``with`` because the caller already holds
+    # the same plain ``threading.Lock``. See the docstring above.
+    if lock_held:
+        try:
+            if getattr(s, "active_stream_id", None) != stream_id:
+                # A successor already claimed this session; leave its state alone.
+                if preserve_wakeup and sid:
+                    _rearm_process_wakeup_after_launch_failure(
+                        s, sid, stream_id, pending_user_message=pending_user_message,
+                    )
+                return
+            s.active_stream_id = None
+            if hasattr(s, "pending_user_message"):
+                s.pending_user_message = None
+            if hasattr(s, "pending_attachments"):
+                s.pending_attachments = []
+            if hasattr(s, "pending_started_at"):
+                s.pending_started_at = None
+            if hasattr(s, "pending_user_source"):
+                s.pending_user_source = None
+            try:
+                s.save(touch_updated_at=False)
+            except Exception:
+                logger.warning(
+                    "Failed to persist compensated launch-abort for session %s",
+                    sid,
+                    exc_info=True,
+                )
+        except Exception:
+            logger.warning(
+                "Failed to reset session state after launch abort for session %s",
+                sid,
+                exc_info=True,
+            )
+        if preserve_wakeup and sid:
+            _rearm_process_wakeup_after_launch_failure(
+                s, sid, stream_id, pending_user_message=pending_user_message,
+            )
         return
     try:
         with _get_session_agent_lock(sid):
             if getattr(s, "active_stream_id", None) != stream_id:
                 # A successor already claimed this session; leave its state alone.
+                if preserve_wakeup and sid:
+                    _rearm_process_wakeup_after_launch_failure(
+                        s, sid, stream_id, pending_user_message=pending_user_message,
+                    )
                 return
             s.active_stream_id = None
             if hasattr(s, "pending_user_message"):
@@ -23452,6 +23522,66 @@ def _abort_launched_stream(
         logger.warning(
             "Failed to reset session state after launch abort for session %s",
             sid,
+            exc_info=True,
+        )
+    if preserve_wakeup and sid:
+        _rearm_process_wakeup_after_launch_failure(
+            s, sid, stream_id, pending_user_message=pending_user_message,
+        )
+
+
+def _rearm_process_wakeup_after_launch_failure(
+    s,
+    sid: str,
+    stream_id: str,
+    *,
+    pending_user_message,
+) -> None:
+    """Re-arm the process-wakeup drain after a launch-failure abort (#7680).
+
+    The process-wakeup path consumes ``PENDING_BG_TASK_COMPLETIONS[sid]`` and
+    writes the wakeup into ``s.pending_user_message`` before the worker
+    actually starts. If construction or ``start()`` then fails, the abort
+    otherwise leaves the marker consumed, the prompt cleared, and the
+    ``submitted`` turn journal event with no terminal sibling. The drain
+    (``api/background_process._process_one``) only sees an empty state and
+    logs; the background result is lost with no retry.
+
+    The fix is to put the wakeup prompt back into a deliverable retry path
+    (re-mark the session in ``PENDING_BG_TASK_COMPLETIONS``) and append an
+    ``interrupted`` terminal journal event so the turn does not read as
+    in-flight forever.
+    """
+    # The marker lives in ``api.config`` (``PENDING_BG_TASK_COMPLETIONS``),
+    # not in ``api.background_process``; import via the shared config module
+    # so the add below writes to the same set the drain reads.
+    try:
+        from api import config as _cfg
+    except Exception:
+        return
+    if not pending_user_message:
+        # Nothing to retry — leave the marker state alone.
+        return
+    try:
+        _cfg.PENDING_BG_TASK_COMPLETIONS.add(sid)
+    except Exception:
+        logger.debug(
+            "Failed to re-arm process-wakeup marker for session %s", sid, exc_info=True,
+        )
+    try:
+        from api.turn_journal import append_turn_journal_event
+
+        append_turn_journal_event(
+            sid,
+            {
+                "event": "interrupted",
+                "stream_id": stream_id,
+                "reason": "launch_failure",
+            },
+        )
+    except Exception:
+        logger.debug(
+            "Failed to append interrupted turn journal event for session %s", sid,
             exc_info=True,
         )
 
@@ -23561,7 +23691,24 @@ def _prepare_chat_start_session_for_stream(
         if not defer_save:
             s.save()
     except Exception:
-        _abort_launched_stream(s, stream_id, reset_session=True)
+        # #7680 re-gate (9/22): the caller (`_start_chat_stream_for_session`'s
+        # chat-start loop) still holds the per-session ``threading.Lock`` here
+        # — re-acquiring it inside ``_abort_launched_stream`` would self-deadlock
+        # (plain ``Lock``, not ``RLock``). The fix is ``lock_held=True`` so the
+        # reset runs without the redundant ``with``; the caller-held lock is
+        # already the correct serialization point.
+        #
+        # ``preserve_wakeup`` is set only for process-wakeup turns (the
+        # background drain consumed ``PENDING_BG_TASK_COMPLETIONS`` upstream);
+        # re-arm the marker so the failed wakeup is delivered on the next drain
+        # instead of being lost with no retry.
+        _abort_launched_stream(
+            s,
+            stream_id,
+            reset_session=True,
+            lock_held=True,
+            preserve_wakeup=(source == "process_wakeup"),
+        )
         raise
 
 
@@ -24192,6 +24339,7 @@ def _start_chat_stream_for_session(
             gateway_starting=backend_is_gateway,
             goal_related=goal_related,
             reset_session=True,
+            preserve_wakeup=(source == "process_wakeup"),
         )
         raise
     response = {
