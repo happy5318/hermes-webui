@@ -6681,6 +6681,20 @@ _available_models_cache_lock = threading.RLock()  # must be RLock: cold path ref
 _cache_build_cv = threading.Condition(_available_models_cache_lock)  # shares underlying RLock so notify_all() is safe inside with _available_models_cache_lock
 _cache_build_in_progress = False  # True while a cold path is actively building
 
+# Per-profile in-flight tracker for the session-visit stale-while-revalidate
+# background rebuild (#7723 review). The session-visit 300 s freshness horizon
+# is checked against the on-disk mtime (which only advances when
+# ``_save_models_cache_to_disk`` writes a fresh live rebuild). When the disk
+# catalog is stale, ``get_available_models_for_session_visit`` immediately
+# returns it (no foreground rebuild) AND fires a background ``force_refresh``
+# for the *active* profile. This dict coalesces that background work per
+# profile: a second stale visit while the first rebuild is still running
+# reuses the in-flight Thread instead of starting a duplicate. Keyed on the
+# profile name (or "" for the default / root profile) so a multi-profile
+# server never blocks profile A's first paint on profile B's slow probe.
+_session_visit_rebuild_threads: dict[str, threading.Thread] = {}
+_session_visit_rebuild_lock = threading.Lock()
+
 # Memoized (snapshot_ref, {provider_slug: frozenset(model_ids)}) derived from
 # the published models-catalog snapshot. Used by _endpoint_advertised_model_ids
 # to answer "did this endpoint actually advertise this exact id?" in O(1) per
@@ -10504,18 +10518,6 @@ def get_available_models_for_session_visit() -> dict:
         _mark("memory_cache_miss_loading_disk")
         disk_cached = _load_models_cache_from_disk()
         if disk_cached is not None:
-            # Fix #7723: re-stamp the on-disk mtime so the 300 s session-visit
-            # freshness window slides forward on every hit instead of acting
-            # as a one-shot window that permanently forces a live rebuild once
-            # the mtime goes stale. The hit path returns the cached payload
-            # unmodified; only the file mtime advances. Errors are swallowed
-            # so a read-only filesystem or missing file (e.g. another process
-            # pruned the cache between ``_load_models_cache_from_disk`` and
-            # here) never breaks the response path.
-            try:
-                os.utime(cache_path, None)
-            except OSError:
-                pass
             with _available_models_cache_lock:
                 cached = _get_fresh_memory_models_cache(time.monotonic())
                 if cached is not None:
@@ -10531,10 +10533,34 @@ def get_available_models_for_session_visit() -> dict:
             return copy.deepcopy(disk_cached)
 
     _mark("cache_age_stale_or_missing")
+    # Stale-while-revalidate, per profile (#7723 review): the on-disk mtime
+    # only advances when ``_save_models_cache_to_disk`` writes a fresh live
+    # rebuild, so the file *going stale* is the per-profile revalidation
+    # signal. When that happens we return the disk/stale catalog immediately
+    # (no foreground rebuild — the catalog payload is shape-valid and trusted
+    # for serving, the freshness decision is about *which* catalog to serve
+    # next, not whether to serve *something*) and fire a coalesced
+    # background ``force_refresh`` for the *active* profile. The background
+    # rebuild publishes through the normal ``get_available_models(force_refresh
+    # =True)`` path, which is the *only* code that calls
+    # ``_save_models_cache_to_disk`` — so the on-disk mtime advances as a
+    # side effect of a real rebuild, not of a read. Per-profile coalescing
+    # keeps a multi-profile alternation from firing N parallel probes for the
+    # same profile (the memory cache is process-global so the in-memory warm
+    # path is already shared, but the disk catalog is per-profile).
     stale_cached = disk_cached or _load_stale_models_cache_from_disk()
     _mark(f"stale_cached_loaded:{bool(stale_cached)}")
+    if stale_cached is not None:
+        _mark("swr_return_stale_cached")
+        _maybe_start_session_visit_background_rebuild()
+        _maybe_log_slow_stages(_logger, _stagelog, _slow_threshold_ms, "models.session_visit")
+        return copy.deepcopy(stale_cached)
+    # No disk cache to serve stale — must rebuild in the foreground so the
+    # caller gets *something* (and populates the on-disk file for the next
+    # visit). Same foreground path as before, just only when there's truly
+    # no payload to return.
+    _mark("force_refresh_start_foreground")
     try:
-        _mark("force_refresh_start")
         result = get_available_models(force_refresh=True)
         _mark("force_refresh_done")
         _maybe_log_slow_stages(_logger, _stagelog, _slow_threshold_ms, "models.session_visit")
@@ -10542,13 +10568,81 @@ def get_available_models_for_session_visit() -> dict:
     except Exception:
         _mark("force_refresh_failed")
         logger.debug("session-visit models refresh failed", exc_info=True)
-        if stale_cached is not None:
-            _mark("stale_fallback_return")
-            _maybe_log_slow_stages(_logger, _stagelog, _slow_threshold_ms, "models.session_visit")
-            return copy.deepcopy(stale_cached)
         _mark("prefer_cache_fallback")
         _maybe_log_slow_stages(_logger, _stagelog, _slow_threshold_ms, "models.session_visit")
         return get_available_models(prefer_cache=True)
+
+
+def _session_visit_active_profile_name() -> str:
+    """Return the active profile name (or "" for default) for SWR coalescing.
+
+    Resolved per-call from the request TLS — the same source
+    ``_get_models_cache_path`` uses to pick the per-profile disk file. Falls
+    back to "" when the profiles module is unavailable (very early boot /
+    import cycle), so SWR coalescing stays correct for the default / root
+    profile path.
+    """
+    try:
+        from api.profiles import get_active_profile_name
+        return (get_active_profile_name() or "").strip()
+    except Exception:
+        return ""
+
+
+def _maybe_start_session_visit_background_rebuild() -> None:
+    """Fire-and-forget coalesced per-profile rebuild for stale session visits.
+
+    Coalesces by profile name so a burst of stale visits on the same profile
+    launches exactly one background ``force_refresh``. The rebuild goes
+    through the normal ``get_available_models(force_refresh=True)`` path,
+    which writes the on-disk cache (and therefore advances the mtime) only
+    on a successful live rebuild — preserving the "mtime records last live
+    rebuild" semantic the 300 s horizon is defined against.
+
+    The profile scope is rebound on the worker thread via
+    ``profile_scope_for_detached_worker`` (the same helper the existing
+    bounded-rebuild worker uses, #3957) so a named profile's live probe and
+    disk write land on that profile's auth/config/catalog, never the default.
+    No-op for the default / root profile (``profile_scope_for_detached_worker``
+    is a no-op there).
+    """
+    profile_key = _session_visit_active_profile_name()
+    with _session_visit_rebuild_lock:
+        existing = _session_visit_rebuild_threads.get(profile_key)
+        if existing is not None and existing.is_alive():
+            return  # already rebuilding for this profile
+        box: dict = {}
+
+        def _worker() -> None:
+            # Rebind the per-request profile on the worker thread so the
+            # live provider probe + ``_save_models_cache_to_disk`` write the
+            # right profile's auth/config/cache file (#3957).
+            try:
+                from api.profiles import profile_scope_for_detached_worker
+                _scope = profile_scope_for_detached_worker(
+                    profile_key, "models session_visit background rebuild"
+                )
+            except Exception:
+                from contextlib import nullcontext as _nullcontext
+                _scope = _nullcontext()
+            try:
+                with _scope:
+                    box["result"] = get_available_models(force_refresh=True)
+            except BaseException as exc:  # noqa: BLE001
+                box["error"] = exc
+            finally:
+                with _session_visit_rebuild_lock:
+                    tracked = _session_visit_rebuild_threads.get(profile_key)
+                    if tracked is threading.current_thread():
+                        _session_visit_rebuild_threads.pop(profile_key, None)
+
+        thread = threading.Thread(
+            target=_worker,
+            name=f"models-session-visit-swr-{profile_key or 'default'}",
+            daemon=True,
+        )
+        _session_visit_rebuild_threads[profile_key] = thread
+        thread.start()
 
 
 def _maybe_log_slow_stages(
