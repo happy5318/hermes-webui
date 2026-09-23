@@ -527,3 +527,186 @@ def test_disk_mtime_only_moves_on_real_rebuild(tmp_path, monkeypatch):
         f"post={mtime_after_rebuild}"
     )
     assert len(disk_save_calls) == 1
+
+
+# ── 7. Root-profile rebuild under a NAMED process profile (#7724 CORE finding)
+
+
+def test_root_profile_rebuild_writes_root_cache_under_named_process_profile(
+    tmp_path, monkeypatch
+):
+    """A default/root session-visit rebuild must bind the ROOT profile's home,
+    TLS and env, even when the process-level active profile is a NAMED one.
+
+    ``profile_scope_for_detached_worker`` used to no-op for the root/default
+    profile, on the assumption that the process defaults to root anyway. That
+    fails whenever the WebUI process runs on a named profile (e.g. ``work``)
+    while a client's cookie asks for ``default``: the detached SWR worker
+    inherited the NAMED process profile, so the root catalog never revalidated
+    and the root cache file's mtime never advanced.
+
+    Asserts:
+      1. the rebuild resolves the ROOT cache file + root HERMES_HOME on the
+         worker (not the named profile's);
+      2. ``_save_models_cache_to_disk`` writes the root file's mtime forward;
+      3. the NAMED profile's cache file is NOT touched.
+    """
+    import api.config as cfg
+
+    _reset_models_memory_cache(monkeypatch)
+
+    root_cache = tmp_path / "models_cache.json"
+    named_cache = tmp_path / "models_cache.work.json"
+    root_cache.write_text("{}", encoding="utf-8")
+    named_cache.write_text("{}", encoding="utf-8")
+    old = time.time() - 600.0
+    os.utime(root_cache, (old, old))
+    os.utime(named_cache, (old, old))
+    root_mtime_before = root_cache.stat().st_mtime
+    named_mtime_before = named_cache.stat().st_mtime
+
+    # Root home + a named profile that owns env values distinct from the root's.
+    root_home = tmp_path / ".hermes"
+    named_home = root_home / "profiles" / "work"
+    named_home.mkdir(parents=True, exist_ok=True)
+    (named_home / ".env").write_text(
+        "ISSUE_7724_PROBE=named-profile-value\n", encoding="utf-8"
+    )
+    monkeypatch.setattr("api.profiles._DEFAULT_HERMES_HOME", root_home)
+
+    observed: dict = {}
+
+    def _worker_inspector(**kwargs):
+        """Stands in for the live probe inside the background rebuild."""
+        from api.profiles import get_active_profile_name
+
+        observed["active_profile"] = get_active_profile_name()
+        observed["cache_path"] = cfg._get_models_cache_path()
+        observed["hermes_home"] = os.environ.get("HERMES_HOME")
+        observed["probe_env"] = os.environ.get("ISSUE_7724_PROBE")
+        # The real rebuild publishes through _save_models_cache_to_disk, whose
+        # disk write is the only legitimate mover of the on-disk mtime.
+        cfg._save_models_cache_to_disk(
+            {"active_provider": "openai", "default_model": "rebuilt",
+             "configured_model_badges": {}, "groups": []}
+        )
+        return _catalog("rebuilt")
+
+    monkeypatch.setattr(cfg, "_SESSION_VISIT_MODELS_FRESHNESS_SECONDS", 300.0, raising=False)
+    monkeypatch.setattr(cfg, "_LIVE_REBUILD_BUDGET_SECONDS", 0.0, raising=False)
+    # The request is for the DEFAULT/root profile.
+    monkeypatch.setattr(cfg, "_session_visit_active_profile_name", lambda: "default")
+    # Keep the real, profile-resolution-based path helper (do NOT stub it):
+    # this test fails if the worker does not rebind the root TLS.
+    monkeypatch.setattr(cfg, "_models_cache_path", root_cache)
+    monkeypatch.setattr(cfg, "_load_models_cache_from_disk", lambda: _catalog("stale"))
+    monkeypatch.setattr(cfg, "_load_stale_models_cache_from_disk", lambda: _catalog("stale"))
+    monkeypatch.setattr(cfg, "_models_cache_source_fingerprint", lambda: {"profile": "root"})
+    monkeypatch.setattr(cfg, "get_available_models", _worker_inspector)
+
+    # PROCESS-level active profile is a NAMED one.
+    import api.profiles as profiles_mod
+
+    prev_process_profile = profiles_mod._active_profile
+    profiles_mod._active_profile = "work"
+    try:
+        result = cfg.get_available_models_for_session_visit()
+    finally:
+        profiles_mod._active_profile = prev_process_profile
+    assert result == _catalog("stale"), "stale visit returns the disk catalog"
+
+    _wait_for_session_visit_rebuild(monkeypatch, timeout=10)
+
+    # 1. The worker resolved the ROOT profile, not the named process profile.
+    assert observed.get("active_profile") in ("", "default"), (
+        f"root-profile rebuild must bind the root profile on the worker, "
+        f"got active_profile={observed.get('active_profile')!r} "
+        f"(inherited the NAMED process profile)"
+    )
+    assert observed.get("cache_path") == root_cache, (
+        f"root-profile rebuild must write the root cache file, got "
+        f"{str(observed.get('cache_path'))!r}"
+    )
+    assert observed.get("hermes_home") == str(root_home), (
+        f"root-profile rebuild must bind the root HERMES_HOME, got "
+        f"{observed.get('hermes_home')!r}"
+    )
+    assert observed.get("probe_env") != "named-profile-value", (
+        "root-profile rebuild must not apply the named process profile's .env"
+    )
+
+    # 2. The root file's mtime advanced (the rebuild landed and wrote it).
+    assert root_cache.stat().st_mtime > root_mtime_before + 1.0, (
+        "root-profile rebuild must advance the root cache file's mtime"
+    )
+    # 3. The named profile's file is untouched.
+    assert abs(named_cache.stat().st_mtime - named_mtime_before) < 0.01, (
+        "the named process profile's cache file must NOT be touched by a "
+        "root-profile rebuild"
+    )
+
+
+def test_root_detached_worker_scope_binds_root_profile_on_worker(monkeypatch, tmp_path):
+    """``profile_scope_for_root_detached_worker`` rebinds the root HOME, TLS and
+    env on a fresh worker thread even when the process profile is named, and
+    restores all of them on exit (#7724)."""
+    import threading
+
+    import api.config as config
+    import api.profiles as profiles
+
+    root_home = tmp_path / ".hermes"
+    named_home = root_home / "profiles" / "work"
+    named_home.mkdir(parents=True, exist_ok=True)
+    (named_home / ".env").write_text(
+        "ISSUE_7724_SCOPE_PROBE=named-value\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(profiles, "_DEFAULT_HERMES_HOME", root_home)
+    default_cache = tmp_path / "models_cache.json"
+    monkeypatch.setattr(config, "_models_cache_path", default_cache)
+    monkeypatch.delenv("ISSUE_7724_SCOPE_PROBE", raising=False)
+    monkeypatch.setattr(profiles, "_active_profile", "work")
+
+    out: dict = {}
+
+    def worker():
+        from api.profiles import get_active_profile_name
+
+        # No TLS on this fresh thread: without the scope it resolves the
+        # NAMED process profile (the bug).
+        out["before_name"] = get_active_profile_name()
+        out["before_cache"] = config._get_models_cache_path().name
+        out["before_env"] = os.environ.get("ISSUE_7724_SCOPE_PROBE")
+        out["before_home"] = os.environ.get("HERMES_HOME")
+        with profiles.profile_scope_for_root_detached_worker("test-root-worker"):
+            out["inside_name"] = get_active_profile_name()
+            out["inside_cache"] = config._get_models_cache_path().name
+            out["inside_env"] = os.environ.get("ISSUE_7724_SCOPE_PROBE")
+            out["inside_home"] = os.environ.get("HERMES_HOME")
+        out["after_name"] = get_active_profile_name()
+        out["after_env"] = os.environ.get("ISSUE_7724_SCOPE_PROBE")
+        out["after_home"] = os.environ.get("HERMES_HOME")
+
+    t = threading.Thread(target=worker)
+    t.start()
+    t.join(timeout=10)
+    assert not t.is_alive(), "root detached worker scope hung"
+
+    # BEFORE: the worker thread inherits the NAMED process profile (the bug).
+    # The process-env mirror only carries the named .env when something has
+    # applied it process-wide; the reliable inheritance signal is the resolved
+    # profile name + profile-keyed cache path, asserted above.
+    assert out["before_name"] == "work"
+    assert out["before_cache"] == "models_cache.work.json"
+    assert out["before_home"] != str(root_home)
+
+    # INSIDE: everything is bound to the ROOT profile.
+    assert out["inside_name"] in ("", "default")
+    assert out["inside_cache"] == "models_cache.json"
+    assert out["inside_env"] != "named-value"
+    assert out["inside_home"] == str(root_home)
+
+    # AFTER: fully restored — the worker thread falls back to the NAMED process
+    # profile again, and the root home it installed is no longer in effect.
+    assert out["after_name"] == "work"
+    assert out["after_home"] != str(root_home)
