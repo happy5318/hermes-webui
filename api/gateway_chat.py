@@ -1247,9 +1247,21 @@ def _run_gateway_chat_streaming(
     usage = {"input_tokens": 0, "output_tokens": 0, "estimated_cost": 0}
     try:
         s = get_session(session_id)
-        from api.config import get_config  # imported lazily to avoid config-cycle churn
+        from api.config import get_config_for_profile_home  # imported lazily to avoid config-cycle churn
+        from api.models import _get_profile_home
 
-        cfg = get_config()
+        # The gateway worker runs on a detached thread that does NOT inherit
+        # the per-request thread-local profile context, so the ambient
+        # ``get_config()`` would resolve through the process-global profile
+        # (usually ``default``) instead of the profile that owns this session.
+        # On a multi-profile instance that lets one profile's
+        # ``agent.reasoning_overrides`` (and model-capability coercion) leak
+        # into another profile's request. Resolve this session's own profile
+        # home instead — the same snapshot ``/api/chat/start`` dispatches with
+        # (issue #3294 pattern, gateway path).
+        cfg = get_config_for_profile_home(
+            _get_profile_home(getattr(s, "profile", None))
+        )
         reasoning_effort = _gateway_reasoning_effort_for_request(
             cfg,
             model=model,
