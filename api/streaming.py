@@ -2999,6 +2999,23 @@ from api.workspace import _resolve_path
 # metadata such as `reasoning`, `thinking`, and `_reasoning` stays omitted here.
 _API_SAFE_MSG_KEYS = {'role', 'content', 'tool_calls', 'tool_call_id', 'name', 'refusal', 'reasoning_content'}
 
+# Discriminators the Agent pass-0 merge needs to see on a row in order to
+# decide whether two adjacent assistant messages are actually mergeable. These
+# are NOT provider-facing — they get stripped in a final projection pass after
+# the merge resolves. Keeping them out of the public `_API_SAFE_MSG_KEYS`
+# preserves the wire contract; preserving them into the merge input matches
+# the Agent's ``_is_codex_interim`` / ``verification_required`` heuristics
+# (#7237 review finding 2).
+_MERGE_VISIBLE_DISCRIMINATORS = frozenset({
+    'codex_reasoning_items',
+    'codex_message_items',
+    'finish_reason',
+})
+# Strict projection drops the merge-visible discriminators + the optional
+# `api_content` sidecar in the final pass. The Agent replay path opts back in
+# to `api_content` via `preserve_api_content=True` (see _sanitize_messages_for_agent).
+_API_PUBLIC_STRIP_KEYS = _MERGE_VISIBLE_DISCRIMINATORS | {'api_content'}
+
 _NATIVE_IMAGE_MAX_BYTES = 20 * 1024 * 1024
 
 _GATEWAY_ROUTING_TOP_LEVEL_KEYS = {
@@ -6121,6 +6138,11 @@ def _sanitize_messages_for_api(
         # here because direct provider/compression projections must continue to
         # reject unknown bookkeeping fields.
         allowed_keys = _API_SAFE_MSG_KEYS | {"api_content"}
+    # The Agent pass-0 merge needs the codex_interim/finish_reason
+    # discriminators on the rows it inspects. They are stripped in a final
+    # pass after the merge resolves so the wire contract still matches
+    # `_API_SAFE_MSG_KEYS` (#7237 review finding 2a).
+    allowed_keys = allowed_keys | _MERGE_VISIBLE_DISCRIMINATORS
     # First pass: collect all tool_call_ids declared by assistant messages.
     # Handles both OpenAI ('id') and Anthropic ('call_id') field names.
     valid_tool_call_ids: set = set()
@@ -6291,6 +6313,12 @@ def _sanitize_messages_for_api(
                 continue  # drop — fusing the neighbours is clean, or it's a stale prompt
             # Keep but strip the temporary marker
             msg = {k: v for k, v in msg.items() if k != '_recovered'}
+        # Final projection: drop the merge-visible discriminators so the
+        # public sanitizer output matches the ``_API_SAFE_MSG_KEYS`` wire
+        # contract. ``api_content`` stays when ``preserve_api_content`` is
+        # true (the Agent replay projection strips it via a dedicated path
+        # earlier in the function, so we don't double-strip here).
+        msg = {k: v for k, v in msg.items() if k not in _MERGE_VISIBLE_DISCRIMINATORS}
         final.append(msg)
     return final
 
@@ -6353,7 +6381,14 @@ def _api_safe_message_positions(messages):
             tid = msg.get('tool_call_id') or ''
             if not tid or tid not in valid_tool_call_ids:
                 continue
-        sanitized = {k: v for k, v in msg.items() if k in _API_SAFE_MSG_KEYS}
+        # Note: the merge-visible discriminators (codex_*/finish_reason) and
+        # the optional `api_content` sidecar are kept on the row so the
+        # Agent pass-0 merge below sees the same fields the Agent's own
+        # ``_merge_consecutive_assistants`` sees. They are stripped in the
+        # final projection pass to honour the public API contract
+        # (#7237 review finding 2a).
+        merge_visible_keys = _API_SAFE_MSG_KEYS | _MERGE_VISIBLE_DISCRIMINATORS | {'api_content'}
+        sanitized = {k: v for k, v in msg.items() if k in merge_visible_keys}
         sanitized = scrub_internal_replay_fields(
             [sanitized],
             message_records=True,
@@ -6372,7 +6407,11 @@ def _api_safe_message_positions(messages):
     # blocker 2). This path carries (original_index, msg) pairs: the merged
     # survivor keeps the FIRST row's original index so downstream alignment
     # (e.g. _restore_reasoning_metadata_before_boundary) still maps onto the
-    # raw list.
+    # raw list. The merge now matches the Agent's own contract: carry the
+    # later row's `reasoning_content` when the survivor lacks it, and drop
+    # the survivor's `api_content` when the joined content actually changed
+    # (replaying the sidecar would resend pre-merge bytes the rewrite just
+    # discarded, #7237 review finding 2b).
     merged_rows: list = []
     for idx, msg in out:
         if not isinstance(msg, dict):
@@ -6400,12 +6439,30 @@ def _api_safe_message_positions(messages):
                 prev.pop('tool_calls', None)
             prev_content = prev.get('content')
             new_content = msg.get('content')
+            content_rewritten = False
             if isinstance(prev_content, str) and isinstance(new_content, str):
                 joined = '\n'.join(p for p in (prev_content.strip(), new_content.strip()) if p)
                 if joined:
                     prev['content'] = joined
+                    # ``joined`` may equal the stripped prev_content when the
+                    # later row carried empty/whitespace text; only count
+                    # that as a rewrite when the value actually changed.
+                    content_rewritten = joined != prev_content
             elif not prev_content and new_content is not None:
                 prev['content'] = new_content
+                content_rewritten = new_content != prev_content
+            # Carry reasoning_content from the later row when the survivor
+            # lacks it. Strict thinking-capable providers need one on the
+            # merged tool-call turn; this matches the Agent's own contract.
+            if not prev.get('reasoning_content') and msg.get('reasoning_content'):
+                prev['reasoning_content'] = msg['reasoning_content']
+            # Drop the survivor's api_content when the merge actually changed
+            # the visible content; otherwise the sidecar still describes the
+            # pre-merge bytes and replaying it would silently resend what the
+            # rewrite just discarded (prompt-cache invariant, see Agent
+            # drop_stale_api_content).
+            if content_rewritten:
+                prev.pop('api_content', None)
             continue
         merged_rows.append((idx, msg))
     out = merged_rows
@@ -6477,6 +6534,14 @@ def _api_safe_message_positions(messages):
             if not (prev_role == 'assistant' and next_role == 'assistant'):
                 continue
             msg = {k: v for k, v in msg.items() if k != '_recovered'}
+        # Final projection: drop the merge-visible discriminators and the
+        # ``api_content`` sidecar so the position payload matches the
+        # `_API_SAFE_MSG_KEYS` wire contract. The Agent replay path
+        # (``_sanitize_messages_for_agent`` -> ``preserve_api_content=True``)
+        # passes a different allowlist and re-inserts ``api_content`` upstream
+        # before the public boundary; here the position path is the strict
+        # public projection (#7237 review finding 2a).
+        msg = {k: v for k, v in msg.items() if k not in _API_PUBLIC_STRIP_KEYS}
         final_out.append((idx, msg))
     return final_out
 
@@ -6568,6 +6633,16 @@ def _merge_consecutive_assistant_rows(messages):
     Codex interim rows are exempt (they carry their own continuation state),
     and a provisional verification candidate is superseded, not unioned —
     both mirroring ``_merge_consecutive_assistants`` in the installed runtime.
+    The merge also matches the Agent's two extra behaviours, so the WebUI
+    helper cannot drift from the runtime contract (#7237 review finding 2b):
+
+    ① When the survivor lacks ``reasoning_content`` and the later row
+       carries one, copy the later value onto the survivor. Strict thinking
+       providers need a ``reasoning_content`` on the merged tool-call turn.
+    ② When the join actually changes the visible content, drop the
+       survivor's ``api_content`` sidecar. Replaying it would silently
+       resend pre-merge bytes the rewrite just discarded.
+
     Copy-on-write: input rows are never mutated; only merged rows are new.
     Returns a new list.
     """
@@ -6611,12 +6686,28 @@ def _merge_consecutive_assistant_rows(messages):
                 prev.pop('tool_calls', None)
             prev_content = prev.get('content')
             new_content = msg.get('content')
+            content_rewritten = False
             if isinstance(prev_content, str) and isinstance(new_content, str):
                 joined = '\n'.join(p for p in (prev_content.strip(), new_content.strip()) if p)
                 if joined:
                     prev['content'] = joined
+                    # ``joined`` may equal the stripped prev_content when the
+                    # later row carried empty/whitespace text; only count
+                    # that as a rewrite when the value actually changed.
+                    content_rewritten = joined != prev_content
             elif not prev_content and new_content is not None:
                 prev['content'] = new_content
+                content_rewritten = new_content != prev_content
+            # ① Carry reasoning_content from the later row when the survivor
+            # lacks it. Mirrors the Agent's own contract.
+            if not prev.get('reasoning_content') and msg.get('reasoning_content'):
+                prev['reasoning_content'] = msg['reasoning_content']
+            # ② Drop the survivor's api_content when the merge actually
+            # changed the visible content; otherwise the sidecar still
+            # describes the pre-merge bytes and replaying it would silently
+            # resend what the rewrite just discarded.
+            if content_rewritten:
+                prev.pop('api_content', None)
             continue
         merged.append(msg)
     return merged
@@ -7241,14 +7332,30 @@ def _strip_replayed_context_items(existing_messages, candidates):
 
 
 def _looks_like_current_user_turn_scan(messages, msg_text):
-    """Return the index of the first row that looks like the current user turn.
+    """Return the index of the last row that looks like the current user turn.
 
     Scan companion to ``_looks_like_current_user_turn`` for the settle path:
-    walks ``messages`` and returns the first user row whose workspace-stripped
+    walks ``messages`` and returns the last user row whose workspace-stripped
     text matches ``msg_text``. Returns None when nothing matches.
+
+    Mirrors ``_find_current_user_turn``'s last-strong-match policy. First-match
+    would replay historical assistant output whenever the same prompt was used
+    in an earlier turn (the very bug ``_find_current_user_turn`` was hardened
+    against, #7237 review finding 3). This fallback is used when the
+    active-turn identity is unavailable, which is exactly the case where
+    the bug bites hardest.
     """
+    last_strong_match = None
     for idx, msg in enumerate(messages or []):
         if _looks_like_current_user_turn(msg, msg_text):
+            last_strong_match = idx
+    if last_strong_match is not None:
+        return last_strong_match
+    # No strong match: fall back to the last user row's index (matching
+    # the legacy fallback tail of ``_find_current_user_turn``).
+    for idx in range(len(messages or []) - 1, -1, -1):
+        msg = messages[idx]
+        if isinstance(msg, dict) and msg.get('role') == 'user':
             return idx
     return None
 
@@ -7464,6 +7571,13 @@ def _find_current_user_turn(messages, msg_text):
         return last_strong_match
     if last_weak_match is not None:
         return last_weak_match
+    # No strong/weak match: returning the LAST user row (fallback) is safe
+    # because we only use it when no turn in the conversation matches the
+    # prompt at all — anchoring on the most recent user row is the closest
+    # match we have. Returning None would force the dedupe to skip the
+    # current-turn slice and risk wholesale history loss (#7237 review
+    # blocker 1 / 3 interaction: a None here means the whole current
+    # turn is dropped on the no-identity, no-marker path).
     return fallback
 
 

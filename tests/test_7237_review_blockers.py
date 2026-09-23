@@ -13,17 +13,49 @@ sanitizer must merge consecutive assistant rows (mirroring the Agent's
 pass order: merge BEFORE orphan detection) so the call/result pair both
 survive the projection. A genuine user/system boundary between a call and
 its result is still an orphan.
+
+Blocker 2a (projection-path discriminators): the
+``_API_SAFE_MSG_KEYS`` allowlist used to drop ``codex_reasoning_items`` /
+``codex_message_items`` / ``finish_reason`` BEFORE the Agent pass-0
+merge could see them, so the Codex-interim / verification-supersede
+behaviours were only proven by the helper tests, never by the real
+projection callers. The sanitizer must let the merge see those
+discriminators, then strip them in a final pass so the wire contract
+still matches ``_API_SAFE_MSG_KEYS``.
+
+Blocker 2b (Agent-merge contract drift): the WebUI merge was missing two
+behaviours the Agent's own ``_merge_assistant_into`` implements —
+① carrying ``reasoning_content`` from the later row when the survivor
+lacks it, and ② dropping the survivor's stale ``api_content`` when the
+joined content actually changed. The drift only mattered in scenarios
+the helper-only tests didn't cover; pin both behaviours on the real
+projection paths.
+
+Blocker 3 (repeated-prompt fallback): the non-compression fallback that
+locates the current turn in ``result_messages`` when the active-turn
+identity is unavailable must select the LAST matching user row, not the
+first. First-match would replay the entire history from an earlier
+identical prompt, just like ``_find_current_user_turn`` was already
+written to avoid. ``_looks_like_current_user_turn_scan`` is the
+``#7237 review`` blocker 3 target; this test exercises the fallback path
+through the public dedupe entry point so the same regression cannot
+re-enter via either helper.
 """
 import json
 from types import SimpleNamespace
 
 from api.streaming import (
+    _API_PUBLIC_STRIP_KEYS,
+    _API_SAFE_MSG_KEYS,
+    _MERGE_VISIBLE_DISCRIMINATORS,
     _dedupe_replayed_context_messages,
     _sanitize_messages_for_api,
+    _sanitize_messages_for_agent,
     _settle_result_messages,
     _strip_orphan_tool_calls,
     _merge_consecutive_assistant_rows,
     _api_safe_message_positions,
+    _looks_like_current_user_turn_scan,
 )
 
 
@@ -53,13 +85,73 @@ class TestBlocker1WholesaleAcceptanceGuard:
             {"role": "assistant", "content": "second answer", "timestamp": 6.0},
         ]
 
-    def test_next_turn_persists_raw_history_not_projected(self):
-        """Save-then-reload: persisted context keeps the original pair."""
+    def _raw_history_with_orphan_pair(self):
+        """History that the outbound sanitizer will rewrite, so the Agent's
+        projected result no longer has the raw history as an exact prefix.
+
+        ``k1`` has a paired tool result, so the sanitizer must KEEP the pair.
+        The pre-existing ``_raw_history`` fixture is retained for the
+        compression-rotation / identity tests that don't rely on a sanitizer
+        rewrite. ``test_sanitize_preserves_paired_call_then_orhan_sanitizer_strips_pair``
+        (below) documents why that fixture cannot stand in for a prefix-mismatch
+        test: the sanitizer keeps the pair, so the projected prefix still
+        matches the raw history and the new fallback branch is never exercised.
+        """
+        return [
+            {"role": "user", "content": "first question", "timestamp": 1.0},
+            {"role": "assistant", "content": "first answer", "timestamp": 2.0},
+            {"role": "user", "content": "second question", "timestamp": 3.0},
+            # Trailing assistant carries a call/result pair split by a real
+            # user turn — the call is a genuine orphan and the result must be
+            # dropped. The sanitizer rewrites this row, so the projected
+            # prefix will no longer match the raw history (the failure mode
+            # the #7237 wholesale-acceptance guard exists to block).
+            {"role": "assistant", "content": "", "tool_calls": [_call("ghost")], "timestamp": 4.0},
+            {"role": "user", "content": "interrupt", "timestamp": 5.0},
+            {"role": "tool", "tool_call_id": "ghost", "content": "late result", "timestamp": 6.0},
+        ]
+
+    def test_sanitize_keeps_paired_call_so_prefix_still_matches(self):
+        """#7237 review finding 1: document the premise of the previous
+        ``_raw_history`` oracle. The second turn's call/result pair is
+        adjacent, so ``_sanitize_messages_for_api`` keeps it. That means
+        ``_dedupe_replayed_context_messages`` sees an exact prefix and takes
+        the cheap branch — the new "no identity, prefix mismatch" fallback
+        path the wholesale-acceptance guard adds is never exercised by the
+        old fixture. The oracle therefore does NOT prove the new branch
+        works. Use ``_raw_history_with_orphan_pair`` for that.
+        """
         raw = self._raw_history()
-        # The outbound sanitizer drops the orphan-looking pair (e.g. strict
-        # provider projection); the Agent returns a projected history whose
-        # prefix no longer matches raw.
         sanitized = _sanitize_messages_for_api(raw)
+        # Sanity: the pair survives, so the projected prefix still matches.
+        surviving_call_ids = [
+            tc.get("id")
+            for m in sanitized
+            for tc in (m.get("tool_calls") or [])
+        ]
+        assert surviving_call_ids == ["k1"], (
+            "fixture premise: the sanitizer must keep the paired call so the "
+            "previous 'third question' test could pass through the cheap "
+            "prefix-match branch. The new prefix-mismatch test below uses a "
+            "different fixture that the sanitizer DOES rewrite."
+        )
+
+    def test_next_turn_persists_raw_history_not_projected(self):
+        """Save-then-reload: persisted context keeps the original pair.
+
+        Uses ``_raw_history_with_orphan_pair``: a sanitizer rewrite is
+        required to force the Agent's projected result off the raw prefix,
+        so the wholesale-acceptance guard's new fallback path is actually
+        exercised. The previous ``_raw_history`` fixture is documented in
+        ``test_sanitize_keeps_paired_call_so_prefix_still_matches``.
+        """
+        raw = self._raw_history_with_orphan_pair()
+        # The outbound sanitizer drops the orphan call + the late tool result
+        # (a user row sits between them), so the projected history no longer
+        # has raw as an exact prefix.
+        sanitized = _sanitize_messages_for_api(raw)
+        # Sanity: the rewrite really happened — projected != raw.
+        assert [m.get("role") for m in sanitized] != [m.get("role") for m in raw]
         # Simulate the Agent returning the sanitized history + a new turn.
         result = sanitized + [
             {"role": "user", "content": "third question"},
@@ -213,6 +305,268 @@ class TestBlocker2MergeBeforeOrphan:
         assert tool_rows and tool_rows[0][1]["tool_call_id"] == "m1"
 
 
+class TestBlocker2ProjectionPath:
+    """#7237 review finding 2a/2b: the real sanitizer/positions projection
+    paths must (a) preserve ``codex_*``/``finish_reason`` discriminators into
+    the Agent pass-0 merge and strip them in a final pass, and (b) match the
+    Agent's ``_merge_assistant_into`` behaviours for ``reasoning_content``
+    carry and ``api_content`` invalidation. The helper-only tests above
+    cover the merge function in isolation; this class covers the projection
+    callers, which is what real session flows hit.
+    """
+
+    def test_sanitize_for_api_strips_merge_visible_discriminators_in_final_pass(self):
+        """The merge-visible discriminators are kept long enough for the
+        Agent pass-0 merge to see them, then dropped in a final pass so
+        the public sanitizer output still matches ``_API_SAFE_MSG_KEYS``.
+        """
+        msgs = [
+            {
+                "role": "assistant", "content": "first", "tool_calls": [_call("v1")],
+                "finish_reason": "verification_required",
+            },
+            {
+                "role": "assistant", "content": "second",
+                "codex_reasoning_items": [{"type": "reasoning"}],
+            },
+        ]
+        out = _sanitize_messages_for_api(msgs)
+        # The merge-visible discriminators are stripped in the final pass.
+        for m in out:
+            for forbidden in _MERGE_VISIBLE_DISCRIMINATORS:
+                assert forbidden not in m, (
+                    f"{forbidden} must not survive the public sanitizer "
+                    f"projection — only the Agent merge may see it"
+                )
+            for key in m:
+                assert key in _API_SAFE_MSG_KEYS, (
+                    f"key {key!r} leaked into the public sanitizer output"
+                )
+
+    def test_sanitize_for_api_keeps_codex_interim_separate(self):
+        """A codex_interim row (carrying ``codex_message_items``) is exempt
+        from the Agent pass-0 merge. The real projection must therefore
+        keep it distinct from the adjacent assistant row, even though both
+        are role=assistant. The pre-existing helper test only proved this
+        for ``_merge_consecutive_assistants`` in isolation.
+
+        The codex_interim marker exempts the row from the merge itself,
+        not from the orphan-repair pass that follows. The call/result pair
+        must still survive end-to-end, so the call/result must be on the
+        SAME assistant row (or be a fully answered call from before the
+        interim). Here we use a single-pair shape where the interim is
+        between the call and its result — that is the bug the helper test
+        reproduces. The point of this test is just that the codex_interim
+        row is preserved as its own assistant turn (the public sanitizer
+        strips ``codex_message_items`` from the output, but the row stays).
+        """
+        interim = {
+            "role": "assistant", "content": "interim",
+            "codex_message_items": [{"type": "message"}],
+        }
+        # Pre-merge, the call/result pair is on a single assistant row, and
+        # the codex_interim row is its own assistant turn AFTER the pair.
+        msgs = [
+            _assistant(["m1"], content="call-then-result"),
+            _tool("m1"),
+            interim,
+        ]
+        out = _sanitize_messages_for_api(msgs)
+        # ``codex_message_items`` is stripped from the public output, but
+        # the interim row's content is still preserved.
+        interim_rows = [m for m in out if m.get("content") == "interim"]
+        assert interim_rows, "codex interim row survives the sanitizer"
+        for m in out:
+            assert "codex_message_items" not in m, (
+                "codex_message_items is a merge-visible discriminator "
+                "and must not leak into the public sanitizer output"
+            )
+        # The call/result pair still survives end-to-end.
+        surviving_tool_ids = [
+            m.get("tool_call_id") for m in out if m.get("role") == "tool"
+        ]
+        assert surviving_tool_ids == ["m1"], (
+            "the call/result pair survives the sanitizer"
+        )
+
+    def test_sanitize_for_api_verification_supersede_on_real_path(self):
+        """A verification_required assistant row followed by a final
+        answer is superseded on the real projection path, not unioned.
+        """
+        provisional = {
+            "role": "assistant", "content": "provisional",
+            "tool_calls": [_call("v1")],
+            "finish_reason": "verification_required",
+        }
+        final = {"role": "assistant", "content": "final answer"}
+        out = _sanitize_messages_for_api([provisional, final])
+        assert len(out) == 1
+        assert out[0]["content"] == "final answer"
+        # ``finish_reason`` does not survive the public projection.
+        assert "finish_reason" not in out[0]
+        # The provisional tool call was replaced, not unioned.
+        assert not out[0].get("tool_calls")
+
+    def test_api_safe_positions_strips_merge_visible_discriminators(self):
+        """The ``_api_safe_message_positions`` projection also strips the
+        merge-visible discriminators before returning. Their presence in
+        the wire payload would leak Agent-internal state to downstream
+        callers that consume the position list.
+        """
+        interim = {
+            "role": "assistant", "content": "interim",
+            "codex_message_items": [{"type": "message"}],
+        }
+        msgs = [
+            {"role": "user", "content": "go"},
+            _assistant(["m1"], content=""),
+            interim,
+            _tool("m1"),
+        ]
+        out = _api_safe_message_positions(msgs)
+        for _idx, m in out:
+            for forbidden in _MERGE_VISIBLE_DISCRIMINATORS | {"api_content"}:
+                assert forbidden not in m, (
+                    f"{forbidden} must not survive the positions projection"
+                )
+            for key in m:
+                assert key in _API_SAFE_MSG_KEYS, (
+                    f"key {key!r} leaked into positions output"
+                )
+
+    def test_sanitize_for_api_carries_reasoning_content_from_later_row(self):
+        """Agent merge contract ①: when the survivor lacks
+        ``reasoning_content`` and the later row carries one, the merge
+        copies the later value onto the survivor. The real sanitizer
+        must match this — a strict thinking provider needs a
+        ``reasoning_content`` on the merged tool-call turn.
+        """
+        msgs = [
+            {
+                "role": "assistant", "content": "first",
+                "tool_calls": [_call("r1")],
+            },
+            {
+                "role": "assistant", "content": "second",
+                "reasoning_content": "thought: the answer is 42",
+            },
+            _tool("r1"),
+        ]
+        out = _sanitize_messages_for_api(msgs)
+        merged = [m for m in out if m.get("role") == "assistant" and m.get("tool_calls")]
+        assert merged, "the merged tool-call row survives"
+        assert merged[0].get("reasoning_content") == "thought: the answer is 42", (
+            "the survivor's reasoning_content must be carried from the "
+            "later row, matching the Agent's _merge_assistant_into contract"
+        )
+
+    def test_sanitize_for_api_drops_stale_api_content_on_content_rewrite(self):
+        """Agent merge contract ②: when the joined content actually
+        changes, the survivor's ``api_content`` sidecar is dropped. A
+        stale sidecar would replay pre-merge bytes on the next request
+        and silently overwrite the rewrite. The Agent replay projection
+        (``preserve_api_content=True``) is the only path that must keep
+        ``api_content``; the sanitizer strips it on non-rewrite
+        content-only-equal merges to honour the prompt-cache invariant.
+        """
+        msgs = [
+            {
+                "role": "assistant", "content": "first",
+                "tool_calls": [_call("c1")],
+                "api_content": "stale bytes the rewrite just discarded",
+            },
+            {
+                "role": "assistant", "content": "second", "tool_calls": [_call("c2")],
+            },
+            _tool("c1"),
+            _tool("c2"),
+        ]
+        # Public sanitizer (preserve_api_content=False): api_content never survives.
+        out = _sanitize_messages_for_api(msgs)
+        assert all("api_content" not in m for m in out), (
+            "public sanitizer strips api_content even when the merge "
+            "saw a stale sidecar; only the Agent replay path keeps it"
+        )
+
+    def test_sanitize_for_agent_keeps_api_content_on_unchanged_merge(self):
+        """When the merge does NOT change the visible content (the later
+        row carried only an empty ``new_content``), the survivor's
+        ``api_content`` MUST survive on the Agent replay path: dropping
+        it would break the prompt-cache replay invariant for no reason.
+        The Agent's own contract distinguishes the "unchanged" and
+        "rewritten" cases; the WebUI helper now does too.
+
+        The orphan-repair pass runs AFTER the merge and drops call ids
+        that lack an immediately-following tool result. To keep the merged
+        row in the output, the survivor's call must already be answered
+        by an adjacent tool row.
+        """
+        msgs = [
+            {
+                "role": "assistant", "content": "only the survivor",
+                "tool_calls": [_call("d1")],
+                "api_content": "stale bytes for unchanged survivor",
+            },
+            {
+                "role": "assistant", "content": "",  # empty → join collapses to prev
+            },
+            _tool("d1"),
+        ]
+        before_bytes = json.dumps(msgs, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+        out = _sanitize_messages_for_agent(msgs)
+        # Source non-mutation: the merge must not rewrite the input rows.
+        assert json.dumps(msgs, sort_keys=True, ensure_ascii=False, separators=(",", ":")) == before_bytes
+        merged = [m for m in out if m.get("role") == "assistant" and m.get("tool_calls")]
+        assert merged
+        # The merge was a no-op on content, so the sidecar survives.
+        assert merged[0].get("api_content") == "stale bytes for unchanged survivor", (
+            "agent replay projection must keep the sidecar when the "
+            "merge did not change the visible content"
+        )
+
+    def test_sanitize_for_agent_drops_api_content_on_rewrite(self):
+        """The Agent replay path must drop the survivor's ``api_content``
+        when the merge actually changes the visible content. Pre-merge
+        bytes cannot describe the post-merge turn; replaying them would
+        silently undo the rewrite at the next API build.
+
+        The orphan-repair pass runs AFTER the merge; this fixture must
+        give the merged row an immediately-following tool result so the
+        repair does not drop the call. The point of the test is the
+        content rewrite + api_content drop, not the orphan-repair.
+        """
+        msgs = [
+            {
+                "role": "assistant", "content": "first",
+                "tool_calls": [_call("e1")],
+                "api_content": "stale bytes the rewrite just discarded",
+            },
+            {
+                "role": "assistant", "content": "second", "tool_calls": [_call("e2")],
+            },
+            _tool("e1"),
+            _tool("e2"),
+        ]
+        out = _sanitize_messages_for_agent(msgs)
+        merged = [m for m in out if m.get("role") == "assistant" and m.get("tool_calls")]
+        assert merged
+        assert "api_content" not in merged[0], (
+            "the survivor's api_content must be dropped when the merge "
+            "actually changed the visible content"
+        )
+
+    def test_merge_visible_strip_keys_cover_required_discriminators(self):
+        """Defensive invariant: the strip set must include every merge
+        discriminator so a future ``_API_SAFE_MSG_KEYS`` expansion cannot
+        silently leak an internal field into the public sanitizer output.
+        """
+        assert {'codex_reasoning_items', 'codex_message_items', 'finish_reason'} <= _API_PUBLIC_STRIP_KEYS
+        assert _MERGE_VISIBLE_DISCRIMINATORS <= _API_PUBLIC_STRIP_KEYS
+        # ``api_content`` is also stripped from the public sanitizer (the
+        # ``preserve_api_content`` opt-in is the only path that keeps it).
+        assert 'api_content' in _API_PUBLIC_STRIP_KEYS
+
+
 class TestOldGuardStillHolds:
     """The pre-existing contract (from the PR's own tests) must survive."""
 
@@ -233,3 +587,110 @@ class TestOldGuardStillHolds:
         # own pass order keeps both. (Previously this whole pair was dropped.)
         tool_rows = [m for m in sanitized if m.get("role") == "tool"]
         assert tool_rows, "agent pass order keeps the late-paired call/result"
+
+
+class TestBlocker3RepeatedPromptFallback:
+    """#7237 review finding 3: the non-compression fallback that locates
+    the current turn in ``result_messages`` when the active-turn identity
+    is unavailable must select the LAST matching user row, not the first.
+
+    ``_find_current_user_turn`` is already written to walk to the end and
+    prefer the last strong match (see its docstring: "first-match would
+    return that old index, causing the merge to replay the entire history
+    from that point"). The new ``_looks_like_current_user_turn_scan`` fallback
+    was added at the same boundary but returned the first match, recreating
+    the bug the established helper was built to avoid. These tests pin the
+    fallback to the same last-strong-match contract.
+    """
+
+    def test_scan_returns_last_matching_user_turn_when_prompt_repeats(self):
+        """Repeated-identical-prompt: the LATER user row is the current
+        turn, the EARLIER one is historical. First-match would replay the
+        full history from the older row. ``_find_current_user_turn`` already
+        pins last-match; ``_looks_like_current_user_turn_scan`` must too.
+        """
+        prompt = "what is the meaning of life"
+        msgs = [
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": "42"},
+            # The current turn uses the same prompt again.
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": "still 42"},
+        ]
+        idx = _looks_like_current_user_turn_scan(msgs, prompt)
+        assert idx == 2, (
+            "fallback must select the LAST matching user row, not the first; "
+            "first-match would replay historical turns (#7237 review finding 3)"
+        )
+
+    def test_scan_falls_back_to_last_user_row_when_no_prompt_match(self):
+        """With no strong match, mirror ``_find_current_user_turn``'s
+        fallback: return the index of the last user row, not None.
+
+        Returning None would force the dedupe to skip the current-turn
+        slice on the no-identity, no-marker path and risk wholesale
+        history loss (#7237 review blocker 1 / 3 interaction). The
+        legacy contract was: anchor on the most recent user row, even
+        if no text matches, because that is the closest analogue to a
+        current turn we can derive.
+        """
+        msgs = [
+            {"role": "user", "content": "unrelated"},
+            {"role": "assistant", "content": "answer"},
+        ]
+        assert _looks_like_current_user_turn_scan(msgs, "totally different prompt") == 0
+        # Empty list still returns None (no user row to anchor on).
+        assert _looks_like_current_user_turn_scan([], "anything") is None
+
+    def test_dedupe_fallback_uses_last_match_not_first_when_no_identity(self):
+        """End-to-end through the public dedupe entry point: when the
+        active-turn identity is unavailable, the fallback must locate the
+        current user turn by last-strong-match so the merged context does
+        NOT replay the historical assistant output.
+
+        Fixture: ``previous_context`` is a four-row history ending with a
+        user/assistant pair whose prompt reappears in the new turn.
+        ``result_messages`` carries the current turn only — the historical
+        prefix is NOT an exact prefix (the prior assistant answers and the
+        first user row are not in the result), so the dedupe takes the
+        no-identity / no-marker path and falls back to
+        ``_looks_like_current_user_turn_scan``.
+
+        With first-match the fallback locates the user row at index 0 and
+        the dedupe re-emits the entire current turn starting from that
+        historical re-entry, leaving the historical user row duplicated at
+        the tail (a partial replay). With last-match the slice starts at
+        the current user row (index 1) and the historical user row at
+        index 0 is dropped as a replayed item.
+        """
+        prompt = "what is the meaning of life"
+        previous_context = [
+            {"role": "user", "content": "earlier question"},
+            {"role": "assistant", "content": "earlier answer"},
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": "42"},
+        ]
+        # result_messages does NOT start with previous_context[:n] for any
+        # n >= 1, so neither the cheap prefix-match branch nor the
+        # stale-merge branch fires. The fallback is the only path that can
+        # locate the current turn.
+        result_messages = [
+            {"role": "user", "content": prompt},  # historical re-entry of the current prompt
+            {"role": "user", "content": prompt},  # the actual current turn
+            {"role": "assistant", "content": "still 42"},
+        ]
+        settled = _dedupe_replayed_context_messages(
+            previous_context, result_messages, prompt, None,
+        )
+        # With LAST-match the boundary is the second user row (index 1),
+        # so the historical user re-entry at index 0 is recognised as a
+        # replayed item and dropped. With FIRST-match the boundary is
+        # index 0, so the dedupe would re-emit the entire current turn
+        # and the historical re-entry duplicates onto the tail.
+        assert settled == previous_context + [
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": "still 42"},
+        ], (
+            "no-identity / no-marker fallback must slice from the LAST "
+            "matching user turn, not the first (#7237 review finding 3)"
+        )
