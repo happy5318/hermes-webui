@@ -313,6 +313,35 @@ class TestRecoveredUserTransparency:
         assert sanitized[0]["role"] == "assistant"
         assert [c["id"] for c in sanitized[0]["tool_calls"]] == ["a", "b"]
 
+    def test_sanitize_for_api_keeps_pair_split_by_recovered_user_before_first_result(self):
+        """#7237 review finding 1 (before-first-result shape): the
+        ``assistant(calls a,b) -> recovered user -> tool(a) -> tool(b) -> assistant(done)``
+        shape currently only exercises the ``_strip_orphan_tool_calls`` helper. The
+        end-to-end sanitizer path must also keep the call/result pair when the
+        recovered user sits BEFORE the first tool result. Without this, a
+        recovered stream that flushes results late is silently dropped on
+        exactly the recovery path this PR family hardens.
+        """
+        msgs = [
+            _assistant(["a", "b"]),
+            {"role": "user", "content": "stale", "_recovered": True},
+            _tool("a"),
+            _tool("b"),
+            {"role": "assistant", "content": "done"},
+        ]
+        before_bytes = json.dumps(msgs, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+        sanitized = _sanitize_messages_for_api(msgs)
+        # Final roles: assistant (carries a+b), tool(a), tool(b), assistant(done).
+        # No recovered user row, no _recovered marker in the projection.
+        assert [m["role"] for m in sanitized] == ["assistant", "tool", "tool", "assistant"]
+        assert [c["id"] for c in sanitized[0]["tool_calls"]] == ["a", "b"]
+        assert sanitized[1]["tool_call_id"] == "a"
+        assert sanitized[2]["tool_call_id"] == "b"
+        assert sanitized[3]["content"] == "done"
+        assert all(not m.get("_recovered") for m in sanitized)
+        # Source rows must remain byte-identical — sanitizer is projection-only.
+        assert json.dumps(msgs, sort_keys=True, ensure_ascii=False, separators=(",", ":")) == before_bytes
+
     def test_api_safe_message_positions_keeps_pair_split_by_recovered_user(self):
         """_api_safe_message_positions delegates to _strip_orphan_tool_calls;
         the same transparency rule must apply on this projection path.
@@ -334,3 +363,33 @@ class TestRecoveredUserTransparency:
             row[1].get("tool_call_id") for row in out if row[1].get("role") == "tool"
         ]
         assert surviving_tool_ids == ["a", "b"]
+
+    def test_api_safe_positions_keeps_pair_with_recovered_user_before_first_result(self):
+        """#7237 review finding 1 (before-first-result shape) on the
+        projection-by-index path. The recovered user sits BEFORE the first
+        tool result, so the kept original indices are [0, 2, 3, 4] (skipping
+        the recovered row at index 1). Final roles and IDs follow the same
+        order as the ``_sanitize_messages_for_api`` test above, and the
+        source list is not mutated.
+        """
+        from api.streaming import _api_safe_message_positions
+        msgs = [
+            _assistant(["a", "b"]),
+            {"role": "user", "content": "stale", "_recovered": True},
+            _tool("a"),
+            _tool("b"),
+            {"role": "assistant", "content": "done"},
+        ]
+        before_bytes = json.dumps(msgs, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+        out = _api_safe_message_positions(msgs)
+        # Original indices of the survivors are the assistant at 0, the two
+        # tool rows at 2 and 3, and the trailing assistant at 4.
+        assert [idx for idx, _m in out] == [0, 2, 3, 4]
+        assert [m["role"] for idx, m in out] == ["assistant", "tool", "tool", "assistant"]
+        assert [c["id"] for c in out[0][1]["tool_calls"]] == ["a", "b"]
+        assert out[1][1]["tool_call_id"] == "a"
+        assert out[2][1]["tool_call_id"] == "b"
+        assert out[3][1]["content"] == "done"
+        assert all(not m.get("_recovered") for _idx, m in out)
+        # Source rows must remain byte-identical — projection is index-preserving.
+        assert json.dumps(msgs, sort_keys=True, ensure_ascii=False, separators=(",", ":")) == before_bytes
