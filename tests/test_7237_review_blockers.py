@@ -56,6 +56,7 @@ from api.streaming import (
     _merge_consecutive_assistant_rows,
     _api_safe_message_positions,
     _looks_like_current_user_turn_scan,
+    _restore_reasoning_metadata_before_boundary,
 )
 
 
@@ -345,48 +346,58 @@ class TestBlocker2ProjectionPath:
 
     def test_sanitize_for_api_keeps_codex_interim_separate(self):
         """A codex_interim row (carrying ``codex_message_items``) is exempt
-        from the Agent pass-0 merge. The real projection must therefore
-        keep it distinct from the adjacent assistant row, even though both
-        are role=assistant. The pre-existing helper test only proved this
-        for ``_merge_consecutive_assistants`` in isolation.
+        from the Agent pass-0 merge. The real projection must therefore keep
+        it distinct from the ADJACENT assistant row, even though both are
+        role=assistant.
 
-        The codex_interim marker exempts the row from the merge itself,
-        not from the orphan-repair pass that follows. The call/result pair
-        must still survive end-to-end, so the call/result must be on the
-        SAME assistant row (or be a fully answered call from before the
-        interim). Here we use a single-pair shape where the interim is
-        between the call and its result — that is the bug the helper test
-        reproduces. The point of this test is just that the codex_interim
-        row is preserved as its own assistant turn (the public sanitizer
-        strips ``codex_message_items`` from the output, but the row stays).
+        The interim row sits directly next to a mergeable assistant row on
+        purpose: the earlier fixture put a tool row between them, which left
+        the test green even if interim preservation stopped working. With
+        adjacent rows the merger WOULD collapse the pair into one row if the
+        exemption were lost, so the exact row count is the discriminator
+        (#7237 review, nesquena-hermes 2026-09-23).
         """
         interim = {
-            "role": "assistant", "content": "interim",
+            "role": "assistant",
+            "content": "interim",
             "codex_message_items": [{"type": "message"}],
         }
-        # Pre-merge, the call/result pair is on a single assistant row, and
-        # the codex_interim row is its own assistant turn AFTER the pair.
         msgs = [
-            _assistant(["m1"], content="call-then-result"),
-            _tool("m1"),
+            {"role": "user", "content": "go"},
+            _assistant(["m1"], content="before interim"),
             interim,
+            {"role": "assistant", "content": "after interim"},
         ]
-        out = _sanitize_messages_for_api(msgs)
-        # ``codex_message_items`` is stripped from the public output, but
-        # the interim row's content is still preserved.
-        interim_rows = [m for m in out if m.get("content") == "interim"]
-        assert interim_rows, "codex interim row survives the sanitizer"
-        for m in out:
+
+        sanitizer_out = _sanitize_messages_for_api(msgs)
+        assert [m.get("content") for m in sanitizer_out] == [
+            "go",
+            "before interim",
+            "interim",
+            "after interim",
+        ], (
+            "the codex_interim row must stay its own assistant turn beside "
+            "the mergeable assistant rows; collapsing them loses the row"
+        )
+        for m in sanitizer_out:
             assert "codex_message_items" not in m, (
                 "codex_message_items is a merge-visible discriminator "
                 "and must not leak into the public sanitizer output"
             )
-        # The call/result pair still survives end-to-end.
-        surviving_tool_ids = [
-            m.get("tool_call_id") for m in out if m.get("role") == "tool"
-        ]
-        assert surviving_tool_ids == ["m1"], (
-            "the call/result pair survives the sanitizer"
+
+        positions_out = _api_safe_message_positions(msgs)
+        assert [m.get("content") for _idx, m in positions_out] == [
+            "go",
+            "before interim",
+            "interim",
+            "after interim",
+        ], (
+            "the positions projection must also keep the adjacent codex_interim "
+            "row separate from its assistant neighbours"
+        )
+        assert [idx for idx, _m in positions_out] == [0, 1, 2, 3], (
+            "adjacent non-interim assistant rows are still merged pair-wise, "
+            "but the interim row keeps its own position"
         )
 
     def test_sanitize_for_api_verification_supersede_on_real_path(self):
@@ -567,6 +578,182 @@ class TestBlocker2ProjectionPath:
         assert 'api_content' in _API_PUBLIC_STRIP_KEYS
 
 
+class TestBlockerOwnershipFailClosed:
+    """#7237 review (nesquena-hermes, 2026-09-23): an unmatched user row
+    must never be treated as current-turn authority.
+
+    ``_looks_like_current_user_turn_scan``'s contract is "return the index of
+    a row that looks like the current user turn, else None". The old tail
+    returned the last arbitrary ``role: "user"`` row after no prompt-derived
+    match, so ``_dedupe_replayed_context_messages`` guessed a boundary from
+    an unrelated (often synthetic continuation) user row and dropped the
+    assistant/tool output between the real turn and that guess.
+
+    Fail-closed rule: with no proven ownership — neither an active-turn
+    identity/checkpoint, nor a prompt-derived match — keep the raw
+    ``previous_context`` exactly as it is and do NOT slice from a guessed row.
+    """
+
+    def _previous_context(self):
+        return [
+            {"role": "user", "content": "real first question", "timestamp": 1.0},
+            {"role": "assistant", "content": "real first answer", "timestamp": 2.0},
+            {"role": "user", "content": "second question", "timestamp": 3.0},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [_call("k1")],
+                "timestamp": 4.0,
+            },
+            {"role": "tool", "tool_call_id": "k1", "content": "tool output", "timestamp": 5.0},
+            {"role": "assistant", "content": "second answer", "timestamp": 6.0},
+        ]
+
+    def test_scan_returns_none_when_no_prompt_match(self):
+        """Contract: no proven ownership -> None (never an arbitrary row)."""
+        msgs = [
+            {"role": "user", "content": "unrelated"},
+            {"role": "assistant", "content": "answer"},
+        ]
+        assert _looks_like_current_user_turn_scan(msgs, "totally different prompt") is None
+        # A non-matching user row is not ownership proof either.
+        msgs = [
+            {"role": "user", "content": "prefix of prompt real first question tail"},
+            {"role": "assistant", "content": "answer"},
+        ]
+        assert _looks_like_current_user_turn_scan(msgs, "something else entirely") is None
+        # Empty list still returns None.
+        assert _looks_like_current_user_turn_scan([], "anything") is None
+        assert _looks_like_current_user_turn_scan(None, "anything") is None
+
+    def test_dedupe_keeps_raw_context_when_no_proven_boundary(self):
+        """Weak/transformed current prompt + later synthetic user row: the
+        guessed boundary must not stand. Raw previous_context is kept and the
+        projected result is NOT wholesale-accepted, so nothing is lost.
+        """
+        previous_context = self._previous_context()
+        # The submitted prompt survived only in a transformed shape (a steer
+        # preamble was prepended to it), so the strict text match in the scan
+        # cannot prove ownership of this row.
+        transformed = {
+            "role": "user",
+            "content": "Mid-turn correction (steer): please refactor streaming.py",
+        }
+        # A synthetic continuation user row the agent loop appended AFTER the
+        # real turn. The old fallback anchored on this row.
+        synthetic = {"role": "user", "content": "Continue from where you stopped"}
+        result_messages = [
+            transformed,
+            {"role": "assistant", "content": "worked on the refactor"},
+            {"role": "assistant", "content": "", "tool_calls": [_call("k2")]},
+            {"role": "tool", "tool_call_id": "k2", "content": "refactor output"},
+            synthetic,
+            {"role": "assistant", "content": "synthetic answer"},
+        ]
+        # Sanity: the scan really cannot prove ownership here.
+        assert _looks_like_current_user_turn_scan(result_messages, "please refactor streaming.py") is None
+
+        settled = _dedupe_replayed_context_messages(
+            previous_context, result_messages, "please refactor streaming.py", None,
+        )
+        # Fail closed: raw context preserved, plus whatever the projection
+        # legitimately adds beyond it. Crucially, none of the raw rows may be
+        # dropped by a guessed boundary.
+        assert settled[:len(previous_context)] == previous_context, (
+            "fail-closed settle must keep the raw pre-turn context intact; "
+            "guessing a boundary from an unrelated user row drops history "
+            "(#7237 review ownership defect 1)"
+        )
+        # The synthetic continuation user row is not the boundary: the rows
+        # between the real turn and it are not swallowed.
+        contents = [m.get("content") for m in settled]
+        assert "worked on the refactor" in contents
+        assert "refactor output" in contents
+
+    def test_dedupe_does_not_persist_whole_projected_result_without_boundary(self):
+        """The no-proven-boundary path must fall through to the shared
+        wholesale-acceptance guard, never to ``result_messages`` as-is.
+        """
+        previous_context = self._previous_context()
+        result_messages = [
+            {"role": "user", "content": "unrelated continued prompt"},
+            {"role": "assistant", "content": "assistant delta"},
+        ]
+        settled = _dedupe_replayed_context_messages(
+            previous_context, result_messages, "please refactor streaming.py", None,
+        )
+        assert settled == previous_context + result_messages, (
+            "with no proven ownership the raw context plus the whole result "
+            "delta must be merged; dropping rows or accepting the projection "
+            "wholesale are both wrong"
+        )
+
+    def test_settle_round_trip_preserves_raw_history(self):
+        """Full ``_settle_result_messages`` path: with no proven ownership the
+        persisted context keeps the raw pre-turn rows AND the projected delta,
+        so neither the historical pair nor the new turn's output is lost.
+        """
+        raw = self._previous_context()
+        result = [
+            {
+                "role": "user",
+                "content": "Mid-turn correction (steer): please refactor streaming.py",
+            },
+            {"role": "assistant", "content": "worked on the refactor"},
+            {"role": "assistant", "content": "", "tool_calls": [_call("k2")]},
+            {"role": "tool", "tool_call_id": "k2", "content": "refactor output"},
+            {"role": "user", "content": "Continue from where you stopped"},
+            {"role": "assistant", "content": "synthetic answer"},
+        ]
+        session = SimpleNamespace(
+            messages=list(raw),
+            context_messages=list(raw),
+            truncation_watermark=None,
+        )
+        _settle_result_messages(
+            session,
+            list(raw),
+            list(raw),
+            result,
+            "please refactor streaming.py",
+            "webui",
+            None,
+        )
+        persisted = session.context_messages
+        assert [(m["role"], m["content"]) for m in persisted[:len(raw)]] == [
+            (m["role"], m["content"]) for m in raw
+        ], "raw pre-turn context survives the settle intact"
+        # The historical call/result pair is still there.
+        assert any(
+            tc.get("id") == "k1"
+            for m in persisted
+            if m.get("role") == "assistant"
+            for tc in (m.get("tool_calls") or [])
+        )
+        assert any(
+            m.get("role") == "tool" and m.get("tool_call_id") == "k1" for m in persisted
+        )
+        # The projected rows are kept too — nothing between the real turn and
+        # the synthetic continuation row was swallowed.
+        contents = [m.get("content") for m in persisted]
+        assert "worked on the refactor" in contents
+        assert "refactor output" in contents
+
+    def test_strong_match_still_slices_current_turn(self):
+        """A prompt-derived match IS ownership proof: the boundary still works.
+        """
+        previous_context = self._previous_context()
+        prompt = "please refactor streaming.py"
+        result_messages = [
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": "refactored"},
+        ]
+        settled = _dedupe_replayed_context_messages(
+            previous_context, result_messages, prompt, None,
+        )
+        assert settled == previous_context + result_messages
+
+
 class TestOldGuardStillHolds:
     """The pre-existing contract (from the PR's own tests) must survive."""
 
@@ -623,24 +810,32 @@ class TestBlocker3RepeatedPromptFallback:
             "first-match would replay historical turns (#7237 review finding 3)"
         )
 
-    def test_scan_falls_back_to_last_user_row_when_no_prompt_match(self):
-        """With no strong match, mirror ``_find_current_user_turn``'s
-        fallback: return the index of the last user row, not None.
+    def test_scan_returns_none_when_no_prompt_match(self):
+        """With no prompt-derived match the scan returns None: an unmatched
+        user row is NOT ownership proof.
 
-        Returning None would force the dedupe to skip the current-turn
-        slice on the no-identity, no-marker path and risk wholesale
-        history loss (#7237 review blocker 1 / 3 interaction). The
-        legacy contract was: anchor on the most recent user row, even
-        if no text matches, because that is the closest analogue to a
-        current turn we can derive.
+        The legacy contract anchored on the most recent user row even when no
+        text matched. That row can be a synthetic continuation prompt the
+        agent loop appended AFTER the real turn, so using it as the boundary
+        drops the assistant/tool output that belongs to the real turn in
+        between (#7237 review ownership defect 1, nesquena-hermes
+        2026-09-23). None makes the caller fail closed instead.
         """
         msgs = [
             {"role": "user", "content": "unrelated"},
             {"role": "assistant", "content": "answer"},
         ]
-        assert _looks_like_current_user_turn_scan(msgs, "totally different prompt") == 0
+        assert _looks_like_current_user_turn_scan(msgs, "totally different prompt") is None
+        # A synthetic continuation row must not win either.
+        msgs = [
+            {"role": "user", "content": "please refactor streaming.py"},
+            {"role": "assistant", "content": "working"},
+            {"role": "user", "content": "Continue"},
+        ]
+        assert _looks_like_current_user_turn_scan(msgs, "unrelated rewritten prompt") is None
         # Empty list still returns None (no user row to anchor on).
         assert _looks_like_current_user_turn_scan([], "anything") is None
+        assert _looks_like_current_user_turn_scan(None, "anything") is None
 
     def test_dedupe_fallback_uses_last_match_not_first_when_no_identity(self):
         """End-to-end through the public dedupe entry point: when the
@@ -694,3 +889,132 @@ class TestBlocker3RepeatedPromptFallback:
             "no-identity / no-marker fallback must slice from the LAST "
             "matching user turn, not the first (#7237 review finding 3)"
         )
+
+
+class TestVerificationSupersessionSurvivorIndex:
+    """#7237 review (nesquena-hermes, 2026-09-23) ownership defect 2.
+
+    In ``_api_safe_message_positions`` the verification-supersession arm
+    replaced the provisional row with the surviving final row while KEEPING
+    the dead provisional row's original index. Downstream
+    ``_restore_reasoning_metadata_before_boundary`` walks the stored pairs and
+    dereferences ``previous_messages[prev_idx]`` for the row it compares, so
+    the survivor was aligned to a row that no longer exists in the projection
+    and its stable id / timestamp / display reasoning could not be recovered.
+
+    The replacement must store the survivor row's OWN index.
+    """
+
+    @staticmethod
+    def _provisional():
+        return {
+            "role": "assistant",
+            "content": "provisional",
+            "tool_calls": [_call("v1")],
+            "finish_reason": "verification_required",
+        }
+
+    def test_positions_keeps_survivor_own_index(self):
+        """The surviving final row must carry ITS OWN original index."""
+        msgs = [
+            {"role": "user", "content": "go"},
+            self._provisional(),
+            {"role": "assistant", "content": "final answer"},
+        ]
+        out = _api_safe_message_positions(msgs)
+        pairs = [(idx, m) for idx, m in out]
+        assert [m.get("content") for _idx, m in pairs] == ["go", "final answer"], (
+            "verification supersession keeps the final row and drops the "
+            "provisional candidate"
+        )
+        final_idx = [idx for idx, m in pairs if m.get("content") == "final answer"]
+        assert final_idx == [2], (
+            "the survivor must store its OWN original index (2); storing the "
+            "dead provisional row's index (1) misaligns every downstream "
+            "metadata restore (#7237 review ownership defect 2)"
+        )
+
+    def test_positions_all_indices_address_their_own_row(self):
+        """Every positional pair must be self-describing: the stored index must
+        resolve to a row in the RAW list that the stored message is derived
+        from.
+
+        A union merge keeps the first row's index because that row IS the
+        merged body; a supersession must keep the survivor's own index because
+        the provisional row it replaced is gone from the projection. What can
+        never happen is a stored index resolving to a row whose ROLE differs
+        from the stored message (i.e. an index pointing at a row the
+        projection no longer emits).
+        """
+        msgs = [
+            {"role": "user", "content": "go"},
+            self._provisional(),
+            {"role": "assistant", "content": "final answer"},
+            {"role": "assistant", "content": "tail answer"},
+            {"role": "user", "content": "next"},
+        ]
+        out = _api_safe_message_positions(msgs)
+        assert len(out) == 3, "user / merged-assistant / next"
+        for idx, msg in out:
+            assert msgs[idx].get("role") == msg.get("role"), (
+                f"stored index {idx} resolves to {msgs[idx]!r}, not the "
+                f"survivor row {msg!r} — positional alignment is broken"
+            )
+        # The merged assistant body must address the row that survived it.
+        merged_idx, _merged = out[1]
+        assert merged_idx == 2, (
+            "the union-merge survivor keeps the FIRST merged row's index (2)"
+        )
+
+    def test_reasoning_metadata_restores_onto_survivor(self):
+        """End-to-end: after supersession the surviving final row recovers its
+        own stable id, timestamp and display reasoning.
+        """
+        previous_messages = [
+            {"role": "user", "content": "go", "id": 1},
+            {
+                **self._provisional(),
+                "id": 2,
+                "reasoning": "provisional thinking",
+                "timestamp": 20.0,
+            },
+            {
+                "role": "assistant",
+                "content": "final answer",
+                "id": 3,
+                "reasoning": "final thinking",
+                "timestamp": 30.0,
+            },
+        ]
+        # The agent rebuilds the projection it actually holds: the superseded
+        # provisional row is gone, so the surviving final row sits at the
+        # position the positional walk pairs with prev_safe[1].
+        updated = [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": "final answer"},
+        ]
+        out = _restore_reasoning_metadata_before_boundary(previous_messages, updated)
+        by_content = {m.get("content"): m for m in out}
+        assert by_content["go"].get("id") == 1, "the untouched user row keeps its id"
+        survivor = by_content["final answer"]
+        assert survivor.get("id") == 3, (
+            "the surviving final row must recover its OWN stable id; a "
+            "misaligned index steals or drops the provisional row's id"
+        )
+        assert survivor.get("timestamp") == 30.0, (
+            "the surviving row must recover its OWN timestamp"
+        )
+        assert survivor.get("reasoning") == "final thinking", (
+            "the surviving row must recover its OWN display reasoning"
+        )
+
+    def test_sanitizer_path_still_supersedes(self):
+        """The parallel ``_sanitize_messages_for_api`` supersession is
+        unaffected: one row, the final content, no provisional tool calls.
+        """
+        out = _sanitize_messages_for_api(
+            [self._provisional(), {"role": "assistant", "content": "final answer"}]
+        )
+        assert len(out) == 1
+        assert out[0]["content"] == "final answer"
+        assert not out[0].get("tool_calls")

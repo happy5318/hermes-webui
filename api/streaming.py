@@ -6119,14 +6119,22 @@ def _api_safe_message_positions(messages):
 
     # Merge consecutive assistant rows BEFORE positional orphan pairing —
     # mirror of _sanitize_messages_for_api (Agent pass-0 order, #7237
-    # blocker 2). This path carries (original_index, msg) pairs: the merged
-    # survivor keeps the FIRST row's original index so downstream alignment
-    # (e.g. _restore_reasoning_metadata_before_boundary) still maps onto the
-    # raw list. The merge now matches the Agent's own contract: carry the
-    # later row's `reasoning_content` when the survivor lacks it, and drop
-    # the survivor's `api_content` when the joined content actually changed
-    # (replaying the sidecar would resend pre-merge bytes the rewrite just
-    # discarded, #7237 review finding 2b).
+    # blocker 2). This path carries (original_index, msg) pairs and every
+    # stored index MUST address the row it is paired with: downstream
+    # alignment (e.g. _restore_reasoning_metadata_before_boundary) walks
+    # these pairs and dereferences the stored index inside the raw list.
+    # A union merge keeps the FIRST row's index because the first row (and
+    # only the first row) survives as the merged body. A verification
+    # supersession REPLACES the provisional row with a different surviving
+    # row, so it must store that survivor's OWN index — keeping the dead
+    # provisional row's index would align the survivor to a row the
+    # projection no longer emits and lose its stable id, timestamp and
+    # display reasoning (#7237 review ownership defect 2, nesquena-hermes
+    # 2026-09-23). The merge also matches the Agent's own contract: carry
+    # the later row's `reasoning_content` when the survivor lacks it, and
+    # drop the survivor's `api_content` when the joined content actually
+    # changed (replaying the sidecar would resend pre-merge bytes the
+    # rewrite just discarded, #7237 review finding 2b).
     merged_rows: list = []
     for idx, msg in out:
         if not isinstance(msg, dict):
@@ -6142,7 +6150,13 @@ def _api_safe_message_positions(messages):
         ):
             prev_idx, prev = prev_pair
             if prev.get('finish_reason') in ('verification_required', 'verify_hook_continue'):
-                merged_rows[-1] = (prev_idx, msg)
+                # Supersession: ``msg`` REPLACES the provisional row, so the
+                # surviving row is ``msg`` itself. Store ``msg``'s own index
+                # (``idx``), never the discarded row's ``prev_idx`` — the
+                # positional consumer would otherwise align the survivor to a
+                # row that is no longer in this projection (#7237 review
+                # ownership defect 2).
+                merged_rows[-1] = (idx, msg)
                 continue
             prev_calls = list(prev.get('tool_calls') or [])
             new_calls = list(msg.get('tool_calls') or [])
@@ -7059,20 +7073,22 @@ def _looks_like_current_user_turn_scan(messages, msg_text):
     against, #7237 review finding 3). This fallback is used when the
     active-turn identity is unavailable, which is exactly the case where
     the bug bites hardest.
+
+    There is deliberately NO weak/arbitrary fallback. A text match on the
+    submitted prompt is the only ownership proof this scan can offer; an
+    unmatched user row is merely the last ``role: "user"`` row and can be a
+    synthetic continuation prompt the agent loop appended after the real turn.
+    Anchoring a current-turn slice on such a row drops the assistant/tool
+    output that belongs to the real turn in between (#7237 review ownership
+    defect 1, nesquena-hermes 2026-09-23). The caller
+    (``_dedupe_replayed_context_messages``) fails closed on None and keeps the
+    raw pre-turn context instead of guessing.
     """
     last_strong_match = None
     for idx, msg in enumerate(messages or []):
         if _looks_like_current_user_turn(msg, msg_text):
             last_strong_match = idx
-    if last_strong_match is not None:
-        return last_strong_match
-    # No strong match: fall back to the last user row's index (matching
-    # the legacy fallback tail of ``_find_current_user_turn``).
-    for idx in range(len(messages or []) - 1, -1, -1):
-        msg = messages[idx]
-        if isinstance(msg, dict) and msg.get('role') == 'user':
-            return idx
-    return None
+    return last_strong_match
 
 
 def _dedupe_replayed_context_messages(previous_context, result_messages, msg_text=None, active_turn_identity=None):
@@ -7166,6 +7182,15 @@ def _dedupe_replayed_context_messages(previous_context, result_messages, msg_tex
                 result_messages, previous_context, active_turn_identity, msg_text,
             )
             if _boundary_idx is None:
+                # Ownership must be PROVEN, not guessed: only a prompt-derived
+                # match on ``msg_text`` may locate the current turn here. An
+                # unmatched user row can be a synthetic continuation prompt
+                # appended after the real turn, and slicing from it would drop
+                # the assistant/tool output in between (#7237 review ownership
+                # defect 1, nesquena-hermes 2026-09-23). When no boundary is
+                # proven the current-turn slice cannot be isolated, so the raw
+                # ``previous_context`` is preserved verbatim and the projected
+                # result is not persisted wholesale either.
                 _boundary_idx = _looks_like_current_user_turn_scan(
                     result_messages, msg_text,
                 )
@@ -7182,6 +7207,25 @@ def _dedupe_replayed_context_messages(previous_context, result_messages, msg_tex
                     len(previous_context), _boundary_idx,
                 )
                 return list(previous_context) + _current_slice
+            # No proven boundary: fail closed. The current-turn slice cannot be
+            # isolated, so do not guess one — slicing from an unproven user row
+            # would drop live assistant/tool rows, and persisting the projected
+            # result on its own would drop the repaired pair the raw context
+            # still carries. Keep the raw pre-turn context and settle the whole
+            # projected delta on top of it (#7237 review ownership defect 1,
+            # nesquena-hermes 2026-09-23).
+            _delta = _strip_replayed_prefix(previous_context, result_messages)
+            if _delta:
+                _delta = _strip_replayed_context_items(previous_context, _delta)
+            logger.info(
+                "Prefix mismatch without compression and no proven current-turn "
+                "boundary: keeping raw pre-turn context (%d rows) + %d projected "
+                "delta row(s); no boundary guessed (#7237 ownership defect 1)",
+                len(previous_context), len(_delta),
+            )
+            return list(previous_context) + _delta
+        # A compression marker explains the rotation: wholesale replacement of
+        # the historical prefix stays legitimate.
         return result_messages
     candidates = result_messages[len(previous_context):]
     # Strip stale merges only from the new-turn candidate slice so that
