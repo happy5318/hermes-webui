@@ -2647,25 +2647,39 @@ def _find_existing_assistant_for_journal_content(
     return substring_match
 
 
-def _journal_tool_already_present(
+def _find_journal_tool_match(
     session,
     name: str,
     preview: str,
     *,
     stream_id: str | None = None,
     current_turn_min_idx: int | None = None,
-) -> bool:
-    """Return True when an equivalent tool card already exists.
+    consumed_indexes: set[int] | None = None,
+) -> int | None:
+    """Return the index of the ONE existing card this journal event consumes.
+
+    Consumption is one-to-one (re-gate 2026-09-23 SILENT 3):
+    ``consumed_indexes`` holds the ``session.tool_calls`` indexes already
+    claimed by earlier journal events on this recovery pass. An
+    already-consumed card cannot satisfy a second identical event, so N
+    identical journaled tool calls need N distinct persisted cards; the
+    surplus appends. Without that bookkeeping one persisted
+    ``terminal: running`` card absorbed every identical tool event and the
+    surplus journaled calls vanished.
 
     Matching is stream-scoped when ``stream_id`` is supplied.  For untagged
     cards, a supplied current-turn boundary must prove ownership with a valid
     assistant anchor; unknown ownership defaults to append so an old card
-    cannot suppress a current recovery.
+    cannot suppress the current recovery.
     """
     candidate_name = str(name or '')
     candidate_preview = _normalize_journal_recovery_text(preview)
     candidate_stream = str(stream_id) if stream_id else None
-    for tool_call in session.tool_calls or []:
+    for tool_idx, tool_call in enumerate(session.tool_calls or []):
+        if consumed_indexes and tool_idx in consumed_indexes:
+            # Already consumed by an earlier journal event on this pass:
+            # one-to-one consumption, no card satisfies two events.
+            continue
         if not isinstance(tool_call, dict):
             continue
         if str(tool_call.get('name') or '') != candidate_name:
@@ -2676,14 +2690,14 @@ def _journal_tool_already_present(
         if existing_preview != candidate_preview:
             continue
         if candidate_stream is None:
-            return True
+            return tool_idx
         existing_stream = tool_call.get('_recovered_stream_id') or tool_call.get('_stream_id')
         if existing_stream:
             if str(existing_stream) == candidate_stream:
-                return True
+                return tool_idx
             continue
         if current_turn_min_idx is None:
-            return True
+            return tool_idx
         anchor = tool_call.get('assistant_msg_idx')
         if isinstance(anchor, bool) or not isinstance(anchor, int):
             # Unknown/invalid anchor must NOT match (fail closed toward
@@ -2753,8 +2767,31 @@ def _journal_tool_already_present(
         # hint, mirroring the content dedupe rule in
         # content_match_owned_by_current_turn — accept as duplicate so the
         # retry does not re-append the persisted card.
-        return True
-    return False
+        return tool_idx
+    return None
+
+
+def _journal_tool_already_present(
+    session,
+    name: str,
+    preview: str,
+    *,
+    stream_id: str | None = None,
+    current_turn_min_idx: int | None = None,
+    consumed_indexes: set[int] | None = None,
+) -> bool:
+    """Bool wrapper over :func:`_find_journal_tool_match` (back-compat)."""
+    return (
+        _find_journal_tool_match(
+            session,
+            name,
+            preview,
+            stream_id=stream_id,
+            current_turn_min_idx=current_turn_min_idx,
+            consumed_indexes=consumed_indexes,
+        )
+        is not None
+    )
 
 
 def _run_journal_has_visible_output(session, stream_id: str | None) -> bool:
@@ -2932,18 +2969,19 @@ def _pending_recovery_turn_start(session) -> int | None:
             if message_token == current_token:
                 return idx
             continue
-        # Token-aware (review fix 4): when the session has an authoritative
-        # token but this row does not, do NOT fall back to the raw checkpoint
-        # predicate — the token is the stronger signal and a tokenless older
-        # row must not claim the current turn. Checkpoint identity is only
-        # consulted when the session itself has no token (legacy sidecars).
-        if current_token is None and _message_matches_pending_checkpoint(
-            message,
-            pending_text,
-            session.pending_started_at,
-            session.pending_user_source,
-            session.pending_attachments,
-        ):
+        # Token-aware ownership (re-gate 2026-09-23 SILENT 2): a row that does
+        # NOT carry the session token is still the current turn when it fully
+        # matches the pending checkpoint (text + exact full-precision timestamp
+        # + source + attachments). The previous "token suppresses checkpoint"
+        # rule rejected every tokenless row whenever the session had a token,
+        # so a fully-matching current-turn row was not recognized and
+        # `_materialize_unsaved_gateway_terminal_error` duplicated the turn.
+        # `_message_owns_current_turn` is the shared predicate used by the
+        # other ownership sites (token first, then full checkpoint identity);
+        # an explicit token conflict is authoritative negative evidence and a
+        # fallback checkpoint match cannot override it — that conflict already
+        # returned above.
+        if _message_owns_current_turn(message, session):
             return idx
     return None
 
@@ -3131,6 +3169,10 @@ def _append_journaled_partial_output(
     recovered_tool_calls: list[dict] = []
     initial_message_count = len(session.messages or [])
     claimed_existing_assistant_indexes: set[int] = set()
+    # One-to-one journal-event consumption (re-gate 2026-09-23 SILENT 3):
+    # each existing tool card counts once, so N identical journaled tool
+    # events need N distinct persisted cards.
+    consumed_tool_card_indexes: set[int] = set()
 
     messages_list = session.messages or []
     current_turn_min_idx = 0
@@ -3461,10 +3503,16 @@ def _append_journaled_partial_output(
             # exists — only the anchor allocation is deferred.
             name = str(payload.get('name') or 'tool')
             preview = str(payload.get('preview') or '')
-            tool_already_present = dedupe_existing and _journal_tool_already_present(
-                session, name, preview, stream_id=stream_id,
-                current_turn_min_idx=current_turn_min_idx,
+            tool_match_idx = (
+                _find_journal_tool_match(
+                    session, name, preview, stream_id=stream_id,
+                    current_turn_min_idx=current_turn_min_idx,
+                    consumed_indexes=consumed_tool_card_indexes,
+                )
+                if dedupe_existing
+                else None
             )
+            tool_already_present = tool_match_idx is not None
             anchor_idx = flush_assistant()
             if tool_already_present:
                 # Pending text (if any) was flushed above; a deduped tool must
@@ -3476,6 +3524,9 @@ def _append_journaled_partial_output(
                 # ``session_mutated`` flag stays False: no fresh row was
                 # added this pass.
                 output_accounted_for = True
+                # Claim the matched card so a later identical journal event
+                # cannot dedupe against the very same card again.
+                consumed_tool_card_indexes.add(tool_match_idx)
                 continue
             if anchor_idx is None:
                 anchor_idx = ensure_assistant_anchor(created_at)
@@ -3808,6 +3859,39 @@ def _retry_journal_recovery_in_place(
         return False
 
 
+def _marker_reuse_index(session, stream_id: str | None) -> int | None:
+    """Return the index of an interruption marker owned by ``stream_id``.
+
+    Reuse sites must require EXPLICIT same-stream identity: only a marker whose
+    recorded stream id (``_journal_retry_stream_id`` or ``_recovered_stream_id``)
+    equals ``str(stream_id)`` may stand in for the marker the repair is about to
+    write. An identity-less marker — a legacy marker written before stream
+    tagging, or a demoted retry marker whose ``_journal_retry_meta`` was
+    stripped — proves nothing about which stream it belongs to, so reusing it
+    for the current stream appends no notice of its own and the user loses the
+    only signal for THIS stream's interruption (SILENT finding from the
+    2026-09-23 re-gate).
+    """
+    if stream_id is None:
+        return None
+    target = str(stream_id)
+    for idx, message in enumerate(session.messages or []):
+        if not isinstance(message, dict):
+            continue
+        is_interrupted = message.get('type') == 'interrupted' and bool(message.get('_error'))
+        is_pending_retry = bool(message.get('_pending_journal_recovery'))
+        if not (is_interrupted or is_pending_retry):
+            continue
+        marker_stream = (
+            message.get('_journal_retry_stream_id') or message.get('_recovered_stream_id')
+        )
+        if not marker_stream or str(marker_stream) != target:
+            # Never reuse an identity-less or other-stream marker.
+            continue
+        return idx
+    return None
+
+
 def _apply_core_sync_or_error_marker(
     session,
     core_path,
@@ -3948,21 +4032,7 @@ def _apply_core_sync_or_error_marker(
             # the transcript, so no new interruption marker is warranted —
             # reuse the one already present. Cross-stream markers are left
             # untouched (a different stream's marker still needs its own).
-            _existing_marker_idx = None
-            for _m_idx, _m in enumerate(session.messages):
-                if not isinstance(_m, dict):
-                    continue
-                _is_pending_retry = bool(_m.get('_pending_journal_recovery'))
-                _is_interrupted = _m.get('type') == 'interrupted' and bool(_m.get('_error'))
-                if not (_is_pending_retry or _is_interrupted):
-                    continue
-                _marker_stream = (
-                    _m.get('_journal_retry_stream_id') or _m.get('_recovered_stream_id')
-                )
-                if _marker_stream and str(_marker_stream) != str(_stream_id):
-                    continue
-                _existing_marker_idx = _m_idx
-                break
+            _existing_marker_idx = _marker_reuse_index(session, _stream_id)
             if _existing_marker_idx is not None:
                 # Reuse: do not append. The marker (and its retry meta, if
                 # any) is already in place for this stream; budget is
@@ -4056,16 +4126,7 @@ def _apply_core_sync_or_error_marker(
             # must skip the append when the existing marker advertises
             # the same stream and recovery state.
             if recovered_output and not terminal_error_recovered:
-                _existing_marker_idx = None
-                for _m_idx, _m in enumerate(session.messages):
-                    if not isinstance(_m, dict):
-                        continue
-                    if _m.get('type') != 'interrupted' or not _m.get('_error'):
-                        continue
-                    if _m.get('_recovered_stream_id') and _m.get('_recovered_stream_id') != _stream_id:
-                        continue
-                    _existing_marker_idx = _m_idx
-                    break
+                _existing_marker_idx = _marker_reuse_index(session, _stream_id)
                 if _existing_marker_idx is None:
                     session.messages.append(
                         _interrupted_recovery_marker(
