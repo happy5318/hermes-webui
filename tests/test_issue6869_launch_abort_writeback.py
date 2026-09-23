@@ -19,7 +19,7 @@ sites of the same class, and the review round that followed found three more
    had no abort cleanup at all; a background failure also left the tracked task
    permanently ``running``.
 
-The fix is one shared launch-abort helper — ``_abort_launched_stream`` — that
+The fix is one shared launch-abort helper — ``_cleanup_chat_start_launch_failure`` — that
 unwinds the registries, the thread state and the session reference together
 (compare-and-clear so a successor's claim is never touched), called from every
 one of those sites.
@@ -314,7 +314,7 @@ def test_abort_helper_leaves_successor_owner_untouched():
     with config.STREAMS_LOCK:
         config.STREAMS[dead_stream] = object()
 
-    routes._abort_launched_stream(s, dead_stream, reset_session=True)
+    routes._cleanup_chat_start_launch_failure(s, dead_stream, reset_session=True)
 
     assert config.SESSION_WRITEBACK_OWNERS.get(sid) == live_stream
     assert s.active_stream_id == live_stream
@@ -329,7 +329,12 @@ def test_btw_launch_failure_unwinds_registries(monkeypatch):
     parent = _make_session("btw-parent")
     monkeypatch.setattr(routes, "_agent_runtime_barrier_response", lambda **kw: None)
     monkeypatch.setattr(routes, "_session_is_subagent_view_only", lambda *a, **kw: False)
-    monkeypatch.setattr(routes, "get_session", lambda *a, **kw: parent)
+    # sid-aware resolver: the handler looks up the parent, and the merged
+    # cleanup helper re-resolves the *ephemeral* session canonically.
+    monkeypatch.setattr(
+        routes, "get_session",
+        lambda sid, metadata_only=False: models.SESSIONS.get(sid) or parent,
+    )
     monkeypatch.setattr(routes, "bad", lambda h, m, status=400: {"status": status})
     monkeypatch.setattr(
         routes, "j", lambda h, payload, status=200: {"status": status, "payload": payload}
@@ -364,7 +369,12 @@ def test_background_launch_failure_unwinds_registries_and_fails_task(monkeypatch
     saw a result."""
     parent = _make_session("bg-parent")
     monkeypatch.setattr(routes, "_agent_runtime_barrier_response", lambda **kw: None)
-    monkeypatch.setattr(routes, "get_session", lambda *a, **kw: parent)
+    # sid-aware: the handler looks up the parent, and the merged cleanup helper
+    # re-resolves the *hidden bg* session canonically.
+    monkeypatch.setattr(
+        routes, "get_session",
+        lambda sid, metadata_only=False: models.SESSIONS.get(sid) or parent,
+    )
     monkeypatch.setattr(routes, "bad", lambda h, m, status=400: {"status": status})
     monkeypatch.setattr(
         routes, "j", lambda h, payload, status=200: {"status": status, "payload": payload}
@@ -404,7 +414,7 @@ def test_background_launch_failure_unwinds_registries_and_fails_task(monkeypatch
 
 def test_source_launch_abort_helper_is_shared_across_all_sites(monkeypatch):
     """#6869 source guard: every launch-failure site must route through the
-    shared ``_abort_launched_stream`` helper rather than a bespoke cleanup.
+    shared ``_cleanup_chat_start_launch_failure`` helper rather than a bespoke cleanup.
     Pin the source so a future refactor cannot reintroduce a fourth bespoke
     try/except that forgets one of the registries."""
     src = routes.__file__
@@ -417,15 +427,15 @@ def test_source_launch_abort_helper_is_shared_across_all_sites(monkeypatch):
         return text[start:end]
 
     # The helper itself exists and clears the writeback owner.
-    helper = _block("_abort_launched_stream")
+    helper = _block("_cleanup_chat_start_launch_failure")
     assert "clear_session_writeback_owner_if_owned" in helper, (
-        "_abort_launched_stream must clear the writeback owner"
+        "_cleanup_chat_start_launch_failure must clear the writeback owner"
     )
     assert "unregister_stream_owner" in helper, (
-        "_abort_launched_stream must unregister the stream owner"
+        "_cleanup_chat_start_launch_failure must unregister the stream owner"
     )
     assert "STREAMS.pop" in helper, (
-        "_abort_launched_stream must drop the dead stream channel"
+        "_cleanup_chat_start_launch_failure must drop the dead stream channel"
     )
 
     # Every launch-failure site calls the helper.
@@ -435,8 +445,8 @@ def test_source_launch_abort_helper_is_shared_across_all_sites(monkeypatch):
         "_handle_btw",
         "_handle_background",
     ):
-        assert "_abort_launched_stream(" in _block(site), (
-            f"{site} must route launch failures through _abort_launched_stream (#6869)"
+        assert "_cleanup_chat_start_launch_failure(" in _block(site), (
+            f"{site} must route launch failures through _cleanup_chat_start_launch_failure (#6869)"
         )
 
     # The old bespoke per-site cleanup must be gone from the two chat-start
@@ -493,7 +503,7 @@ def test_abort_with_lock_held_does_not_self_deadlock(monkeypatch):
 
         def _run():
             try:
-                routes._abort_launched_stream(
+                routes._cleanup_chat_start_launch_failure(
                     s, stream_id, reset_session=True, lock_held=True
                 )
                 result_box["ok"] = True
@@ -506,7 +516,7 @@ def test_abort_with_lock_held_does_not_self_deadlock(monkeypatch):
         t.start()
         assert completed.wait(timeout=2.0), (
             "abort hung while caller held the session lock — "
-            "_abort_launched_stream re-acquired the same threading.Lock "
+            "_cleanup_chat_start_launch_failure re-acquired the same threading.Lock "
             "and self-deadlocked (#7680 BRICK)"
         )
         assert result_box.get("ok"), result_box.get("err")
@@ -640,7 +650,7 @@ def test_abort_preserves_process_wakeup_on_failure(monkeypatch):
     # (it was consumed upstream before the worker started).
     assert s.session_id not in config.PENDING_BG_TASK_COMPLETIONS
 
-    routes._abort_launched_stream(
+    routes._cleanup_chat_start_launch_failure(
         s,
         "stream-wakeup-fail",
         reset_session=True,
@@ -674,7 +684,7 @@ def test_abort_without_preserve_wakeup_leaves_marker_alone(monkeypatch):
     s.pending_user_message = "regular user message"
     s.active_stream_id = "stream-no-wakeup"
 
-    routes._abort_launched_stream(
+    routes._cleanup_chat_start_launch_failure(
         s,
         "stream-no-wakeup",
         reset_session=True,

@@ -23179,7 +23179,7 @@ def _handle_btw(handler, body):
         )
         thr.start()
     except Exception:
-        _abort_launched_stream(ephemeral, stream_id, reset_session=True)
+        _cleanup_chat_start_launch_failure(ephemeral, stream_id, reset_session=True)
         raise
     return j(handler, {"stream_id": stream_id, "session_id": ephemeral.session_id, "parent_session_id": body["session_id"]})
 
@@ -23237,7 +23237,7 @@ def _handle_background(handler, body):
             STREAMS[stream_id] = stream
         track_background(parent_sid, bg_sid, stream_id, task_id, prompt)
     except Exception:
-        _abort_launched_stream(bg, stream_id, reset_session=True)
+        _cleanup_chat_start_launch_failure(bg, stream_id, reset_session=True)
         try:
             complete_background(parent_sid, task_id, "(background task failed)")
         except Exception:
@@ -23294,7 +23294,7 @@ def _handle_background(handler, body):
     try:
         thr.start()
     except Exception:
-        _abort_launched_stream(bg, stream_id, reset_session=True)
+        _cleanup_chat_start_launch_failure(bg, stream_id, reset_session=True)
         try:
             complete_background(parent_sid, task_id, "(background task failed)")
         except Exception:
@@ -23360,174 +23360,6 @@ def _provisional_title_from_prompt(prompt: str, fallback: str = "Untitled") -> s
 
 
 _RETAINED_CONTEXT_USER_UNSET = object()
-
-
-def _abort_launched_stream(
-    s,
-    stream_id: str,
-    *,
-    gateway_starting: bool = False,
-    goal_related: bool = False,
-    reset_session: bool = False,
-    lock_held: bool = False,
-    preserve_wakeup: bool = False,
-) -> None:
-    """Unwind every registry a half-launched stream touched (#6869 re-gate).
-
-    A stream that never produced a live worker is indistinguishable from a live
-    one to every consumer that reads the per-session registries: ``STREAMS`` still
-    holds its channel, ``STREAM_SESSION_OWNERS`` still maps its id, and
-    ``SESSION_WRITEBACK_OWNERS`` still names it the session's writeback owner.
-    The dead channel makes every later send for that session return 409, so the
-    session is bricked until the process restarts.
-
-    Call this once from every launch-failure branch (thread construction or
-    ``start()`` failure, and any preparation exception raised after the
-    registrations). It never raises: an abort path must not replace the original
-    failure with a cleanup failure.
-
-    ``reset_session`` also clears the persisted ``active_stream_id``/``pending_*``
-    fields — but only while they still name this stream, and only under the
-    per-session lock, so a successor that was admitted meanwhile is never
-    clobbered.
-
-    ``lock_held`` is the BRICK-deadlock escape hatch (#7680 re-gate, 9/22): when
-    the caller already holds the per-session lock (e.g. the abort triggered
-    from inside ``_prepare_chat_start_session_for_stream`` while the chat-start
-    loop is still inside the ``with session_lock`` block), re-acquiring the same plain
-    ``threading.Lock`` would self-deadlock. In that case the reset runs without
-    the ``with`` — the caller-held lock is already the correct serialization
-    point, and a successor cannot have been admitted because the caller has not
-    released it yet. Every other call site leaves ``lock_held`` at its
-    ``False`` default and the original acquire is unchanged.
-
-    ``preserve_wakeup`` (#7680 re-gate, 9/22, finding 2) re-arms the
-    process-wakeup drain for this session if the abort happens between the
-    marker being consumed and the worker actually starting. Without this, a
-    background wakeup that failed on worker construction leaves
-    ``PENDING_BG_TASK_COMPLETIONS`` empty, ``pending_user_message`` cleared,
-    and an unresolved ``submitted`` journal event, so the background result is
-    lost with no retry.
-    """
-    sid = str(getattr(s, "session_id", "") or "").strip()
-    stream_id = str(stream_id or "").strip()
-    # Capture before any reset; the wakeup-rearm helper uses this to decide
-    # whether to re-mark the process-wakeup drain. See ``preserve_wakeup``.
-    pending_user_message = getattr(s, "pending_user_message", None)
-    if goal_related:
-        try:
-            STREAM_GOAL_RELATED.pop(stream_id, None)
-        except Exception:
-            logger.debug("Failed to drop goal marker for stream %s", stream_id, exc_info=True)
-    try:
-        with STREAMS_LOCK:
-            STREAMS.pop(stream_id, None)
-    except Exception:
-        logger.debug("Failed to drop stream channel for stream %s", stream_id, exc_info=True)
-    try:
-        unregister_stream_owner(stream_id)
-    except Exception:
-        logger.debug("Failed to drop stream owner for stream %s", stream_id, exc_info=True)
-    try:
-        clear_session_writeback_owner_if_owned(sid, stream_id)
-    except Exception:
-        logger.debug("Failed to clear writeback owner for stream %s", stream_id, exc_info=True)
-    if gateway_starting:
-        try:
-            from api.gateway_chat import (
-                _clear_gateway_run_starting,
-                _finish_gateway_run_starting,
-            )
-
-            _finish_gateway_run_starting(stream_id)
-            _clear_gateway_run_starting(stream_id)
-        except Exception:
-            logger.debug(
-                "Failed to clear compensated gateway start %s",
-                stream_id,
-                exc_info=True,
-            )
-    if not reset_session or not sid or not stream_id:
-        if preserve_wakeup and sid:
-            _rearm_process_wakeup_after_launch_failure(
-                s, sid, stream_id, pending_user_message=pending_user_message,
-            )
-        return
-    # ``lock_held`` branch: skip the ``with`` because the caller already holds
-    # the same plain ``threading.Lock``. See the docstring above.
-    if lock_held:
-        try:
-            if getattr(s, "active_stream_id", None) != stream_id:
-                # A successor already claimed this session; leave its state alone.
-                if preserve_wakeup and sid:
-                    _rearm_process_wakeup_after_launch_failure(
-                        s, sid, stream_id, pending_user_message=pending_user_message,
-                    )
-                return
-            s.active_stream_id = None
-            if hasattr(s, "pending_user_message"):
-                s.pending_user_message = None
-            if hasattr(s, "pending_attachments"):
-                s.pending_attachments = []
-            if hasattr(s, "pending_started_at"):
-                s.pending_started_at = None
-            if hasattr(s, "pending_user_source"):
-                s.pending_user_source = None
-            try:
-                s.save(touch_updated_at=False)
-            except Exception:
-                logger.warning(
-                    "Failed to persist compensated launch-abort for session %s",
-                    sid,
-                    exc_info=True,
-                )
-        except Exception:
-            logger.warning(
-                "Failed to reset session state after launch abort for session %s",
-                sid,
-                exc_info=True,
-            )
-        if preserve_wakeup and sid:
-            _rearm_process_wakeup_after_launch_failure(
-                s, sid, stream_id, pending_user_message=pending_user_message,
-            )
-        return
-    try:
-        with _get_session_agent_lock(sid):
-            if getattr(s, "active_stream_id", None) != stream_id:
-                # A successor already claimed this session; leave its state alone.
-                if preserve_wakeup and sid:
-                    _rearm_process_wakeup_after_launch_failure(
-                        s, sid, stream_id, pending_user_message=pending_user_message,
-                    )
-                return
-            s.active_stream_id = None
-            if hasattr(s, "pending_user_message"):
-                s.pending_user_message = None
-            if hasattr(s, "pending_attachments"):
-                s.pending_attachments = []
-            if hasattr(s, "pending_started_at"):
-                s.pending_started_at = None
-            if hasattr(s, "pending_user_source"):
-                s.pending_user_source = None
-            try:
-                s.save(touch_updated_at=False)
-            except Exception:
-                logger.warning(
-                    "Failed to persist compensated launch-abort for session %s",
-                    sid,
-                    exc_info=True,
-                )
-    except Exception:
-        logger.warning(
-            "Failed to reset session state after launch abort for session %s",
-            sid,
-            exc_info=True,
-        )
-    if preserve_wakeup and sid:
-        _rearm_process_wakeup_after_launch_failure(
-            s, sid, stream_id, pending_user_message=pending_user_message,
-        )
 
 
 def _rearm_process_wakeup_after_launch_failure(
@@ -23702,7 +23534,7 @@ def _prepare_chat_start_session_for_stream(
         # background drain consumed ``PENDING_BG_TASK_COMPLETIONS`` upstream);
         # re-arm the marker so the failed wakeup is delivered on the next drain
         # instead of being lost with no retry.
-        _abort_launched_stream(
+        _cleanup_chat_start_launch_failure(
             s,
             stream_id,
             reset_session=True,
@@ -23712,38 +23544,166 @@ def _prepare_chat_start_session_for_stream(
         raise
 
 
-def _cleanup_chat_start_launch_failure(session, stream_id: str) -> None:
-    """Release state registered before a worker thread successfully starts."""
-    clear_session_writeback_owner_if_owned(session.session_id, stream_id)
-    unregister_stream_owner(stream_id)
-    with STREAMS_LOCK:
-        STREAMS.pop(stream_id, None)
-    STREAM_GOAL_RELATED.pop(stream_id, None)
-    # The session-field reset needs the same concurrency discipline as the
-    # registry half: hold the per-session lock and re-resolve the canonical
-    # session before clearing anything. Mutating the passed-in stale object
-    # could wipe a concurrent successor turn's pending fields, and saving it
-    # could resurrect a session deleted while the launch was failing. Same
-    # pattern as the #1533 race fix (routes.py:3077) and the anchor-scene
-    # write guard (routes.py:5140).
-    #
-    # This runs while the original launch failure is being handled, so it must
-    # never raise. Lock acquisition and session resolution can fail on their own
-    # (I/O, deserialization), and an escaping error here would mask the launch
-    # failure the caller is about to report while leaving the reset half done.
+def _cleanup_chat_start_launch_failure(
+    session,
+    stream_id: str,
+    *,
+    gateway_starting: bool = False,
+    goal_related: bool = False,
+    reset_session: bool = True,
+    lock_held: bool = False,
+    preserve_wakeup: bool = False,
+) -> None:
+    """Unwind every registry a half-launched stream touched (#6869, #7680).
+
+    A stream that never produced a live worker is indistinguishable from a live
+    one to every consumer that reads the per-session registries: ``STREAMS``
+    still holds its channel, ``STREAM_SESSION_OWNERS`` still maps its id, and
+    ``SESSION_WRITEBACK_OWNERS`` still names it the session's writeback owner.
+    The dead channel makes every later send for that session return 409, so the
+    session is bricked until the process restarts.
+
+    This is the **single** launch-failure cleanup: call it once from every
+    launch-failure branch (thread construction or ``start()`` failure, and any
+    preparation exception raised after the registrations). It never raises: an
+    abort path must not replace the original failure with a cleanup failure.
+
+    The registry half is unconditional: drop the goal marker (``goal_related``),
+    the stream channel, the stream owner and the writeback owner, and the
+    gateway run-started marker (``gateway_starting``).
+
+    ``reset_session`` (default True) also clears the persisted
+    ``active_stream_id``/``pending_*`` fields. The reset always runs against
+    the **canonical** session re-resolved via ``get_session(sid)`` — never the
+    passed-in object — and only while it still names this stream
+    (compare-and-clear), so a successor that was admitted meanwhile is never
+    clobbered and a session deleted mid-launch is never resurrected (#1533 /
+    #6937 discipline). Throws like ``KeyError`` (deleted), ``OSError``
+    (unreadable store) are contained; the registry half already ran.
+
+    ``lock_held`` is the #7680 BRICK-deadlock escape hatch. The per-session
+    lock is a plain ``threading.Lock`` (not re-entrant), and the callers that
+    trigger an abort from inside ``_prepare_chat_start_session_for_stream`` /
+    the caller-held session-lock block in ``_start_chat_stream_for_session``
+    already hold that same lock. Re-acquiring it from the same thread would
+    deadlock the request and brick the session in exactly the symptom class
+    this helper exists to prevent. With ``lock_held=True`` the compare-and-clear
+    runs inline (the caller's lock is the serialization point; no successor can
+    be admitted while it is held). Every call site that does *not* hold the
+    lock leaves ``lock_held=False`` and the helper takes it normally.
+
+    ``reset_session=False`` (the regeneration cleanup path) unwinds the
+    registries only — the caller's compensation owns the persisted fields.
+
+    ``preserve_wakeup`` (#7680 finding 2) re-arms the process-wakeup drain when
+    the abort fires between the marker being consumed upstream and the worker
+    actually starting, so the failed wakeup is retried instead of lost.
+    """
+    sid = str(getattr(session, "session_id", "") or "").strip()
+    stream_id = str(stream_id or "").strip()
+    # Capture before any reset; the wakeup-rearm helper uses this to decide
+    # whether a wakeup prompt existed. See ``preserve_wakeup``.
+    pending_user_message = getattr(session, "pending_user_message", None)
+
+    if goal_related:
+        try:
+            STREAM_GOAL_RELATED.pop(stream_id, None)
+        except Exception:
+            logger.debug("Failed to drop goal marker for stream %s", stream_id, exc_info=True)
     try:
-        with _get_session_agent_lock(session.session_id):
+        with STREAMS_LOCK:
+            STREAMS.pop(stream_id, None)
+    except Exception:
+        logger.debug("Failed to drop stream channel for stream %s", stream_id, exc_info=True)
+    try:
+        unregister_stream_owner(stream_id)
+    except Exception:
+        logger.debug("Failed to drop stream owner for stream %s", stream_id, exc_info=True)
+    try:
+        clear_session_writeback_owner_if_owned(sid, stream_id)
+    except Exception:
+        logger.debug("Failed to clear writeback owner for stream %s", stream_id, exc_info=True)
+    if gateway_starting:
+        try:
+            from api.gateway_chat import (
+                _clear_gateway_run_starting,
+                _finish_gateway_run_starting,
+            )
+
+            _finish_gateway_run_starting(stream_id)
+            _clear_gateway_run_starting(stream_id)
+        except Exception:
+            logger.debug(
+                "Failed to clear compensated gateway start %s",
+                stream_id,
+                exc_info=True,
+            )
+
+    if not reset_session or not sid or not stream_id:
+        if preserve_wakeup and sid:
+            _rearm_process_wakeup_after_launch_failure(
+                session, sid, stream_id, pending_user_message=pending_user_message,
+            )
+        return
+
+    if lock_held:
+        # Caller already holds the per-session plain threading.Lock; re-entering
+        # it would self-deadlock. The caller-held lock is the serialization
+        # point, so the compare-and-clear runs inline, still on the canonical
+        # session (a stale passed-in object can outlive the launch).
+        try:
             try:
-                canonical = get_session(session.session_id)
+                canonical = get_session(sid)
             except KeyError:
-                return  # session deleted while the thread launch was failing
+                return  # session deleted while the launch was failing
             if getattr(canonical, "active_stream_id", None) != stream_id:
                 return  # a successor turn already owns the session
             canonical.active_stream_id = None
-            canonical.pending_user_message = None
-            canonical.pending_attachments = []
-            canonical.pending_started_at = None
-            canonical.pending_user_source = None
+            if hasattr(canonical, "pending_user_message"):
+                canonical.pending_user_message = None
+            if hasattr(canonical, "pending_attachments"):
+                canonical.pending_attachments = []
+            if hasattr(canonical, "pending_started_at"):
+                canonical.pending_started_at = None
+            if hasattr(canonical, "pending_user_source"):
+                canonical.pending_user_source = None
+            try:
+                canonical.save()
+            except Exception:
+                logger.warning(
+                    "Failed to persist compensated launch-abort for session %s",
+                    sid,
+                    exc_info=True,
+                )
+        except Exception:
+            logger.warning(
+                "Failed to reset session state after launch abort for session %s",
+                sid,
+                exc_info=True,
+            )
+        if preserve_wakeup and sid:
+            _rearm_process_wakeup_after_launch_failure(
+                session, sid, stream_id, pending_user_message=pending_user_message,
+            )
+        return
+
+    try:
+        with _get_session_agent_lock(sid):
+            try:
+                canonical = get_session(sid)
+            except KeyError:
+                return  # session deleted while the launch was failing
+            if getattr(canonical, "active_stream_id", None) != stream_id:
+                return  # a successor turn already owns the session
+            canonical.active_stream_id = None
+            if hasattr(canonical, "pending_user_message"):
+                canonical.pending_user_message = None
+            if hasattr(canonical, "pending_attachments"):
+                canonical.pending_attachments = []
+            if hasattr(canonical, "pending_started_at"):
+                canonical.pending_started_at = None
+            if hasattr(canonical, "pending_user_source"):
+                canonical.pending_user_source = None
             try:
                 canonical.save()
             except Exception:
@@ -23757,6 +23717,10 @@ def _cleanup_chat_start_launch_failure(session, stream_id: str) -> None:
             "Failed to reset session state after worker launch failure for %s",
             stream_id,
             exc_info=True,
+        )
+    if preserve_wakeup and sid:
+        _rearm_process_wakeup_after_launch_failure(
+            session, sid, stream_id, pending_user_message=pending_user_message,
         )
 
 
@@ -23885,11 +23849,12 @@ def _start_regeneration_stream_locked(
         # fields — the caller's compensation (restore_regeneration_state /
         # interrupted-journal bookkeeping) owns that, and it must survive a
         # partially-accepted regeneration.
-        _abort_launched_stream(
+        _cleanup_chat_start_launch_failure(
             s,
             stream_id,
             gateway_starting=gateway_starting,
             goal_related=goal_related,
+            reset_session=False,
         )
 
     try:
@@ -24333,7 +24298,7 @@ def _start_chat_stream_for_session(
         )
         thr.start()
     except Exception:
-        _abort_launched_stream(
+        _cleanup_chat_start_launch_failure(
             s,
             stream_id,
             gateway_starting=backend_is_gateway,
