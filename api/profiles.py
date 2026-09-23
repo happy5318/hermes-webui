@@ -1190,11 +1190,27 @@ def profile_env_for_background_worker(
         # (which routes through ``_profile_env_for_home`` with the root home).
         yield
         return
+    try:
+        profile_home = get_hermes_home_for_profile(profile)
+    except Exception:
+        # Mirrors the fail-open contract of the shared helper below: an
+        # unresolvable profile home logs a diagnosable line and degrades to
+        # the current env instead of breaking the worker (pre-existing
+        # contract pinned by the title-routing regression test).
+        logger.debug(
+            "Failed to resolve profile env for %s profile %s; falling back to current env",
+            purpose,
+            profile,
+            exc_info=True,
+        )
+        yield
+        return
     with _profile_env_for_home(
-        get_hermes_home_for_profile(profile),
+        profile_home,
         purpose,
         logger_override=logger_override,
         scope_skill_modules=scope_skill_modules,
+        profile_label=profile,
     ):
         yield
 
@@ -1206,6 +1222,7 @@ def _profile_env_for_home(
     logger_override: Optional[logging.Logger] = None,
     *,
     scope_skill_modules: bool = True,
+    profile_label: Optional[str] = None,
 ):
     """Route detached worker config reads through an EXPLICIT profile home.
 
@@ -1228,12 +1245,24 @@ def _profile_env_for_home(
         safe_runtime_env = filter_runtime_env_for_gateway_parity(runtime_env)
         secret_env_names = _profile_secret_env_names(profile_home_path)
     except Exception:
-        log.debug(
-            "Failed to resolve profile env for %s home %s; falling back to current env",
-            purpose,
-            profile_home,
-            exc_info=True,
-        )
+        # The label (profile name) is kept in the message when the caller
+        # supplied one: the fail-open path is a diagnostic surface and tests /
+        # operators key off the readable profile name, not a home path.
+        if profile_label:
+            # Historical contract: "... for <purpose> profile <name>".
+            log.debug(
+                "Failed to resolve profile env for %s profile %s; falling back to current env",
+                purpose,
+                profile_label,
+                exc_info=True,
+            )
+        else:
+            log.debug(
+                "Failed to resolve profile env for %s home %s; falling back to current env",
+                purpose,
+                profile_home,
+                exc_info=True,
+            )
         yield
         return
 
@@ -1593,7 +1622,9 @@ def profile_scope_for_root_detached_worker(
         home = Path(_INITIAL_HERMES_HOME).expanduser()
     else:
         home = _DEFAULT_HERMES_HOME
-    with _profile_env_for_home(home, purpose, logger_override=logger_override):
+    with _profile_env_for_home(
+        home, purpose, logger_override=logger_override, profile_label="root (default)"
+    ):
         set_request_profile("default")
         try:
             yield
