@@ -10199,6 +10199,7 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
         _active_profile_name = ""
         _prof_env_request = None
         _prof_scope_worker = None
+        _worker_bind_root = False
         try:
             from api.profiles import (
                 get_active_profile_name as _gapn,
@@ -10206,6 +10207,13 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                 profile_scope_for_detached_worker as _prof_scope_worker,
             )
             _active_profile_name = (_gapn() or "").strip()
+            # A root/default request while the process-level active profile is
+            # NAMED needs the root profile bound explicitly: the detached-worker
+            # scope no-ops for 'default' alone, so the worker would inherit the
+            # named process profile and publish to the wrong cache file (#7724).
+            _worker_bind_root = _is_root_profile_key(_active_profile_name) and (
+                _is_root_active_profile()
+            )
         except Exception:
             _prof_env_request = None
             _prof_scope_worker = None
@@ -10315,9 +10323,16 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
             # (#3957): the daemon inherits neither the request-profile TLS nor
             # os.environ, so without this it would probe the default profile's
             # credentials and, over budget, publish the rebuilt catalog to the
-            # DEFAULT profile's disk cache. No-op for the default profile.
+            # DEFAULT profile's disk cache. For a default/root request under a
+            # NAMED process profile, ``bind_root=True`` additionally pins the
+            # root profile explicitly so the worker cannot inherit the named
+            # profile's home, credentials and cache file (#7724).
             _worker_scope = (
-                _prof_scope_worker(_active_profile_name, "models rebuild (worker)")
+                _prof_scope_worker(
+                    _active_profile_name,
+                    "models rebuild (worker)",
+                    bind_root=_worker_bind_root,
+                )
                 if _prof_scope_worker is not None
                 else _nullcontext()
             )
@@ -10589,6 +10604,45 @@ def _session_visit_active_profile_name() -> str:
         return ""
 
 
+def _is_root_profile_key(profile_key: str) -> bool:
+    """True when *profile_key* denotes the root/default profile.
+
+    Same predicate the detached-worker scope uses to take its no-op branch: an
+    empty key (profiles module unavailable / root resolution) or any name
+    ``_is_root_profile()`` accepts — the legacy ``default`` alias plus a renamed
+    root.
+    """
+    key = str(profile_key or "").strip()
+    if not key:
+        return True
+    try:
+        from api.profiles import _is_root_profile
+
+        return bool(_is_root_profile(key))
+    except Exception:
+        return key == "default"
+
+
+def _is_root_active_profile() -> bool:
+    """True when the PROCESS-LEVEL active profile is a NAMED (non-root) one.
+
+    Reads the process-global ``api.profiles._active_profile`` directly, NOT
+    ``get_active_profile_name()``: the calling thread is a request thread whose
+    TLS legitimately holds the request profile (``default``), so the global is
+    the only source that answers "what would a detached worker thread that finds
+    no request TLS inherit?". The background rebuild workers use it to decide
+    whether a root/default request needs the root profile bound explicitly on the
+    worker (#7724).
+    """
+    try:
+        import api.profiles as _profiles
+
+        process_profile = str(getattr(_profiles, "_active_profile", "default") or "").strip()
+        return bool(process_profile) and not _is_root_profile_key(process_profile)
+    except Exception:
+        return False
+
+
 def _maybe_start_session_visit_background_rebuild() -> None:
     """Fire-and-forget coalesced per-profile rebuild for stale session visits.
 
@@ -10603,10 +10657,16 @@ def _maybe_start_session_visit_background_rebuild() -> None:
     ``profile_scope_for_detached_worker`` (the same helper the existing
     bounded-rebuild worker uses, #3957) so a named profile's live probe and
     disk write land on that profile's auth/config/catalog, never the default.
-    No-op for the default / root profile (``profile_scope_for_detached_worker``
-    is a no-op there).
+    No-op for the default / root profile in the single-profile case
+    (``profile_scope_for_detached_worker`` is a no-op there); under a NAMED
+    process profile the root profile is bound explicitly instead, so the worker
+    cannot inherit the named profile's home, credentials and cache file (#7724).
     """
     profile_key = _session_visit_active_profile_name()
+    # Root/default key: the worker must bind the root profile explicitly when the
+    # PROCESS-level active profile is a named one (the no-op branch of
+    # profile_scope_for_detached_worker would otherwise leak it in).
+    _bind_root = _is_root_profile_key(profile_key) and _is_root_active_profile()
     with _session_visit_rebuild_lock:
         existing = _session_visit_rebuild_threads.get(profile_key)
         if existing is not None and existing.is_alive():
@@ -10616,11 +10676,15 @@ def _maybe_start_session_visit_background_rebuild() -> None:
         def _worker() -> None:
             # Rebind the per-request profile on the worker thread so the
             # live provider probe + ``_save_models_cache_to_disk`` write the
-            # right profile's auth/config/cache file (#3957).
+            # right profile's auth/config/cache file (#3957), and pin the root
+            # profile explicitly for a root request under a named process profile
+            # (#7724).
             try:
                 from api.profiles import profile_scope_for_detached_worker
                 _scope = profile_scope_for_detached_worker(
-                    profile_key, "models session_visit background rebuild"
+                    profile_key,
+                    "models session_visit background rebuild",
+                    bind_root=_bind_root,
                 )
             except Exception:
                 from contextlib import nullcontext as _nullcontext

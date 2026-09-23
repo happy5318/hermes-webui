@@ -1178,27 +1178,60 @@ def profile_env_for_background_worker(
     session/request profile env or they can fall back to the server-default
     profile. Pass either a session-like object with `.profile` or a profile name.
     """
-    log = logger_override or logger
     raw_profile = session if isinstance(session, str) else getattr(session, "profile", "")
     profile = str(raw_profile or "").strip()
     if not profile or profile == "default":
+        # No-op for the default/root profile: on a REQUEST thread the ambient
+        # state already IS the root profile, and on a plain worker thread the
+        # historical assumption was "the process defaults to root anyway".
+        # That assumption is wrong whenever the process-level active profile is
+        # a NAMED one, so detached workers that must pin the root profile use
+        # ``profile_scope_for_detached_worker(..., bind_root=True)`` instead
+        # (which routes through ``_profile_env_for_home`` with the root home).
         yield
         return
+    with _profile_env_for_home(
+        get_hermes_home_for_profile(profile),
+        purpose,
+        logger_override=logger_override,
+        scope_skill_modules=scope_skill_modules,
+    ):
+        yield
 
+
+@contextmanager
+def _profile_env_for_home(
+    profile_home,
+    purpose: str = "background worker",
+    logger_override: Optional[logging.Logger] = None,
+    *,
+    scope_skill_modules: bool = True,
+):
+    """Route detached worker config reads through an EXPLICIT profile home.
+
+    Shared body of ``profile_env_for_background_worker``, parameterized by a
+    resolved HERMES_HOME directory (a named profile's dir, or the root
+    ``~/.hermes``) instead of a profile name. Applying the env is what lets a
+    detached worker bind the ROOT profile while the process-level active profile
+    is a NAMED one: ``profile_env_for_background_worker("default")`` no-ops, so
+    without this the worker silently inherits the named process profile's home,
+    credentials and profile-keyed cache file (#7724).
+    """
+    log = logger_override or logger
     try:
         # Lazy imports avoid a module-load cycle: streaming imports this helper.
         from api.config import _clear_thread_env, _set_thread_env, _thread_ctx
         from api.streaming import _ENV_LOCK
 
-        profile_home_path = Path(get_hermes_home_for_profile(profile))
+        profile_home_path = Path(profile_home).expanduser()
         runtime_env = get_profile_runtime_env(profile_home_path)
         safe_runtime_env = filter_runtime_env_for_gateway_parity(runtime_env)
         secret_env_names = _profile_secret_env_names(profile_home_path)
     except Exception:
         log.debug(
-            "Failed to resolve profile env for %s profile %s; falling back to current env",
+            "Failed to resolve profile env for %s home %s; falling back to current env",
             purpose,
-            profile,
+            profile_home,
             exc_info=True,
         )
         yield
@@ -1268,7 +1301,7 @@ def profile_env_for_background_worker(
                 except Exception:
                     logger.debug(
                         "Failed to evaluate profile-home skill module capability for %s in %s",
-                        profile,
+                        profile_home_path,
                         purpose,
                         exc_info=True,
                     )
@@ -1471,6 +1504,8 @@ def profile_scope_for_detached_worker(
     profile_name,
     purpose: str = "detached worker",
     logger_override: Optional[logging.Logger] = None,
+    *,
+    bind_root: bool = False,
 ):
     """Bind BOTH the per-request profile TLS and the profile env on a NEW thread (#3957).
 
@@ -1497,7 +1532,19 @@ def profile_scope_for_detached_worker(
     """
     name = (profile_name or "").strip()
     if not name or _is_root_profile(name):
-        yield
+        if not bind_root:
+            yield
+            return
+        # #7724: the request is for the default/root profile, but the
+        # PROCESS-level active profile may be a named one. A detached worker
+        # thread inherits neither the request TLS nor a root env binding, so
+        # without this it resolves the named process profile and writes THAT
+        # profile's cache file. Bind the root profile explicitly (TLS + base
+        # home + env) so the rebuild lands on the root profile's file.
+        with profile_scope_for_root_detached_worker(
+            purpose, logger_override=logger_override
+        ):
+            yield
         return
     set_request_profile(name)
     try:
@@ -1507,6 +1554,51 @@ def profile_scope_for_detached_worker(
             yield
     finally:
         clear_request_profile()
+
+
+@contextmanager
+def profile_scope_for_root_detached_worker(
+    purpose: str = "detached worker (root profile)",
+    logger_override: Optional[logging.Logger] = None,
+):
+    """Explicitly bind the ROOT (~/.hermes) profile on a detached worker (#7724).
+
+    ``profile_scope_for_detached_worker`` used to treat the root/default profile
+    as a no-op, on the assumption that "the process defaults to the root profile
+    anyway". That assumption fails as soon as the process-level active profile is
+    a NAMED one: a per-client (cookie) request for ``default`` while the server
+    runs on ``work``. The detached worker thread then inherits the named process
+    profile — its HERMES_HOME, its credentials, and its profile-keyed cache file —
+    instead of the root profile the request asked for, so a root-profile rebuild
+    writes ``models_cache.<named>.json`` and the root catalog never revalidates.
+
+    This scope pins all three layers to the root profile:
+
+      * TLS — ``get_active_profile_name()`` resolves the root alias, so the
+        profile-keyed path helpers (``_get_models_cache_path`` /
+        ``_get_config_path`` / ``_get_auth_store_path`` /
+        ``_models_cache_source_fingerprint``) resolve the ROOT files;
+      * env — the root home's runtime env is applied to both the thread-local
+        channel and the process-env mirror, and the credential env vars the root
+        profile does not define are scrubbed, so the probe can never pair the
+        root config with the named process profile's API keys;
+      * both are restored on exit, so the worker leaves no trace behind on the
+        thread or the process.
+
+    In isolated-profile mode the bound home is clamped to the pinned startup
+    home (``_INITIAL_HERMES_HOME``) rather than the base dir, mirroring
+    ``get_active_hermes_home()``.
+    """
+    if _is_isolated_profile_mode():
+        home = Path(_INITIAL_HERMES_HOME).expanduser()
+    else:
+        home = _DEFAULT_HERMES_HOME
+    with _profile_env_for_home(home, purpose, logger_override=logger_override):
+        set_request_profile("default")
+        try:
+            yield
+        finally:
+            clear_request_profile()
 
 
 def _set_hermes_home(home: Path):
