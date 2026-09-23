@@ -23394,7 +23394,7 @@ def _abort_launched_stream(
     ``lock_held`` is the BRICK-deadlock escape hatch (#7680 re-gate, 9/22): when
     the caller already holds the per-session lock (e.g. the abort triggered
     from inside ``_prepare_chat_start_session_for_stream`` while the chat-start
-    loop is still inside ``with session_lock:``), re-acquiring the same plain
+    loop is still inside the ``with session_lock`` block), re-acquiring the same plain
     ``threading.Lock`` would self-deadlock. In that case the reset runs without
     the ``with`` — the caller-held lock is already the correct serialization
     point, and a successor cannot have been admitted because the caller has not
