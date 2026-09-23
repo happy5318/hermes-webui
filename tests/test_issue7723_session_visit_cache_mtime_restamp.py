@@ -231,7 +231,6 @@ def test_dual_profile_alternation_triggers_per_profile_rebuild(tmp_path, monkeyp
     # beyond the foreground returning something shape-valid.
     disk_catalog = _catalog("disk")
     rebuilt_catalog_a = _catalog("rebuilt-a")
-    rebuilt_catalog_b = _catalog("rebuilt-b")
 
     simulated_now = [planted_mtime + 100.0]
     # Track which profile the foreground was last requesting.
