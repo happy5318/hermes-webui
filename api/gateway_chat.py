@@ -318,6 +318,28 @@ def _gateway_api_key(environ: dict[str, str] | None = None) -> str:
     ).strip()
 
 
+def _gateway_session_owner_cfg(session) -> dict:
+    """Resolve the config snapshot of the profile that owns ``session``.
+
+    Called at /api/chat/start dispatch time (routes.py), on the request
+    thread, and handed into the detached gateway worker as ``session_cfg``.
+    The worker runs on its own thread that does NOT inherit the per-request
+    thread-local profile context, so a ``get_config()`` inside the worker
+    would read the process-global profile (usually ``default``) instead of
+    the profile owning this session — on a multi-profile instance that lets
+    one profile's per-model ``agent.reasoning_overrides`` (and capability
+    coercion) leak into another profile's request (issue #7170). Resolving
+    the session's own profile home at dispatch (issue #3294 pattern) gives
+    the worker the same snapshot the in-process path uses.
+    """
+    from api.config import get_config_for_profile_home  # imported lazily to avoid config-cycle churn
+    from api.models import _get_profile_home
+
+    return get_config_for_profile_home(
+        _get_profile_home(getattr(session, "profile", None))
+    )
+
+
 def _gateway_use_runs_api_enabled(config_data=None, environ: dict[str, str] | None = None) -> bool:
     """Return True only when the operator has explicitly opted into the runs API path."""
     source = os.environ if environ is None else environ
@@ -1169,6 +1191,7 @@ def _run_gateway_chat_streaming(
     regeneration=False,
     reattach_run=None,
     reattach_endpoint=None,
+    session_cfg=None,
 ):
     """Bridge a WebUI chat turn through Hermes Gateway's API server.
 
@@ -1177,6 +1200,16 @@ def _run_gateway_chat_streaming(
     event names. The worker translates OpenAI-compatible streaming chunks from
     the configured Gateway API server into those local events and persists the
     final user/assistant turn back into the WebUI session.
+
+    ``session_cfg`` is the config snapshot the /api/chat/start dispatch already
+    resolved for the session-owning profile. The worker runs on a detached
+    thread that does NOT inherit the per-request thread-local profile context,
+    so an ambient ``get_config()`` here would read the process-global profile,
+    not the session owner's — letting one profile's per-model
+    ``agent.reasoning_overrides`` (and capability coercion) leak into another
+    profile's request. The dispatch passes the owner config in instead; the
+    worker only falls back to resolving the session's own profile home for
+    legacy direct callers that did not capture a snapshot.
     """
     q = peek_stream(stream_id)
     if q is None:
@@ -1247,21 +1280,23 @@ def _run_gateway_chat_streaming(
     usage = {"input_tokens": 0, "output_tokens": 0, "estimated_cost": 0}
     try:
         s = get_session(session_id)
-        from api.config import get_config_for_profile_home  # imported lazily to avoid config-cycle churn
-        from api.models import _get_profile_home
-
-        # The gateway worker runs on a detached thread that does NOT inherit
-        # the per-request thread-local profile context, so the ambient
-        # ``get_config()`` would resolve through the process-global profile
-        # (usually ``default``) instead of the profile that owns this session.
-        # On a multi-profile instance that lets one profile's
-        # ``agent.reasoning_overrides`` (and model-capability coercion) leak
-        # into another profile's request. Resolve this session's own profile
-        # home instead — the same snapshot ``/api/chat/start`` dispatches with
-        # (issue #3294 pattern, gateway path).
-        cfg = get_config_for_profile_home(
-            _get_profile_home(getattr(s, "profile", None))
-        )
+        # Issue #7170: the detached worker thread does NOT inherit the
+        # per-request thread-local profile context. The /api/chat/start
+        # dispatch captured the session-owning profile's config snapshot and
+        # passed it in as ``session_cfg`` — use that for the override
+        # selection, capability coercion, request overrides, runs-API gate,
+        # and prefill context below. Resolving config here would read the
+        # ambient (process-active) profile, which on a multi-profile instance
+        # lets one profile's ``agent.reasoning_overrides`` leak into another
+        # profile's request. Only direct/legacy callers that did not capture
+        # a snapshot fall back to the session's own profile home (issue #3294
+        # pattern) — never the ambient process profile.
+        cfg = session_cfg
+        if cfg is None:
+            # Legacy/direct callers that spawned the worker without a dispatch
+            # snapshot: resolve the session's own profile home (issue #3294
+            # pattern) — never the ambient process profile.
+            cfg = _gateway_session_owner_cfg(s)
         reasoning_effort = _gateway_reasoning_effort_for_request(
             cfg,
             model=model,

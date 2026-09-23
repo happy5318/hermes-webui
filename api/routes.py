@@ -23577,6 +23577,11 @@ def _start_regeneration_stream_locked(
     }
     if backend_is_gateway:
         worker_kwargs["regeneration"] = True
+        # #7170: same dispatch-time session-profile config snapshot as the
+        # normal /api/chat/start path — the detached gateway worker must not
+        # resolve config on its own thread (ambient profile leak).
+        from api.gateway_chat import _gateway_session_owner_cfg
+        worker_kwargs["session_cfg"] = _gateway_session_owner_cfg(s)
     if moa_config and not backend_is_gateway:
         worker_kwargs["moa_config"] = moa_config
 
@@ -24041,6 +24046,14 @@ def _start_chat_stream_for_session(
     if backend_is_gateway:
         from api.gateway_chat import _mark_gateway_run_starting
         _mark_gateway_run_starting(stream_id)
+        # #7170: capture the session-owning profile's config snapshot at
+        # dispatch time (the request thread) and hand it to the detached
+        # gateway worker, which uses it for per-model reasoning override
+        # selection and model-capability coercion. The worker cannot resolve
+        # config itself — a detached thread has no per-request profile context
+        # and would read the process-global profile instead.
+        from api.gateway_chat import _gateway_session_owner_cfg
+        worker_kwargs["session_cfg"] = _gateway_session_owner_cfg(s)
     thr = threading.Thread(
         target=worker_target,
         args=(s.session_id, msg, model, workspace, stream_id, attachments),
