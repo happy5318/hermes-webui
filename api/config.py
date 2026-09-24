@@ -10198,43 +10198,53 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
 
         _active_profile_name = ""
         _prof_scope_worker = None
+        _prof_scope_request = None
         _worker_bind_root = False
         try:
             from api.profiles import (
                 get_active_profile_name as _gapn,
+                profile_scope_for_active_request as _prof_scope_request,
                 profile_scope_for_detached_worker as _prof_scope_worker,
             )
             _active_profile_name = (_gapn() or "").strip()
             # A root/default request while the process-level active profile is
-            # NAMED needs the root profile bound explicitly: the detached-worker
-            # scope no-ops for 'default' alone, so the worker would inherit the
-            # named process profile and publish to the wrong cache file (#7724).
+            # NAMED needs the root profile bound explicitly: the scopes no-op
+            # for 'default' alone, so the rebuild would inherit the named
+            # process profile and publish to the wrong cache file (#7724).
             _worker_bind_root = _is_root_profile_key(_active_profile_name) and (
                 _is_root_active_profile()
             )
         except Exception:
             _prof_scope_worker = None
+            _prof_scope_request = None
 
         # Legacy synchronous (unbounded) rebuild — opt-in via budget<=0.
         if _LIVE_REBUILD_BUDGET_SECONDS <= 0:
             try:
-                # Foreground thread already carries the request-profile TLS
-                # (set by the outer SWR worker's
-                # ``profile_tls_scope_for_detached_worker`` for SWR callers,
-                # or by the request handler for direct callers). Apply the
-                # profile env via the same scope the bounded rebuild worker
-                # uses, with ``bind_root=_worker_bind_root`` so a root
-                # request under a NAMED process profile still pins the
-                # root home + credentials (#7724). This is the
-                # synchronous-budget path's "explicit root/default
-                # binding" the maintainer asked to preserve (#7724 re-gate).
+                # This is a REQUEST thread (a direct /api/models caller, or the
+                # SWR worker's inner cold path where the outer worker already
+                # bound the captured request TLS). It therefore uses the
+                # REQUEST-thread scope — NOT the detached-worker one: this scope
+                # restores the ambient request-profile TLS on exit instead of
+                # CLEARING it, so the publication below (cache assignment +
+                # ``_sync_models_cache_provenance`` + ``_save_models_cache_to_disk``)
+                # still resolves the SAME profile that the rebuild just probed.
+                # Clearing it (the detached-worker contract) would drop the
+                # foreground request onto the process-level named profile
+                # mid-request and write the wrong profile's cache file (#7724).
+                #
+                # ``bind_root=_worker_bind_root`` keeps the explicit
+                # root/default binding a root request under a NAMED process
+                # profile needs. It is named ``_worker_bind_root`` because the
+                # same flag is reused verbatim by the bounded rebuild worker
+                # below.
                 _sync_scope = (
-                    _prof_scope_worker(
+                    _prof_scope_request(
                         _active_profile_name,
                         "models rebuild (sync)",
                         bind_root=_worker_bind_root,
                     )
-                    if _prof_scope_worker is not None
+                    if _prof_scope_request is not None
                     else _nullcontext()
                 )
                 with _sync_scope:
@@ -10667,8 +10677,12 @@ def _maybe_start_session_visit_background_rebuild() -> None:
     with profile B's provider credentials (#7724 re-gate). The env
     application is the bounded rebuild worker's job: it runs serialized
     by the cache-build lock inside the cold path, so at most one env
-    owner is in flight at any time. The synchronous-budget path keeps
-    its own explicit root/default binding.
+    owner is in flight at any time. The synchronous-budget path (budget <= 0)
+    runs on a REQUEST thread — this same worker's inner cold path, or a
+    direct /api/models caller — so it uses the request-thread scope
+    ``profile_scope_for_active_request``, which restores (never clears) the
+    ambient request TLS so its cache publication stays on the request's
+    profile.
 
     No-op for the default / root profile in the single-profile case
     (``profile_tls_scope_for_detached_worker`` is a no-op there); under a

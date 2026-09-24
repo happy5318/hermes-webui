@@ -1529,6 +1529,102 @@ def profile_env_for_active_request(
 
 
 @contextmanager
+def profile_scope_for_active_request(
+    profile_name,
+    purpose: str = "active request",
+    logger_override: Optional[logging.Logger] = None,
+    *,
+    bind_root: bool = False,
+):
+    """Bind a CAPTURED request profile's TLS + env ON THE CALLING thread.
+
+    The request-thread counterpart of ``profile_scope_for_detached_worker``.
+
+    Contract difference that matters (maintainer finding, #7724 re-gate): this
+    NEVER clears the request-profile TLS on exit. The calling thread is a
+    *request* thread — the TLS it entered with belongs to the request (or to an
+    outer detached-worker scope that installed it), and the request keeps using
+    it after the call returns. ``profile_scope_for_detached_worker`` deliberately
+    clears the TLS because a *dedicated worker* has no other use for it; reusing
+    that helper on the request thread wipes the foreground profile mid-request,
+    so every profile-resolving read after the scope exits — including the cache
+    publication that follows the rebuild — falls back to the process-level named
+    profile and writes the wrong profile's cache file.
+
+    Pass the profile name CAPTURED before entering (``get_active_profile_name()``
+    on the request thread, where the TLS is valid). Semantics of the branches:
+
+      - named profile → set the TLS, apply the profile env, restore BOTH on
+        exit (env restore is unchanged from the detached-worker scope;
+        ``os.environ`` is process-wide and MUST be unwound);
+      - root/default with ``bind_root=True`` (a root request while the
+        process-level active profile is a NAMED one) → set the root TLS and pin
+        the root home + env for the duration, then restore;
+      - root/default without ``bind_root`` → no-op: on a request thread the
+        ambient state already IS the root profile.
+
+    No-op fallbacks stay fail-open: an unresolvable profile home degrades to a
+    bare no-op instead of breaking the caller (pre-existing contract pinned by
+    the fail-open helper tests). Resolution happens BEFORE the yield, so an
+    exception raised by the caller's body still propagates untouched.
+    """
+    name = (profile_name or "").strip()
+    if not name or _is_root_profile(name):
+        if not bind_root:
+            # On a request thread the ambient state already IS the root profile.
+            yield
+            return
+        try:
+            env_home = _root_profile_home()
+        except Exception:
+            logger.debug(
+                "Failed to resolve root home for active request in %s; "
+                "continuing with ambient profile state",
+                purpose,
+                exc_info=True,
+            )
+            yield
+            return
+        bind_name = "default"
+    else:
+        try:
+            env_home = get_hermes_home_for_profile(name)
+        except Exception:
+            # Mirrors the fail-open contract of profile_env_for_background_worker:
+            # an unresolvable profile home degrades to the current env rather
+            # than breaking the caller.
+            logger.debug(
+                "Failed to resolve profile env for active request profile %s "
+                "in %s; falling back to current env",
+                name,
+                purpose,
+                exc_info=True,
+            )
+            yield
+            return
+        bind_name = name
+
+    # Enter the env scope OUTSIDE any try/except that swallows body errors:
+    # from here on, an exception from the caller's body must propagate through
+    # the inner context manager (which unwinds os.environ and the thread env)
+    # and the TLS-restoring finally below, unchanged.
+    previous_tls = getattr(_tls, "profile", None)
+    with _profile_env_for_home(
+        env_home,
+        purpose,
+        logger_override=logger_override,
+        profile_label=bind_name,
+    ):
+        set_request_profile(bind_name)
+        try:
+            yield
+        finally:
+            # RESTORE the ambient TLS — never clear it. This is the whole point
+            # of the request-thread scope; see the docstring.
+            _tls.profile = previous_tls
+
+
+@contextmanager
 def profile_scope_for_detached_worker(
     profile_name,
     purpose: str = "detached worker",
@@ -1607,8 +1703,11 @@ def profile_tls_scope_for_detached_worker(
     The env application is the bounded rebuild worker's job — see
     ``profile_scope_for_detached_worker`` inside the cold path, which
     runs serialized by the cache-build lock, so at most one env owner
-    is in flight at any time. The synchronous-budget path also keeps
-    its own explicit root/default binding.
+    is in flight at any time. The synchronous-budget path (budget <= 0)
+    runs on a REQUEST thread (this worker's inner cold path, or a
+    direct /api/models caller), so it applies its env through
+    ``profile_scope_for_active_request`` — the request-thread scope,
+    which restores the ambient request TLS instead of clearing it.
 
     For a default/root request with ``bind_root=True`` (a root request
     while the process-level active profile is a NAMED one), this sets
@@ -1636,6 +1735,19 @@ def profile_tls_scope_for_detached_worker(
         yield
     finally:
         clear_request_profile()
+
+
+def _root_profile_home() -> Path:
+    """Return the Hermes home a bound root/default profile resolves to.
+
+    Shared by the detached-worker and request-thread root scopes so the two
+    cannot drift: in isolated-profile mode the home is clamped to the pinned
+    startup home (``_INITIAL_HERMES_HOME``), mirroring
+    ``get_active_hermes_home()``; otherwise it is the base root home.
+    """
+    if _is_isolated_profile_mode():
+        return Path(_INITIAL_HERMES_HOME).expanduser()
+    return _DEFAULT_HERMES_HOME
 
 
 @contextmanager
@@ -1671,12 +1783,9 @@ def profile_scope_for_root_detached_worker(
     home (``_INITIAL_HERMES_HOME``) rather than the base dir, mirroring
     ``get_active_hermes_home()``.
     """
-    if _is_isolated_profile_mode():
-        home = Path(_INITIAL_HERMES_HOME).expanduser()
-    else:
-        home = _DEFAULT_HERMES_HOME
     with _profile_env_for_home(
-        home, purpose, logger_override=logger_override, profile_label="root (default)"
+        _root_profile_home(), purpose, logger_override=logger_override,
+        profile_label="root (default)"
     ):
         set_request_profile("default")
         try:
