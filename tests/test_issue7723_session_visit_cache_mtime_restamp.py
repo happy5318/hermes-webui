@@ -29,6 +29,8 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
+
 REPO = Path(__file__).resolve().parent.parent
 
 
@@ -874,3 +876,196 @@ def test_swr_two_profile_barrier_no_env_leak(tmp_path, monkeypatch):
     assert b_home == str(home_b), (
         f"profile B's probe must bind B's HERMES_HOME, got {b_home!r}"
     )
+
+
+# ── 9. Request-thread scope contract: never clear the ambient request profile
+#      (#7724 re-gate maintainer finding)
+
+
+def test_request_thread_scope_restores_ambient_request_profile(monkeypatch, tmp_path):
+    """``profile_scope_for_active_request`` must NOT clear the request TLS.
+
+    The legacy synchronous (budget<=0) rebuild used to enter
+    ``profile_scope_for_detached_worker`` — a helper whose contract is for a
+    NEW thread: it sets the request-profile TLS and CLEARS it on exit. On the
+    calling REQUEST thread that wipes the foreground profile mid-request, so
+    the cache publication that follows the rebuild falls back to the
+    process-level named profile (a root request publishes to
+    ``models_cache.work.json``) and the rest of the request keeps answering as
+    the named profile.
+
+    The request-thread scope restores the ambient TLS instead. This pins the
+    contract directly: for each possible incoming state the TLS after the scope
+    equals the TLS before it.
+    """
+    import api.profiles as profiles
+
+    root_home = tmp_path / ".hermes"
+    named_home = root_home / "profiles" / "work"
+    named_home.mkdir(parents=True, exist_ok=True)
+    (named_home / ".env").write_text(
+        "ISSUE_7724_REQ_PROBE=from-work-profile\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(profiles, "_DEFAULT_HERMES_HOME", root_home)
+    monkeypatch.setenv("ISSUE_7724_REQ_PROBE", "from-process-env")
+
+    cases = [
+        # (ambient TLS before, profile_name passed in, expected raw TLS inside)
+        ("default", "default", "default"),   # root request under named process
+        ("work", "work", "work"),            # named request, ambient == passed
+        ("work", "personal", "personal"),    # captured name differs from ambient
+        (None, "", None),                    # no request profile at all (no-op)
+    ]
+    for ambient, captured, expected_inside in cases:
+        if ambient is not None:
+            profiles.set_request_profile(ambient)
+        else:
+            profiles.clear_request_profile()
+        try:
+            with profiles.profile_scope_for_active_request(
+                captured, "test-request-scope"
+            ):
+                assert getattr(profiles._tls, "profile", None) == expected_inside, (
+                    f"inside the scope the TLS must be {expected_inside!r} "
+                    f"(ambient={ambient!r}, captured={captured!r})"
+                )
+            # THE CONTRACT: the ambient TLS is RESTORED, never cleared. With the
+            # detached-worker contract this was None after the scope for every
+            # case, which is what dropped the foreground request onto the
+            # process-level profile mid-request.
+            assert getattr(profiles._tls, "profile", None) == ambient, (
+                f"request-thread scope must restore the ambient TLS "
+                f"{ambient!r}; got "
+                f"{getattr(profiles._tls, 'profile', None)!r} "
+                f"(captured={captured!r}). The detached-worker scope's "
+                f"clear-on-exit is wrong on a request thread."
+            )
+        finally:
+            profiles.clear_request_profile()
+
+    # The env is applied for the named profile and unwound afterwards.
+    monkeypatch.setattr(profiles, "_active_profile", "work")
+    profiles.set_request_profile("work")
+    try:
+        with profiles.profile_scope_for_active_request("work", "test-request-scope"):
+            assert os.environ.get("ISSUE_7724_REQ_PROBE") == "from-work-profile"
+        assert os.environ.get("ISSUE_7724_REQ_PROBE") == "from-process-env"
+        # The request profile survived the scope exit.
+        assert profiles.get_active_profile_name() == "work"
+    finally:
+        profiles.clear_request_profile()
+
+
+def test_request_thread_scope_binds_root_under_named_process_profile(
+    monkeypatch, tmp_path
+):
+    """``bind_root=True`` pins the root home/env on the CALLING request thread.
+
+    A root/``default`` request on a server whose process-level active profile is
+    NAMED (``work``) must still resolve the ROOT cache file + home while the
+    rebuild runs, and must restore the ambient (``default``) TLS afterwards —
+    the binding the detached-worker scope used to provide, without its
+    clear-on-exit side effect.
+    """
+    import api.profiles as profiles
+
+    root_home = tmp_path / ".hermes"
+    named_home = root_home / "profiles" / "work"
+    named_home.mkdir(parents=True, exist_ok=True)
+    (named_home / ".env").write_text(
+        "ISSUE_7724_ROOT_REQ_PROBE=named-value\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(profiles, "_DEFAULT_HERMES_HOME", root_home)
+    monkeypatch.setattr(profiles, "_active_profile", "work")
+    monkeypatch.delenv("ISSUE_7724_ROOT_REQ_PROBE", raising=False)
+
+    out = {}
+    profiles.set_request_profile("default")
+    try:
+        out["before_home"] = os.environ.get("HERMES_HOME")
+        with profiles.profile_scope_for_active_request(
+            "default", "test-root-request-scope", bind_root=True
+        ):
+            out["inside_name"] = profiles.get_active_profile_name()
+            out["inside_home"] = os.environ.get("HERMES_HOME")
+            out["inside_env"] = os.environ.get("ISSUE_7724_ROOT_REQ_PROBE")
+        out["after_name"] = profiles.get_active_profile_name()
+    finally:
+        profiles.clear_request_profile()
+
+    # The root home + root alias were pinned for the duration.
+    assert out["inside_name"] in ("", "default")
+    assert out["inside_home"] == str(root_home)
+    assert out["inside_env"] != "named-value"
+    # The ambient request TLS is restored, not cleared.
+    assert out["after_name"] in ("", "default"), (
+        f"bind_root must restore the ambient request TLS, got "
+        f"{out['after_name']!r}"
+    )
+
+
+def test_request_thread_scope_propagates_body_exceptions(monkeypatch):
+    """A body exception must propagate AND still restore the ambient TLS.
+
+    The scope resolves its profile home BEFORE yielding, so it never wraps the
+    caller's body in a swallowing ``except``: an exception from the body
+    propagates unchanged (through the env scope's unwind and the
+    TLS-restoring ``finally``) instead of being re-yielded as a
+    ``RuntimeError`` or silently swallowed.
+    """
+    import api.profiles as profiles
+
+    monkeypatch.setattr(profiles, "_active_profile", "work")
+
+    class _BodyBoom(RuntimeError):
+        pass
+
+    profiles.set_request_profile("work")
+    try:
+        with pytest.raises(_BodyBoom):
+            with profiles.profile_scope_for_active_request("work", "test-scope-boom"):
+                raise _BodyBoom("caller body failed")
+        # The unwind ran: ambient TLS restored (never cleared to None).
+        assert getattr(profiles._tls, "profile", None) == "work"
+    finally:
+        profiles.clear_request_profile()
+
+
+def test_request_thread_scope_fail_open_on_unresolvable_home(monkeypatch):
+    """An unresolvable profile home degrades to a no-op, not an exception.
+
+    Mirrors the pre-existing fail-open contract of the sibling detached-worker
+    scope: the caller keeps its ambient profile state and must not break.
+    """
+    import api.profiles as profiles
+
+    def _boom(_name):
+        raise RuntimeError("profile home resolution failed")
+
+    monkeypatch.setattr(profiles, "get_hermes_home_for_profile", _boom)
+
+    profiles.set_request_profile("work")
+    try:
+        with profiles.profile_scope_for_active_request("work", "test-scope-failopen"):
+            # No env bound, but the ambient request TLS is still intact.
+            assert getattr(profiles._tls, "profile", None) == "work"
+        assert getattr(profiles._tls, "profile", None) == "work"
+    finally:
+        profiles.clear_request_profile()
+
+
+def test_request_thread_scope_noop_for_root_without_bind_root(monkeypatch):
+    """Root/default without ``bind_root`` is a no-op on a request thread."""
+    import api.profiles as profiles
+
+    monkeypatch.setattr(profiles, "_active_profile", "work")
+    monkeypatch.setenv("ISSUE_7724_NOOP_PROBE", "from-process-env")
+
+    profiles.set_request_profile("default")
+    try:
+        with profiles.profile_scope_for_active_request("default", "test-scope-noop"):
+            assert getattr(profiles._tls, "profile", None) == "default"
+            assert os.environ.get("ISSUE_7724_NOOP_PROBE") == "from-process-env"
+        assert getattr(profiles._tls, "profile", None) == "default"
+    finally:
+        profiles.clear_request_profile()
