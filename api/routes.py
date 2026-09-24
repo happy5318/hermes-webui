@@ -5594,8 +5594,26 @@ def _apply_cli_source_meta_to_session(session, cli_meta):
     identity. Persisting the source meta from the captured ``cli_meta`` BEFORE
     the lock-held reload — or re-applying it to the freshly loaded session
     after the reload — closes that gap. This helper does the latter.
+
+    #7776 Finding 3 (SILENT regression on forks): ``cli_meta`` comes from
+    ``_lookup_cli_session_metadata`` → ``get_cli_sessions()``, which projects
+    state.db rows for EVERY source — including WebUI-origin rows
+    (``session_source="webui"``). A WebUI fork is one of those rows, so a
+    blanket re-stamp turns the fork into a WebUI-native session on the
+    rename/move/archive save. Two guards:
+      1. Early-return when the row is WebUI-origin. It is not a CLI row
+         (``is_cli_session_row`` returns False for it), so there is nothing
+         to re-stamp; the reloaded sidecar already has the right identity.
+      2. Never overwrite an existing ``session_source == "fork"`` — a
+         WebUI-created fork (/api/session/branch, compression recovery)
+         owns its own provenance and must stay a fork even if a same-id
+         state.db row claims some other source.
     """
     if not cli_meta:
+        return
+    if _session_source_is_webui(cli_meta):
+        return
+    if str(getattr(session, "session_source", None) or "").strip().lower() == "fork":
         return
     session.is_cli_session = is_cli_session_row(cli_meta)
     session.source_tag = cli_meta.get("source_tag")

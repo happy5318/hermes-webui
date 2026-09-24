@@ -878,3 +878,296 @@ def test_archive_handler_preserves_cli_source_identity_across_lock_reload(
         "archive must preserve raw_source; on-disk "
         f"raw_source={on_disk.get('raw_source')!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# PR #7776 Finding 3 (SILENT regression): rename/move/archive must not
+# re-stamp a WebUI fork as session_source="webui".
+#
+# ``_apply_cli_source_meta_to_session`` re-stamps every source field from
+# ``_lookup_cli_session_metadata(sid)``. That lookup walks
+# ``get_cli_sessions()``, which projects state.db rows for EVERY source —
+# including WebUI-origin rows (session_source="webui"). A WebUI fork is one
+# of those rows, so the blanket re-stamp overwrote the fork's identity.
+#
+# These tests seed a REAL isolated SQLite state.db with a WebUI-origin row
+# (so the actual get_cli_sessions() projection is exercised, not a patched
+# ``_lookup_cli_session_metadata``) and then drive rename / move / archive
+# through the real POST handlers, asserting session_source stays "fork".
+# ---------------------------------------------------------------------------
+
+
+WEBUI_STATE_DB_SCHEMA = """
+CREATE TABLE sessions (
+    id TEXT PRIMARY KEY,
+    title TEXT,
+    model TEXT,
+    message_count INTEGER DEFAULT 0,
+    actual_message_count INTEGER DEFAULT 0,
+    started_at REAL,
+    last_activity REAL,
+    source TEXT,
+    session_source TEXT,
+    cwd TEXT
+);
+CREATE TABLE messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    content TEXT,
+    timestamp REAL NOT NULL
+);
+"""
+
+
+def _seed_webui_state_db_row(tmp_path, sid, *, title="Fork chat"):
+    """Create an isolated state.db whose ``sessions`` row for ``sid`` is
+    WebUI-origin (source='webui'), exactly what a WebUI fork session writes.
+
+    Returns the ``state.db`` path. Point ``models._active_state_db_path`` /
+    ``routes`` at it so ``get_cli_sessions()`` projects this row.
+    """
+    import sqlite3
+
+    db_path = tmp_path / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.executescript(WEBUI_STATE_DB_SCHEMA)
+        conn.execute(
+            "INSERT INTO sessions "
+            "(id, title, model, message_count, actual_message_count, started_at, "
+            " last_activity, source, session_source, cwd) "
+            "VALUES (?, ?, 'gpt-test', 2, 2, 100.0, 200.0, 'webui', 'webui', ?)",
+            (sid, title, str(tmp_path)),
+        )
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp) "
+            "VALUES (?, 'user', 'hello', 101.0)",
+            (sid,),
+        )
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp) "
+            "VALUES (?, 'assistant', 'hi there', 102.0)",
+            (sid,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return db_path
+
+
+def _seed_fork_sidecar(session_dir, sid, *, title="Fork chat", profile="alpha"):
+    """Persist a WebUI-origin fork sidecar (what /api/session/branch writes):
+    session_source='fork', parent_session_id set, default is_cli_session."""
+    fork = Session(
+        session_id=sid,
+        title=title,
+        workspace=str(session_dir.parent),
+        messages=[{"role": "user", "content": "hello"}],
+        composer_draft={"text": "fork draft"},
+        profile=profile,
+        session_source="fork",
+        parent_session_id="fork-parent-1",
+    )
+    fork.save()
+    return fork
+
+
+def _isolate_state_db_for_cli_projection(tmp_path, monkeypatch, db_path):
+    """Point the state.db resolution at an isolated DB and clear caches.
+
+    ``_resolve_cli_sessions_context`` reads ``profiles.get_active_hermes_home``
+    and appends ``/state.db``, so the DB must live inside the redirected home.
+    """
+    from api import profiles as _profiles_mod
+
+    hermes_home = db_path.parent
+    monkeypatch.setattr(
+        _profiles_mod, "get_active_hermes_home", lambda: str(hermes_home),
+    )
+    monkeypatch.setattr(
+        _profiles_mod, "get_active_profile_name", lambda: "alpha",
+    )
+    # No Claude Code project dir on the test box — return an empty projection.
+    monkeypatch.setattr(models, "get_claude_code_sessions", lambda: [])
+    monkeypatch.setenv("HERMES_WEBUI_CLAUDE_PROJECTS_DIR", str(hermes_home / "no-claude"))
+    models.clear_cli_sessions_cache()
+    models.clear_sidecar_metadata_cache()
+    return db_path
+
+
+def _setup_fork_rename_scenario(tmp_path, monkeypatch, *, sid):
+    """Shared wiring for a fork rename through the real handler."""
+    from api import profiles as _profiles_mod
+
+    session_dir = _isolate_session_store(tmp_path, monkeypatch)
+    monkeypatch.setattr(routes, "_get_active_profile_name", lambda: "alpha")
+    monkeypatch.setattr(
+        _profiles_mod, "get_active_profile_name", lambda: "alpha",
+    )
+    db_path = _seed_webui_state_db_row(tmp_path, sid)
+    _isolate_state_db_for_cli_projection(tmp_path, monkeypatch, db_path)
+    _seed_fork_sidecar(session_dir, sid)
+    return session_dir
+
+
+def _assert_fork_identity_survived(on_disk, sid, *, context):
+    """The fork's WebUI-owned identity must be byte-identical after the op."""
+    assert on_disk.get("session_source") == "fork", (
+        f"{context} must not re-stamp a WebUI fork's session_source; "
+        f"on-disk session_source={on_disk.get('session_source')!r}"
+    )
+    assert on_disk.get("parent_session_id") == "fork-parent-1", (
+        f"{context} must preserve the fork's parent link; "
+        f"on-disk parent_session_id={on_disk.get('parent_session_id')!r}"
+    )
+    assert on_disk.get("is_cli_session") is not True, (
+        f"{context} must not mark a WebUI fork as a CLI-imported session; "
+        f"on-disk is_cli_session={on_disk.get('is_cli_session')!r}"
+    )
+
+
+def test_rename_handler_does_not_restamp_fork_as_webui(tmp_path, monkeypatch):
+    """#7776 Finding 3: rename of a WebUI fork must keep session_source='fork'.
+
+    get_cli_sessions() returns the WebUI-origin state.db row for this sid, so
+    the pre-fix helper overwrote the fork's identity with the row's
+    session_source='webui' and is_cli_session=False on the save.
+    """
+    sid = "webui-fork-rename-1"
+    session_dir = _setup_fork_rename_scenario(tmp_path, monkeypatch, sid=sid)
+    captured = _capture_post(
+        monkeypatch, {"session_id": sid, "title": "Renamed fork"},
+    )
+    _stub_post_lock_side_effects(monkeypatch)
+
+    result = routes.handle_post(
+        _FakeHandler(
+            b'{"session_id": "' + sid.encode() + b'", "title": "Renamed fork"}',
+        ),
+        SimpleNamespace(path="/api/session/rename"),
+    )
+
+    assert result is True, "rename handler must claim the request"
+    assert captured["status"] == 200, f"expected 200, got {captured}"
+    on_disk = _load_disk_session(session_dir, sid)
+    assert on_disk["title"] == "Renamed fork"
+    _assert_fork_identity_survived(on_disk, sid, context="rename")
+
+
+def test_move_handler_does_not_restamp_fork_as_webui(tmp_path, monkeypatch):
+    """#7776 Finding 3: move of a WebUI fork must keep session_source='fork'."""
+    sid = "webui-fork-move-1"
+    session_dir = _setup_fork_rename_scenario(tmp_path, monkeypatch, sid=sid)
+    monkeypatch.setattr(routes, "load_projects", lambda: [])
+    captured = _capture_post(
+        monkeypatch, {"session_id": sid, "project_id": None},
+    )
+    monkeypatch.setattr(
+        routes, "publish_session_list_changed", lambda *a, **kw: None,
+    )
+
+    result = routes.handle_post(
+        _FakeHandler(b'{"session_id": "' + sid.encode() + b'"}'),
+        SimpleNamespace(path="/api/session/move"),
+    )
+
+    assert result is True, "move handler must claim the request"
+    assert captured["status"] == 200, f"expected 200, got {captured}"
+    on_disk = _load_disk_session(session_dir, sid)
+    _assert_fork_identity_survived(on_disk, sid, context="move")
+
+
+def test_archive_handler_does_not_restamp_fork_as_webui(tmp_path, monkeypatch):
+    """#7776 Finding 3: archive of a WebUI fork must keep session_source='fork'."""
+    sid = "webui-fork-archive-1"
+    session_dir = _setup_fork_rename_scenario(tmp_path, monkeypatch, sid=sid)
+    monkeypatch.setattr(
+        routes, "_session_is_subagent_view_only", lambda value: False,
+    )
+    captured = _capture_post(
+        monkeypatch, {"session_id": sid, "archived": True},
+    )
+    monkeypatch.setattr(
+        routes, "publish_session_list_changed", lambda *a, **kw: None,
+    )
+    monkeypatch.setattr(routes, "_worktree_retained_payload", lambda s: {})
+
+    result = routes.handle_post(
+        _FakeHandler(
+            b'{"session_id": "' + sid.encode() + b'", "archived": true}',
+        ),
+        SimpleNamespace(path="/api/session/archive"),
+    )
+
+    assert result is True, "archive handler must claim the request"
+    assert captured["status"] == 200, f"expected 200, got {captured}"
+    on_disk = _load_disk_session(session_dir, sid)
+    assert on_disk.get("archived") is True, (
+        "archive must still persist archived=True on the fork"
+    )
+    _assert_fork_identity_survived(on_disk, sid, context="archive")
+
+
+def test_apply_cli_source_meta_skips_webui_origin_row():
+    """#7776 Finding 3 unit edge: a WebUI-origin cli_meta must be a no-op,
+    even when the in-memory session currently has null source fields."""
+    import api.routes as routes
+    from types import SimpleNamespace as _NS
+
+    session = _NS(
+        session_id="s1",
+        is_cli_session=False,
+        source_tag=None,
+        raw_source=None,
+        session_source=None,
+        source_label=None,
+    )
+    routes._apply_cli_source_meta_to_session(
+        session,
+        {
+            "session_id": "s1",
+            "source_tag": "webui",
+            "raw_source": "webui",
+            "session_source": "webui",
+            "source_label": "WebUI",
+        },
+    )
+    assert session.session_source is None, (
+        "a WebUI-origin cli_meta row must not stamp the session at all"
+    )
+    assert session.source_tag is None
+    assert session.is_cli_session is False
+
+
+def test_apply_cli_source_meta_never_overwrites_existing_fork():
+    """#7776 Finding 3 unit edge: an existing session_source='fork' survives a
+    non-WebUI cli_meta (defense in depth for a mislabelled state.db row)."""
+    import api.routes as routes
+    from types import SimpleNamespace as _NS
+
+    session = _NS(
+        session_id="fork1",
+        is_cli_session=False,
+        source_tag=None,
+        raw_source=None,
+        session_source="fork",
+        source_label=None,
+        parent_session_id="parent1",
+    )
+    routes._apply_cli_source_meta_to_session(
+        session,
+        {
+            "session_id": "fork1",
+            "is_cli_session": True,
+            "source_tag": "cli",
+            "raw_source": "cli",
+            "session_source": "cli",
+            "source_label": "CLI",
+        },
+    )
+    assert session.session_source == "fork", (
+        "an existing session_source='fork' must never be overwritten"
+    )
+    assert session.is_cli_session is False
+    assert session.source_tag is None
