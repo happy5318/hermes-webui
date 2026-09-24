@@ -576,7 +576,7 @@ def test_root_profile_rebuild_writes_root_cache_under_named_process_profile(
 
     observed: dict = {}
 
-    def _worker_inspector(**kwargs):
+    def _worker_inspector(builder=None, **kwargs):
         """Stands in for the live probe inside the background rebuild."""
         from api.profiles import get_active_profile_name
 
@@ -602,7 +602,13 @@ def test_root_profile_rebuild_writes_root_cache_under_named_process_profile(
     monkeypatch.setattr(cfg, "_load_models_cache_from_disk", lambda: _catalog("stale"))
     monkeypatch.setattr(cfg, "_load_stale_models_cache_from_disk", lambda: _catalog("stale"))
     monkeypatch.setattr(cfg, "_models_cache_source_fingerprint", lambda: {"profile": "root"})
-    monkeypatch.setattr(cfg, "get_available_models", _worker_inspector)
+    # Mock the INNER rebuild seam (``_invoke_models_rebuild``) rather than
+    # ``get_available_models`` itself. The synchronous-budget path inside
+    # ``get_available_models`` is what applies the root env for a root
+    # request under a named process profile (#7724 re-gate: the outer SWR
+    # worker only binds TLS; the env application is the rebuild scope's
+    # job). Mocking the outer function would skip the env binding entirely.
+    monkeypatch.setattr(cfg, "_invoke_models_rebuild", _worker_inspector)
 
     # PROCESS-level active profile is a NAMED one.
     import api.profiles as profiles_mod
@@ -710,3 +716,161 @@ def test_root_detached_worker_scope_binds_root_profile_on_worker(monkeypatch, tm
     # profile again, and the root home it installed is no longer in effect.
     assert out["after_name"] == "work"
     assert out["after_home"] != str(root_home)
+
+
+# ── 8. Two-profile barrier: concurrent SWR workers must not leak env (#7724 re-gate)
+
+
+def test_swr_two_profile_barrier_no_env_leak(tmp_path, monkeypatch):
+    """Concurrent SWR workers for two profiles must NOT leak env between them.
+
+    Bug (Codex repro, #7724 re-gate): the outer SWR worker in
+    ``_maybe_start_session_visit_background_rebuild`` entered
+    ``profile_scope_for_detached_worker`` which mutates ``os.environ`` to the
+    captured profile's env. Two concurrent SWR workers — one per profile —
+    could interleave their env mutations: while A's bounded rebuild worker
+    was running its live probe, B's outer SWR worker entered its own scope
+    and overwrote process env with B's env. A's probe then read B's
+    credentials and built A's catalog with B's provider keys.
+
+    Fix: the outer SWR worker only binds the request-profile TLS via the
+    new ``profile_tls_scope_for_detached_worker`` (no env mutation). The
+    bounded rebuild worker inside the cold path is the SOLE env owner, and
+    the cold-path lock serializes cold-path rebuilds, so at most one env
+    owner is in flight at any time.
+
+    This test reproduces the interleaving: it starts a SWR worker for
+    profile A that blocks its bounded rebuild on a barrier, then starts a
+    SWR worker for profile B whose outer scope (with the bug) would have
+    mutated env to B. With the fix, B's outer scope only sets TLS, so A's
+    blocked probe still sees A's env. After the barrier releases, B's
+    cold path runs and B's probe sees B's env.
+    """
+    import api.config as cfg
+    import api.profiles as profiles_mod
+    from concurrent.futures import ThreadPoolExecutor
+
+    _reset_models_memory_cache(monkeypatch)
+
+    # Two profile homes with distinct .env values
+    root_home = tmp_path / ".hermes"
+    home_a = root_home / "profiles" / "profile_a"
+    home_b = root_home / "profiles" / "profile_b"
+    for home in (home_a, home_b):
+        home.mkdir(parents=True, exist_ok=True)
+    (home_a / ".env").write_text("ISSUE_7724_BARRIER=alpha\n", encoding="utf-8")
+    (home_b / ".env").write_text("ISSUE_7724_BARRIER=beta\n", encoding="utf-8")
+    monkeypatch.setattr(profiles_mod, "_DEFAULT_HERMES_HOME", root_home)
+
+    # Per-profile disk cache files (stale, so session-visit fires SWR)
+    cache_a = tmp_path / "models_cache.profile_a.json"
+    cache_b = tmp_path / "models_cache.profile_b.json"
+    for p in (cache_a, cache_b):
+        p.write_text("{}", encoding="utf-8")
+        os.utime(p, (time.time() - 600.0, time.time() - 600.0))
+
+    # The bounded rebuild for A blocks on a barrier until B's outer SWR
+    # worker has had a chance to enter its scope. If the outer scope
+    # mutates env (the bug), B's scope overwrites A's env and A's blocked
+    # probe sees B's env. With the fix, B's scope only sets TLS and A's
+    # probe still sees A's env.
+    a_probe_seen = threading.Event()
+    b_probe_seen = threading.Event()
+    release_a = threading.Event()
+    observed: dict = {}
+
+    def _inspect(builder, **kwargs):
+        from api.profiles import get_active_profile_name
+        name = get_active_profile_name()
+        if name == "profile_a":
+            a_probe_seen.set()
+            # Block A's probe until the test releases it. The test waits
+            # long enough for B's outer SWR scope to have entered (and,
+            # with the bug, mutated process env to B's env) before
+            # releasing A.
+            assert release_a.wait(timeout=15), "test never released profile A's probe"
+            # Record the env NOW (after the race window) — this is what
+            # the real live provider probe would see when it reads
+            # os.environ. With the bug, this is B's env (leaked). With
+            # the fix, this is still A's env.
+            observed[name] = dict(os.environ)
+        elif name == "profile_b":
+            b_probe_seen.set()
+            observed[name] = dict(os.environ)
+        else:
+            observed[name] = dict(os.environ)
+        return _catalog(f"rebuilt-{name}")
+
+    monkeypatch.setattr(cfg, "_SESSION_VISIT_MODELS_FRESHNESS_SECONDS", 300.0, raising=False)
+    monkeypatch.setattr(cfg, "_LIVE_REBUILD_BUDGET_SECONDS", 0.0, raising=False)
+    monkeypatch.setattr(cfg, "_invoke_models_rebuild", _inspect)
+    monkeypatch.setattr(cfg, "_load_models_cache_from_disk", lambda: _catalog("stale"))
+    monkeypatch.setattr(cfg, "_load_stale_models_cache_from_disk", lambda: _catalog("stale"))
+    monkeypatch.setattr(cfg, "_models_cache_source_fingerprint", lambda: {"profile": "test"})
+    monkeypatch.setattr(cfg, "_save_models_cache_to_disk", lambda _cache: None)
+    monkeypatch.setattr(cfg, "_get_fresh_memory_models_cache", lambda _now: None)
+
+    def _stale_visit_for(profile_name: str, cache_path: Path):
+        """Simulate a stale session-visit for one profile, firing SWR."""
+        monkeypatch.setattr(cfg, "_get_models_cache_path", lambda: cache_path)
+        monkeypatch.setattr(cfg, "_session_visit_active_profile_name", lambda: profile_name)
+        return cfg.get_available_models_for_session_visit()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        # 1. Start A's stale visit. A's SWR outer worker enters its TLS-only
+        # scope and calls get_available_models(force_refresh=True), which
+        # enters the cold path and reaches _invoke_models_rebuild (the
+        # mock). The mock blocks on release_a.
+        a_future = executor.submit(_stale_visit_for, "profile_a", cache_a)
+        # Wait for A's probe to actually be running (inside the mock).
+        assert a_probe_seen.wait(timeout=10), "A's bounded rebuild never reached the mock"
+        # 2. Now start B's stale visit while A's probe is still blocked.
+        # B's SWR outer worker enters its scope. With the bug, this would
+        # mutate process env to B's env, and A's blocked probe (still
+        # inside the mock, reading os.environ) would see B's env. With
+        # the fix, B's scope only sets TLS — no env mutation.
+        b_future = executor.submit(_stale_visit_for, "profile_b", cache_b)
+        # Give B's outer scope time to enter (it sets TLS, then calls
+        # get_available_models which blocks on _cache_build_in_progress
+        # until A's cold path releases the lock). 500ms is generous
+        # enough for the scope body to run on any reasonable test box.
+        time.sleep(0.5)
+        # 3. Release A's probe. A records the env NOW — after the race
+        # window where B's outer scope could have mutated it.
+        release_a.set()
+        a_result = a_future.result(timeout=10)
+        b_result = b_future.result(timeout=10)
+
+    # Wait for both SWR background threads to finish.
+    _wait_for_session_visit_rebuild(monkeypatch, timeout=10)
+
+    assert a_result == _catalog("stale")
+    assert b_result == _catalog("stale")
+
+    # THE CORE ASSERTION: A's probe must have seen A's env, not B's.
+    # With the bug, observed["profile_a"]["ISSUE_7724_BARRIER"] would be
+    # "beta" (B's env, leaked via process-wide os.environ mutation in
+    # B's outer SWR scope while A's probe was blocked).
+    a_env = observed.get("profile_a", {}).get("ISSUE_7724_BARRIER")
+    b_env = observed.get("profile_b", {}).get("ISSUE_7724_BARRIER")
+    assert a_env == "alpha", (
+        f"profile A's bounded rebuild must see profile A's env (no env "
+        f"leak from concurrent SWR worker for profile B); "
+        f"got ISSUE_7724_BARRIER={a_env!r} (expected 'alpha'). "
+        f"With the #7724 re-gate bug, this would be 'beta' (B's env) "
+        f"because the outer SWR scope mutated process-wide os.environ."
+    )
+    assert b_env == "beta", (
+        f"profile B's bounded rebuild must see profile B's env; "
+        f"got ISSUE_7724_BARRIER={b_env!r} (expected 'beta')"
+    )
+
+    # HERMES_HOME should also be profile-specific on each probe.
+    a_home = observed.get("profile_a", {}).get("HERMES_HOME")
+    b_home = observed.get("profile_b", {}).get("HERMES_HOME")
+    assert a_home == str(home_a), (
+        f"profile A's probe must bind A's HERMES_HOME, got {a_home!r}"
+    )
+    assert b_home == str(home_b), (
+        f"profile B's probe must bind B's HERMES_HOME, got {b_home!r}"
+    )

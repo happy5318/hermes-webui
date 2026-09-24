@@ -370,7 +370,10 @@ def test_providers_and_models_routes_wrap_in_profile_env():
       - /api/models relies on get_available_models() using the mirrored request
         scope for the budget<=0 sync rebuild plus profile_scope_for_detached_worker
         for the detached rebuild worker (the request-thread wrapper cannot reach
-        the worker thread — Codex CORE finding).
+        the worker thread — Codex CORE finding). After the #7724 re-gate, the
+        synchronous-budget path also uses ``profile_scope_for_detached_worker``
+        (with ``bind_root=_worker_bind_root``) so a root request under a
+        NAMED process profile still pins the root home + env.
     """
     routes_src = Path(profiles.__file__).resolve().parent.joinpath("routes.py").read_text(
         encoding="utf-8"
@@ -378,8 +381,13 @@ def test_providers_and_models_routes_wrap_in_profile_env():
     assert 'with profile_env_for_active_request("/api/models/live"' in routes_src
     assert "profile_env_for_active_request_readonly" in routes_src
     config_src = Path(config.__file__).resolve().read_text(encoding="utf-8")
-    assert "profile_env_for_active_request as _prof_env_request" in config_src
     assert "profile_scope_for_detached_worker" in config_src
+    # The synchronous-budget path inside get_available_models() now uses
+    # ``profile_scope_for_detached_worker`` (not the legacy
+    # ``profile_env_for_active_request``) so the env binding is consistent
+    # with the bounded rebuild worker and the root-under-named-process
+    # case is handled (#7724 re-gate).
+    assert "profile_scope_for_detached_worker as _prof_scope_worker" in config_src
     assert "_get_models_cache_path" in config_src
 
 

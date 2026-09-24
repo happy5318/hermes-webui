@@ -10197,13 +10197,11 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
         from contextlib import nullcontext as _nullcontext
 
         _active_profile_name = ""
-        _prof_env_request = None
         _prof_scope_worker = None
         _worker_bind_root = False
         try:
             from api.profiles import (
                 get_active_profile_name as _gapn,
-                profile_env_for_active_request as _prof_env_request,
                 profile_scope_for_detached_worker as _prof_scope_worker,
             )
             _active_profile_name = (_gapn() or "").strip()
@@ -10215,19 +10213,28 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                 _is_root_active_profile()
             )
         except Exception:
-            _prof_env_request = None
             _prof_scope_worker = None
 
         # Legacy synchronous (unbounded) rebuild — opt-in via budget<=0.
         if _LIVE_REBUILD_BUDGET_SECONDS <= 0:
             try:
-                # Foreground thread already carries the request-profile TLS;
-                # apply the mirrored profile env (no-op for default) for the
-                # live probe because provider_model_ids() still has raw
-                # os.getenv()/HERMES_HOME readers on this synchronous path.
+                # Foreground thread already carries the request-profile TLS
+                # (set by the outer SWR worker's
+                # ``profile_tls_scope_for_detached_worker`` for SWR callers,
+                # or by the request handler for direct callers). Apply the
+                # profile env via the same scope the bounded rebuild worker
+                # uses, with ``bind_root=_worker_bind_root`` so a root
+                # request under a NAMED process profile still pins the
+                # root home + credentials (#7724). This is the
+                # synchronous-budget path's "explicit root/default
+                # binding" the maintainer asked to preserve (#7724 re-gate).
                 _sync_scope = (
-                    _prof_env_request("models rebuild (sync)")
-                    if _prof_env_request is not None
+                    _prof_scope_worker(
+                        _active_profile_name,
+                        "models rebuild (sync)",
+                        bind_root=_worker_bind_root,
+                    )
+                    if _prof_scope_worker is not None
                     else _nullcontext()
                 )
                 with _sync_scope:
@@ -10653,14 +10660,21 @@ def _maybe_start_session_visit_background_rebuild() -> None:
     on a successful live rebuild — preserving the "mtime records last live
     rebuild" semantic the 300 s horizon is defined against.
 
-    The profile scope is rebound on the worker thread via
-    ``profile_scope_for_detached_worker`` (the same helper the existing
-    bounded-rebuild worker uses, #3957) so a named profile's live probe and
-    disk write land on that profile's auth/config/catalog, never the default.
+    The OUTER SWR worker only binds the captured request-profile TLS via
+    ``profile_tls_scope_for_detached_worker`` (no process-wide env
+    mutation) so two concurrent SWR workers — one per profile — cannot
+    interleave their env mutations and pair profile A's catalog build
+    with profile B's provider credentials (#7724 re-gate). The env
+    application is the bounded rebuild worker's job: it runs serialized
+    by the cache-build lock inside the cold path, so at most one env
+    owner is in flight at any time. The synchronous-budget path keeps
+    its own explicit root/default binding.
+
     No-op for the default / root profile in the single-profile case
-    (``profile_scope_for_detached_worker`` is a no-op there); under a NAMED
-    process profile the root profile is bound explicitly instead, so the worker
-    cannot inherit the named profile's home, credentials and cache file (#7724).
+    (``profile_tls_scope_for_detached_worker`` is a no-op there); under a
+    NAMED process profile the root profile is bound explicitly instead
+    (TLS only, on the outer worker), so the inner cold path cannot
+    inherit the named profile's home, credentials and cache file (#7724).
     """
     profile_key = _session_visit_active_profile_name()
     # Root/default key: the worker must bind the root profile explicitly when the
@@ -10674,16 +10688,21 @@ def _maybe_start_session_visit_background_rebuild() -> None:
         box: dict = {}
 
         def _worker() -> None:
-            # Rebind the per-request profile on the worker thread so the
-            # live provider probe + ``_save_models_cache_to_disk`` write the
-            # right profile's auth/config/cache file (#3957), and pin the root
-            # profile explicitly for a root request under a named process profile
-            # (#7724).
+            # Bind ONLY the per-request profile on the worker thread so the
+            # inner ``get_available_models(force_refresh=True)`` cold path
+            # resolves the right profile-keyed cache/config paths via the
+            # TLS, but do NOT mutate ``os.environ`` here — the bounded
+            # rebuild worker inside the cold path is the sole env owner, so
+            # two concurrent SWR workers (one per profile) cannot interleave
+            # their env mutations and steal each other's provider credentials
+            # (#7724 re-gate). The bounded rebuild worker's own
+            # ``profile_scope_for_detached_worker`` call applies the env
+            # AFTER cache-build admission, and only one cold-path rebuild
+            # is in flight at a time.
             try:
-                from api.profiles import profile_scope_for_detached_worker
-                _scope = profile_scope_for_detached_worker(
+                from api.profiles import profile_tls_scope_for_detached_worker
+                _scope = profile_tls_scope_for_detached_worker(
                     profile_key,
-                    "models session_visit background rebuild",
                     bind_root=_bind_root,
                 )
             except Exception:

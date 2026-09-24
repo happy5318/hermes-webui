@@ -1586,6 +1586,59 @@ def profile_scope_for_detached_worker(
 
 
 @contextmanager
+def profile_tls_scope_for_detached_worker(
+    profile_name,
+    *,
+    bind_root: bool = False,
+):
+    """Bind ONLY the per-request profile TLS on a NEW thread (#7724 re-gate).
+
+    A companion to ``profile_scope_for_detached_worker`` for callers that
+    must NOT mutate ``os.environ`` on a detached worker. The outer SWR
+    worker in ``api/config._maybe_start_session_visit_background_rebuild``
+    is the primary caller: it just needs ``get_active_profile_name()`` to
+    resolve the captured request profile so the inner
+    ``get_available_models(force_refresh=True)`` cold path picks the right
+    profile-keyed cache/config paths, but it must not touch process-wide
+    env, because two concurrent SWR workers (one per profile) would then
+    interleave their env mutations and the slower worker's catalog would
+    be built with the faster worker's provider credentials (#7724).
+
+    The env application is the bounded rebuild worker's job — see
+    ``profile_scope_for_detached_worker`` inside the cold path, which
+    runs serialized by the cache-build lock, so at most one env owner
+    is in flight at any time. The synchronous-budget path also keeps
+    its own explicit root/default binding.
+
+    For a default/root request with ``bind_root=True`` (a root request
+    while the process-level active profile is a NAMED one), this sets
+    the TLS to the root alias so the cold-path path resolution finds
+    the root files, but defers env application to the bounded rebuild
+    worker (which uses ``bind_root=True`` on its own scope to pin the
+    root home + credentials).
+    """
+    name = (profile_name or "").strip()
+    if not name or _is_root_profile(name):
+        if not bind_root:
+            yield
+            return
+        # Root request under a NAMED process profile: bind the root TLS
+        # so the cold-path path helpers resolve the root files, but do
+        # NOT mutate env — the bounded rebuild worker owns env.
+        set_request_profile("default")
+        try:
+            yield
+        finally:
+            clear_request_profile()
+        return
+    set_request_profile(name)
+    try:
+        yield
+    finally:
+        clear_request_profile()
+
+
+@contextmanager
 def profile_scope_for_root_detached_worker(
     purpose: str = "detached worker (root profile)",
     logger_override: Optional[logging.Logger] = None,
