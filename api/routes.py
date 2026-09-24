@@ -27,17 +27,39 @@ import sys
 import threading
 import time
 import uuid
-# ── server timezone offset (#7140) ─────────────────────────────────────────
-# `time.strftime("%z")` returns the offset of the **process** timezone, not
-# the configured Hermes timezone.  On a typical container deployment the
-# process timezone is UTC, so the operator's WebUI sees cron timestamps
-# in the browser zone (often UTC too) and reads them as scheduling bugs.
-# A first-visit hint to the agent's configured timezone (env override) is
-# the minimum that's needed to make the helper in `static/sessions.js`
-# (`_formatInServerTz`) actually format in the server's wall clock.
+# ── server timezone offset (#7140) — DEGRADED FALLBACK ONLY ────────────────
+# `_server_tz_offset()` resolves ONE process-wide zone.  The cron timestamps
+# it is meant to display are stamped per-job with the offset of the zone the
+# job's profile configured (`hermes_time._resolve_timezone_name()` reads the
+# ACTIVE PROFILE's config.yaml `timezone`).  A single process-wide offset is
+# therefore wrong for two independent reasons:
+#   1. It cannot know that an operator on a UTC container who only sets
+#      `timezone: America/Sao_Paulo` in config.yaml (no HERMES_TIMEZONE env
+#      export) still has -03:00 jobs — so that operator kept seeing UTC.
+#   2. It is a point-in-time ("current") offset, so it is wrong across DST
+#      for a timestamp in the other half of the year, and it is wrong for
+#      any profile whose configured zone differs from the resolving env.
+#
+# The canonical fix is on the client: `static/panels.js` now formats cron
+# `next_run_at` / `last_run_at` with `_formatInIsoTz()` (static/sessions.js),
+# which parses the ±HH:MM offset out of the timestamp string ITSELF and
+# shifts by it.  The agent already writes the right offset for that job into
+# the ISO string, so this helper needs no timezone inference at all — and it
+# is correct per-job, per-profile and across DST.
+#
+# `server_tz` in the /api/sessions payload is kept (other panels use
+# `_serverTzOptions()` / `_formatInServerTz()`) but this helper is now only
+# the last-resort fallback for values that carry no offset of their own.
 def _server_tz_offset() -> str:
-    """Return the server's wall-clock offset as a string like '+0800' or
-    '-0330', falling back to the process timezone and finally to '+0000'.
+    """Return a coarse server wall-clock offset like '+0800' or '-0330'.
+
+    .. deprecated::
+        Use the timestamp's own ISO offset instead (client-side
+        ``_formatInIsoTz``).  This resolver can only ever produce ONE
+        offset for the whole process and only for the CURRENT instant, so
+        it is systematically wrong for per-profile zones and across DST.
+        It remains as the fallback for naive timestamps that carry no
+        offset.
 
     Resolution order:
       1. ``HERMES_TIMEZONE`` env var (the canonical knob for self-hosted
@@ -66,14 +88,6 @@ def _server_tz_offset() -> str:
             pass
     fallback = time.strftime("%z")
     return fallback if fallback else "+0000"
-
-
-# ── server timezone offset (#7140) — see `_server_tz_offset` for rationale ──
-def _now_local_str() -> str:  # noqa: ARG001 — placeholder for future profile-tz hook
-    """Reserved for future per-profile timezone hooks.  Currently a no-op
-    so the helper signature can be referenced from docstrings without
-    pulling in a profile branch."""
-    return _server_tz_offset()
 
 
 import http.client
