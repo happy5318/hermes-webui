@@ -74,6 +74,7 @@ let _cronPollSince=10;
 let _cronUnreadCount=1;
 let _cronPollGeneration=0;
 const _cronNewJobIds=new Set(['old-profile-job']);
+const _cronPendingToasts=[];
 global.S={{activeProfile:'default'}};
 global.api=async()=>({{active:'alternate',is_default:false}});
 global.localStorage={{removeItem(){{}}}};
@@ -106,6 +107,7 @@ function _clearCronSessionCompletionUnreadForInactiveProfiles(){{}}
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
 def test_poll_started_before_switch_cannot_recreate_unread_state():
     polling = _extract_function(PANELS_JS, "startCronPolling")
+    tick = _extract_function(PANELS_JS, "_runCronPollTick")
     reset = _extract_function(PANELS_JS, "_resetCronUnreadForProfileSwitch")
     script = f"""
 let _cronPollSince=10;
@@ -113,6 +115,8 @@ let _cronPollTimer=null;
 let _cronUnreadCount=0;
 let _cronPollGeneration=0;
 const _cronNewJobIds=new Set();
+const _cronPendingToasts=[];
+let _cronPollInFlight=false;
 let intervalCallback=null;
 let resolveApi;
 global.document={{hidden:false}};
@@ -123,6 +127,7 @@ global.t=(key)=>key;
 global.updateCronBadge=()=>{{ _cronUnreadCount=_cronNewJobIds.size; }};
 function _clearCronSessionCompletionUnreadForInactiveProfiles(){{}}
 {polling}
+{tick}
 {reset}
 startCronPolling();
 (async()=>{{
@@ -181,6 +186,7 @@ let _cronPollSince=10;
 let _cronUnreadCount=0;
 let _cronPollGeneration=0;
 const _cronNewJobIds=new Set(['old-cron-job']);
+const _cronPendingToasts=[];
 let renders=0;
 global.S={{activeProfile:'profile-a',activeProfileIsDefault:false}};
 global._allSessions=[];
@@ -251,12 +257,15 @@ function _clearSessionCompletionUnread(sid){{
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
 def test_cron_poll_tags_persisted_markers_with_active_profile():
     polling = _extract_function(PANELS_JS, "startCronPolling")
+    tick = _extract_function(PANELS_JS, "_runCronPollTick")
     script = f"""
 let _cronPollSince=10;
 let _cronPollTimer=null;
 let _cronUnreadCount=0;
 let _cronPollGeneration=0;
 const _cronNewJobIds=new Set();
+const _cronPendingToasts=[];
+let _cronPollInFlight=false;
 const markCalls=[];
 let intervalCallback=null;
 global.document={{hidden:false}};
@@ -278,6 +287,7 @@ function _markSessionCompletionUnreadIfBackground(sid, count, meta){{
   markCalls.push([sid, count, meta]);
 }}
 {polling}
+{tick}
 startCronPolling();
 (async()=>{{
   await intervalCallback();
@@ -665,6 +675,7 @@ let _cronPollGeneration=0;
 let _cronPollSince=10;
 let _cronUnreadCount=0;
 const _cronNewJobIds=new Set(['old-job']);
+const _cronPendingToasts=[];
 let _allSessions=[];
 let _allSessionsScope=null;
 let _sidebarReferenceSessions=[];
