@@ -536,3 +536,345 @@ def test_archive_handler_re_resolves_session_under_lock_to_avoid_stale_overwrite
         "(newer) object's composer_draft must survive on disk (issue #7738). "
         f"Got stale-clobbered: {on_disk['composer_draft']!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# PR #7776 Finding 1: /api/session/move must re-run _profiles_match inside
+# the lock with the canonical session's profile, not the stale pre-lock one.
+# ---------------------------------------------------------------------------
+
+
+def test_move_handler_reruns_profile_match_under_lock_for_canonical_session(
+    tmp_path, monkeypatch,
+):
+    """#7776 Finding 1 regression: /api/session/move's pre-lock profile
+    check used the stale, evicted session (issue #7738's exact race), so
+    a profile-beta session resolved pre-lock could be assigned to a
+    profile-alpha project — origin/master would reject this but the
+    stale-PR head returned 200 and persisted the cross-profile move.
+
+    The fix re-runs ``_profiles_match`` inside the lock with the canonical
+    session's profile. This test stages the race:
+      * pre-lock session (returned by ``_get_or_materialize_session``)
+        has profile=alpha (matches the project — pre-lock check passes)
+      * lock acquire swaps the SESSIONS entry to the canonical session
+        with profile=beta (does NOT match the project)
+      * the lock-held re-run must reject with 404
+    """
+    from api import profiles as _profiles_mod
+
+    session_dir = _isolate_session_store(tmp_path, monkeypatch)
+    sid = "stale-move-profile-1"
+    target_pid = "project-alpha-1"
+
+    # Active profile is "alpha" so the request-level
+    # _session_id_visible_to_request_profile guard (api/routes.py:~596)
+    # passes for the alpha-owned session. The fix's #1614 profile-match
+    # gate is the only thing left that can reject the cross-profile move.
+    # routes.py imports get_active_profile_name as _get_active_profile_name
+    # at module load (routes.py:~479), so we must patch the alias to
+    # actually flip the guard's view of the active profile.
+    monkeypatch.setattr(routes, "_get_active_profile_name", lambda: "alpha")
+    monkeypatch.setattr(
+        _profiles_mod, "get_active_profile_name", lambda: "alpha",
+    )
+    # Project belongs to profile=alpha. The pre-lock session will also be
+    # profile=alpha, so the pre-lock check passes; the canonical session
+    # resolved inside the lock is profile=beta and must fail.
+    monkeypatch.setattr(
+        routes, "load_projects",
+        lambda: [
+            {
+                "project_id": target_pid,
+                "name": "Alpha project",
+                "profile": "alpha",
+            },
+        ],
+    )
+
+    # Pre-lock session: profile=alpha (stale, passes pre-lock check).
+    stale = _seed_stale_session(
+        session_dir, sid,
+        title="move title",
+        draft={"text": "pre-lock draft"},
+    )
+    stale.profile = "alpha"
+
+    # Canonical (lock-held) session: profile=beta (should be rejected).
+    newer = _make_newer_session(
+        session_dir, sid,
+        title="move title",
+        draft={"text": "canonical draft"},
+    )
+    newer.profile = "beta"
+
+    monkeypatch.setattr(
+        routes, "_get_or_materialize_session", lambda value: stale,
+    )
+    _install_swap_lock(monkeypatch, sid, swap_with=newer)
+    monkeypatch.setattr(
+        routes, "publish_session_list_changed", lambda *a, **kw: None,
+    )
+    captured = _capture_post(
+        monkeypatch, {"session_id": sid, "project_id": target_pid},
+    )
+
+    result = routes.handle_post(
+        _FakeHandler(
+            b'{"session_id": "' + sid.encode() + b'", "project_id": "' +
+            target_pid.encode() + b'"}',
+        ),
+        SimpleNamespace(path="/api/session/move"),
+    )
+
+    assert result is True, "move handler must claim the request"
+    # The lock-held re-run must reject the cross-profile move with 404.
+    assert captured["status"] == 404, (
+        f"move must reject cross-profile assignment against the canonical "
+        f"session's profile (beta != project alpha); got {captured}"
+    )
+    on_disk = _load_disk_session(session_dir, sid)
+    # The cross-profile project_id must NOT have been written to disk.
+    assert on_disk.get("project_id") in (None, ""), (
+        "a 404 must not persist the cross-profile project_id onto disk; "
+        f"got project_id={on_disk.get('project_id')!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# PR #7776 Finding 2: rename/move/archive must preserve CLI source identity
+# on the on-disk sidecar after the lock-held reload.
+# ---------------------------------------------------------------------------
+
+
+def _seed_sidecar_without_source_meta(
+    session_dir, sid, *, title="cli title",
+    profile="alpha",
+):
+    """Write a sidecar that looks like the bug-state — a WebUI session
+    object that was materialized from CLI/agent metadata but whose
+    ``import_cli_session`` save() ran BEFORE the source-meta assignment,
+    so the on-disk file has the default source identity (is_cli_session
+    False, null source_tag/raw_source/session_source/source_label).
+    """
+    baseline = Session(
+        session_id=sid,
+        title=title,
+        workspace=str(session_dir.parent),
+        messages=[{"role": "user", "content": "hi"}],
+        composer_draft={"text": "baseline draft"},
+        profile=profile,
+    )
+    # Default is_cli_session/source_* — mirrors the import_cli_session
+    # save() output that the materialize path produces.
+    baseline.save()
+    return baseline
+
+
+def test_rename_handler_preserves_cli_source_identity_across_lock_reload(
+    tmp_path, monkeypatch,
+):
+    """#7776 Finding 2: /api/session/rename's lock-held Session.load(sid)
+    must not drop the CLI source identity that the pre-lock
+    ``_get_or_materialize_session`` materialize path established in
+    state.db. The on-disk sidecar after rename must keep
+    ``is_cli_session=True`` + non-null source identity.
+    """
+    from api import profiles as _profiles_mod
+
+    session_dir = _isolate_session_store(tmp_path, monkeypatch)
+    sid = "cli-source-rename-1"
+
+    # Active profile is "alpha" so the request-level
+    # _session_id_visible_to_request_profile guard passes for the
+    # alpha-owned sidecar the test seeds.
+    monkeypatch.setattr(routes, "_get_active_profile_name", lambda: "alpha")
+    monkeypatch.setattr(
+        _profiles_mod, "get_active_profile_name", lambda: "alpha",
+    )
+
+    # Simulate the bug-state sidecar: materialized by import_cli_session
+    # (which saves with default source identity) but NOT yet re-stamped
+    # with the CLI source meta.
+    _seed_sidecar_without_source_meta(session_dir, sid, title="cli title")
+
+    # State.db says this session is a real CLI session. The handler must
+    # re-apply this identity after the lock-held reload.
+    cli_meta = {
+        "session_id": sid,
+        "title": "cli title",
+        "is_cli_session": True,
+        "source_tag": "hermes-cli",
+        "raw_source": "hermes-cli",
+        "session_source": "cli",
+        "source_label": "Hermes CLI",
+    }
+    monkeypatch.setattr(
+        routes, "_lookup_cli_session_metadata",
+        lambda value, *, all_profiles=False: dict(cli_meta),
+    )
+    # Pre-validation must pass: the sidecar exists.
+    captured = _capture_post(
+        monkeypatch, {"session_id": sid, "title": "new title"},
+    )
+    _stub_post_lock_side_effects(monkeypatch)
+
+    result = routes.handle_post(
+        _FakeHandler(
+            b'{"session_id": "' + sid.encode() + b'", "title": "new title"}',
+        ),
+        SimpleNamespace(path="/api/session/rename"),
+    )
+
+    assert result is True, "rename handler must claim the request"
+    assert captured["status"] == 200, f"expected 200, got {captured}"
+    on_disk = _load_disk_session(session_dir, sid)
+    # The CLI source identity must have been re-stamped onto the on-disk
+    # sidecar; otherwise rename silently converted a CLI session into a
+    # WebUI-native one (Finding 2).
+    assert on_disk.get("is_cli_session") is True, (
+        "rename must preserve is_cli_session=True; on-disk "
+        f"is_cli_session={on_disk.get('is_cli_session')!r}"
+    )
+    assert on_disk.get("source_tag") == "hermes-cli", (
+        "rename must preserve source_tag; on-disk "
+        f"source_tag={on_disk.get('source_tag')!r}"
+    )
+    assert on_disk.get("raw_source") == "hermes-cli", (
+        "rename must preserve raw_source; on-disk "
+        f"raw_source={on_disk.get('raw_source')!r}"
+    )
+    assert on_disk.get("source_label") == "Hermes CLI", (
+        "rename must preserve source_label; on-disk "
+        f"source_label={on_disk.get('source_label')!r}"
+    )
+
+
+def test_move_handler_preserves_cli_source_identity_across_lock_reload(
+    tmp_path, monkeypatch,
+):
+    """#7776 Finding 2: /api/session/move must keep CLI source identity
+    on the on-disk sidecar after the lock-held reload.
+    """
+    from api import profiles as _profiles_mod
+
+    session_dir = _isolate_session_store(tmp_path, monkeypatch)
+    sid = "cli-source-move-1"
+    monkeypatch.setattr(routes, "_get_active_profile_name", lambda: "alpha")
+    monkeypatch.setattr(
+        _profiles_mod, "get_active_profile_name", lambda: "alpha",
+    )
+    _seed_sidecar_without_source_meta(session_dir, sid, title="cli title")
+
+    cli_meta = {
+        "session_id": sid,
+        "is_cli_session": True,
+        "source_tag": "cli",
+        "raw_source": "cli",
+        "session_source": "cli",
+        "source_label": "CLI",
+    }
+    monkeypatch.setattr(
+        routes, "_lookup_cli_session_metadata",
+        lambda value, *, all_profiles=False: dict(cli_meta),
+    )
+    monkeypatch.setattr(routes, "load_projects", lambda: [])
+    captured = _capture_post(
+        monkeypatch, {"session_id": sid, "project_id": None},
+    )
+    monkeypatch.setattr(
+        routes, "publish_session_list_changed", lambda *a, **kw: None,
+    )
+
+    result = routes.handle_post(
+        _FakeHandler(b'{"session_id": "' + sid.encode() + b'"}'),
+        SimpleNamespace(path="/api/session/move"),
+    )
+
+    assert result is True, "move handler must claim the request"
+    assert captured["status"] == 200, f"expected 200, got {captured}"
+    on_disk = _load_disk_session(session_dir, sid)
+    assert on_disk.get("is_cli_session") is True, (
+        "move must preserve is_cli_session=True; on-disk "
+        f"is_cli_session={on_disk.get('is_cli_session')!r}"
+    )
+    assert on_disk.get("source_tag") == "cli", (
+        "move must preserve source_tag; on-disk "
+        f"source_tag={on_disk.get('source_tag')!r}"
+    )
+    assert on_disk.get("raw_source") == "cli", (
+        "move must preserve raw_source; on-disk "
+        f"raw_source={on_disk.get('raw_source')!r}"
+    )
+
+
+def test_archive_handler_preserves_cli_source_identity_across_lock_reload(
+    tmp_path, monkeypatch,
+):
+    """#7776 Finding 2: /api/session/archive must keep CLI source identity
+    on the on-disk sidecar after the lock-held reload.
+
+    Archive is the most-affected handler: its own pre-lock materialize
+    fallback (api/routes.py:~17543-17590) uses ``import_cli_session``
+    (which saves WITHOUT source meta) and then mutates the in-memory
+    object without a follow-up save. The lock-held Session.load(sid)
+    reload then reads the source-stripped sidecar. The fix re-stamps
+    CLI source identity after the reload and before the save().
+    """
+    from api import profiles as _profiles_mod
+
+    session_dir = _isolate_session_store(tmp_path, monkeypatch)
+    sid = "cli-source-archive-1"
+    monkeypatch.setattr(routes, "_get_active_profile_name", lambda: "alpha")
+    monkeypatch.setattr(
+        _profiles_mod, "get_active_profile_name", lambda: "alpha",
+    )
+    # Bug-state sidecar: import_cli_session output, default source identity.
+    _seed_sidecar_without_source_meta(session_dir, sid, title="cli title")
+
+    cli_meta = {
+        "session_id": sid,
+        "is_cli_session": True,
+        "source_tag": "hermes-tui",
+        "raw_source": "hermes-tui",
+        "session_source": "tui",
+        "source_label": "Hermes TUI",
+    }
+    monkeypatch.setattr(
+        routes, "_lookup_cli_session_metadata",
+        lambda value, *, all_profiles=False: dict(cli_meta),
+    )
+    monkeypatch.setattr(
+        routes, "_session_is_subagent_view_only", lambda value: False,
+    )
+    captured = _capture_post(
+        monkeypatch, {"session_id": sid, "archived": True},
+    )
+    monkeypatch.setattr(
+        routes, "publish_session_list_changed", lambda *a, **kw: None,
+    )
+    monkeypatch.setattr(routes, "_worktree_retained_payload", lambda s: {})
+
+    result = routes.handle_post(
+        _FakeHandler(
+            b'{"session_id": "' + sid.encode() + b'", "archived": true}',
+        ),
+        SimpleNamespace(path="/api/session/archive"),
+    )
+
+    assert result is True, "archive handler must claim the request"
+    assert captured["status"] == 200, f"expected 200, got {captured}"
+    on_disk = _load_disk_session(session_dir, sid)
+    assert on_disk.get("archived") is True
+    assert on_disk.get("is_cli_session") is True, (
+        "archive must preserve is_cli_session=True; on-disk "
+        f"is_cli_session={on_disk.get('is_cli_session')!r}"
+    )
+    assert on_disk.get("source_tag") == "hermes-tui", (
+        "archive must preserve source_tag; on-disk "
+        f"source_tag={on_disk.get('source_tag')!r}"
+    )
+    assert on_disk.get("raw_source") == "hermes-tui", (
+        "archive must preserve raw_source; on-disk "
+        f"raw_source={on_disk.get('raw_source')!r}"
+    )

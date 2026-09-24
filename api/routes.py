@@ -5576,6 +5576,40 @@ def _get_or_materialize_session(sid: str, *, refresh_cli_messages: bool = False)
     return s
 
 
+def _apply_cli_source_meta_to_session(session, cli_meta):
+    """Apply CLI source identity from ``cli_meta`` onto an in-memory session.
+
+    Mirrors the ``_apply_source_meta`` closure inside ``_get_or_materialize_session``
+    (api/routes.py:~5535) so the rename/move/archive handlers can re-stamp the
+    full source-identity field set on a session that was reloaded via
+    ``Session.load(sid)`` inside their per-session lock.
+
+    #7776 Finding 2: the pre-lock materialization path
+    (``_get_or_materialize_session``) writes a sidecar for the regular
+    CLI/agent branch through ``import_cli_session`` (which saves with default
+    source identity) and then applies source meta to the in-memory object
+    WITHOUT a follow-up ``save()``. The lock-held ``Session.load(sid)`` reload
+    then reads that source-stripped sidecar, and the handler's ``s.save()``
+    persists a WebUI-native copy with ``is_cli_session=False`` + null source
+    identity. Persisting the source meta from the captured ``cli_meta`` BEFORE
+    the lock-held reload — or re-applying it to the freshly loaded session
+    after the reload — closes that gap. This helper does the latter.
+    """
+    if not cli_meta:
+        return
+    session.is_cli_session = is_cli_session_row(cli_meta)
+    session.source_tag = cli_meta.get("source_tag")
+    session.raw_source = cli_meta.get("raw_source") or cli_meta.get("source_tag")
+    session.session_source = cli_meta.get("session_source")
+    session.source_label = cli_meta.get("source_label")
+    session.user_id = cli_meta.get("user_id")
+    session.chat_id = cli_meta.get("chat_id")
+    session.chat_type = cli_meta.get("chat_type")
+    session.thread_id = cli_meta.get("thread_id")
+    session.session_key = cli_meta.get("session_key")
+    session.platform = cli_meta.get("platform")
+
+
 def _share_snapshot_messages_for_session(session, *, cli_meta: dict | None = None) -> list:
     """Return the visible transcript that a public share should snapshot.
 
@@ -16037,6 +16071,11 @@ def handle_post(handler, parsed) -> bool:
             return bad(handler, "Session not found", 404)
         except PermissionError:
             return bad(handler, "Read-only imported sessions cannot be renamed from WebUI", 403)
+        # #7776 Finding 2: capture the CLI source identity BEFORE acquiring
+        # the lock so the lock-held Session.load(sid) reload (which materializes
+        # a brand-new WebUI session without the pre-lock CLI metadata) cannot
+        # drop it on the way back to disk.
+        _rename_cli_meta = _lookup_cli_session_metadata(sid) or {}
         with _get_session_agent_lock(sid):
             with LOCK:
                 latest = SESSIONS.get(sid)
@@ -16052,6 +16091,10 @@ def handle_post(handler, parsed) -> bool:
             s = _ensure_full_session_before_mutation(sid, latest)
             if getattr(s, "read_only", False):
                 return bad(handler, "Read-only imported sessions cannot be renamed from WebUI", 403)
+            # #7776 Finding 2: re-stamp CLI source identity on the freshly
+            # loaded session before mutating it.
+            if _rename_cli_meta:
+                _apply_cli_source_meta_to_session(s, _rename_cli_meta)
             from api.session_ops import apply_session_title_rename
             apply_session_title_rename(s, body["title"])
             s.save()
@@ -17472,6 +17515,11 @@ def handle_post(handler, parsed) -> bool:
         sid = body["session_id"]
         if _session_is_subagent_view_only(sid):
             return bad(handler, "Subagent sessions are view-only and cannot be archived from WebUI", 400)
+        # #7776 Finding 2: capture the CLI source identity BEFORE the lock so
+        # the lock-held Session.load(sid) reload (which materializes a brand
+        # new WebUI session without the pre-lock CLI metadata) cannot drop it
+        # on the way back to disk. The materialize path below also uses it.
+        _archive_cli_meta = _lookup_cli_session_metadata(sid) or {}
         try:
             s = get_session(sid)
             # #1558: save() refuses metadata-only session stubs because their
@@ -17485,7 +17533,7 @@ def handle_post(handler, parsed) -> bool:
                 with LOCK:
                     SESSIONS[sid] = s
         except KeyError:
-            cli_meta = _lookup_cli_session_metadata(sid)
+            cli_meta = _archive_cli_meta
             if not cli_meta:
                 return bad(handler, "Session not found", 404)
             if cli_meta.get("read_only"):
@@ -17565,6 +17613,15 @@ def handle_post(handler, parsed) -> bool:
                 if latest is None:
                     return bad(handler, "Session not found", 404)
             s = _ensure_full_session_before_mutation(sid, latest)
+            # #7776 Finding 2: re-stamp CLI source identity on the freshly
+            # loaded session before mutating it. ``_archive_cli_meta`` was
+            # captured above (before the lock); for the regular CLI/agent
+            # materialize path the on-disk sidecar that Session.load(sid)
+            # just read is the import_cli_session save WITHOUT source meta,
+            # so without this re-stamp the save() below would persist a
+            # WebUI-native copy with is_cli_session=False + null source.
+            if _archive_cli_meta:
+                _apply_cli_source_meta_to_session(s, _archive_cli_meta)
             s.archived = bool(body.get("archived", True))
             s.save(touch_updated_at=False)
             with LOCK:
@@ -17589,33 +17646,35 @@ def handle_post(handler, parsed) -> bool:
         # still answer with a 404 before the lock is acquired. The actual
         # mutation re-resolves INSIDE the lock (see #7738 same-shape fix as
         # /api/session/rename) to avoid saving a stale, evicted object over a
-        # newer save. The 1614 project-ownership authorization below reads
-        # s.profile, which is metadata, so it can use the outside-resolved
-        # session without re-introducing the stale-overwrite hazard.
+        # newer save.
         try:
             s = _get_or_materialize_session(sid)
         except KeyError:
             return bad(handler, "Session not found", 404)
         except PermissionError:
             return bad(handler, "Read-only imported sessions cannot be moved from WebUI", 403)
-        # #1614: refuse moves into a project owned by another profile.
+        # #7776 Finding 1: the pre-lock ``s`` may be stale (issue #7738's
+        # exact race). The 1614 cross-profile authorization MUST be
+        # re-evaluated against the canonical session resolved INSIDE the
+        # lock — using the stale pre-lock ``s.profile`` would let a
+        # profile-beta session be assigned to a profile-alpha project.
+        # We still need ``target_pid`` and the project-not-found 404
+        # outside the lock (so the early-exit is honored), but the
+        # authoritative profile match waits for the canonical session.
         target_pid = body.get("project_id") or None
+        target = None
         if target_pid:
-            # Use the session's own profile for authorization, not the global
-            # active profile. A session belongs to a specific profile set at
-            # creation; projects from that profile should always be assignable,
-            # regardless of which profile is "active" at the process level.
-            # Matches the same principle as the profile chip fix — prefer
-            # session-scoped state over global active profile. (#3325 follow-up)
-            _session_profile = getattr(s, 'profile', None) or get_active_profile_name()
             target = next(
                 (p for p in load_projects() if p["project_id"] == target_pid),
                 None,
             )
             if not target:
                 return bad(handler, "Project not found", 404)
-            if not _profiles_match(target.get("profile"), _session_profile):
-                return bad(handler, "Project not found", 404)
+        # #7776 Finding 2: capture the CLI source identity BEFORE acquiring
+        # the lock so the lock-held reload (which materializes a new WebUI
+        # session via Session.load(sid)) cannot drop it on the way back to
+        # disk. Applied after the reload below.
+        _move_cli_meta = _lookup_cli_session_metadata(sid) or {}
         # #3746: acquire the per-session agent lock with a bounded timeout
         # instead of blocking indefinitely. The streaming thread holds this same
         # lock during checkpoint saves; on slow file I/O (e.g. WSL/DrvFs) a bare
@@ -17646,6 +17705,27 @@ def handle_post(handler, parsed) -> bool:
                 if latest is None:
                     return bad(handler, "Session not found", 404)
             s = _ensure_full_session_before_mutation(sid, latest)
+            # #7776 Finding 2: re-stamp CLI source identity on the freshly
+            # loaded session (the lock-held Session.load(sid) read the
+            # source-stripped sidecar that _get_or_materialize_session's
+            # import_cli_session path produced).
+            if _move_cli_meta:
+                _apply_cli_source_meta_to_session(s, _move_cli_meta)
+            # #7776 Finding 1: re-run the #1614 profile authorization with
+            # the canonical session's profile. The pre-lock check above was
+            # only a 404/404 contract gate; the authoritative cross-profile
+            # move guard runs here, with ``s`` guaranteed to be the resident
+            # object (issue #7738's stale hazard closed).
+            if target_pid:
+                # Use the session's own profile for authorization, not the global
+                # active profile. A session belongs to a specific profile set at
+                # creation; projects from that profile should always be assignable,
+                # regardless of which profile is "active" at the process level.
+                # Matches the same principle as the profile chip fix — prefer
+                # session-scoped state over global active profile. (#3325 follow-up)
+                _session_profile = getattr(s, 'profile', None) or get_active_profile_name()
+                if not _profiles_match(target.get("profile"), _session_profile):
+                    return bad(handler, "Project not found", 404)
             s.project_id = target_pid
             s.save()
             with LOCK:
