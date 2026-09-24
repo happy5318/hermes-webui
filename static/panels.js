@@ -118,14 +118,7 @@ function syncAppTitlebar() {
       // chat UI. Disable autofill / form-fill explicitly so the
       // browser does not surface the "save password" dialog after
       // the user renames a conversation.
-      inp.autocomplete = 'off';
-      inp.setAttribute('autocorrect', 'off');
-      inp.setAttribute('autocapitalize', 'off');
-      inp.setAttribute('spellcheck', 'false');
-      inp.setAttribute('data-1p-ignore', 'true');
-      inp.setAttribute('data-lpignore', 'true');
-      inp.setAttribute('data-bwignore', 'true');
-      inp.setAttribute('data-form-type', 'other');
+      _markNonCredentialInput(inp);
 
       // Prevent click/dblclick on the input from bubbling — we don't want
       // panel switches, session switches, or any other handler firing.

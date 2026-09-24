@@ -4610,6 +4610,8 @@ function _buildSessionRenameStarter(session, displayEl, renderDisplay){
     const inp=document.createElement('input');
     inp.className='session-title-input';
     inp.value=oldTitle;
+    // #7542: chat-title editor in the sidebar, not a credentials field.
+    _markNonCredentialInput(inp);
     ['click','mousedown','dblclick','pointerdown'].forEach(ev=>
       inp.addEventListener(ev, e2=>e2.stopPropagation())
     );
@@ -9380,6 +9382,8 @@ function _startProjectCreate(bar, addBtn){
   const inp=document.createElement('input');
   inp.className='project-create-input';
   inp.placeholder='Project name';
+  // #7542: free-text project-name editor, not a credentials field.
+  _markNonCredentialInput(inp);
   let _finishDone=false;
   const finish=async(save)=>{
     if(_finishDone) return;
@@ -9418,6 +9422,8 @@ function _startProjectRename(proj, chip){
   const inp=document.createElement('input');
   inp.className='project-create-input';
   inp.value=proj.name;
+  // #7542: free-text project-name editor, not a credentials field.
+  _markNonCredentialInput(inp);
   let _finishDone=false;
   const finish=async(save)=>{
     if(_finishDone) return;
