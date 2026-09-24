@@ -1081,3 +1081,128 @@ def test_background_thread_construct_failure_unwinds_registries(monkeypatch):
     tasks = background.get_background_tasks("bg-threadfail-parent")
     assert tasks, "aborted background task must still be tracked"
     assert all(t["status"] != "running" for t in tasks)
+
+
+# ── #7680 finding 3: the requeued wakeup must have a delivery path ──────────
+# Recording the deferred wakeup (finding 1) fixes the LOSS half; nothing
+# delivers it, because drain_deferred_wakeups_for_session's only caller is
+# the turn-teardown hook and a worker that never started has no teardown.
+# The fix schedules ONE bounded daemon-timer retry that calls the drain
+# once the session is idle. These tests pin the schedule + exactly-once
+# behavior with a fake timer (no real sleeps).
+
+
+class _FakeTimer:
+    """Stand-in for threading.Timer: records the delay, fires on demand."""
+
+    instances: list = []
+
+    def __init__(self, delay, fn, args=()):
+        self.delay = delay
+        self.fn = fn
+        self.args = args
+        self.started = False
+        self.cancelled = False
+        self.daemon = False
+        _FakeTimer.instances.append(self)
+
+    def start(self):
+        self.started = True
+
+    def cancel(self):
+        self.cancelled = True
+
+    def is_alive(self):
+        return self.started and not self.cancelled
+
+
+@pytest.fixture
+def _fake_timer(monkeypatch):
+    _FakeTimer.instances = []
+    monkeypatch.setattr(routes.threading, "Timer", _FakeTimer)
+    yield _FakeTimer.instances
+    # Sweep any pending handles so a late fire can't touch shared state.
+    for t in list(routes._DEFERRED_WAKEUP_RETRY_TIMERS.values()):
+        try:
+            t.cancel()
+        except Exception:
+            pass
+    routes._DEFERRED_WAKEUP_RETRY_TIMERS.clear()
+
+
+def test_launch_abort_schedules_bounded_wakeup_retry(monkeypatch, _fake_timer):
+    """#7680 finding 3: a launch abort on a process-wakeup path must schedule
+    exactly one bounded drain retry — the deferred prompt has a delivery
+    path even though the worker never started (no teardown will fire)."""
+    s = _make_session("wakeup-retry")
+    drain_calls = []
+
+    import api.background_process as bp
+
+    monkeypatch.setattr(
+        bp, "drain_deferred_wakeups_for_session",
+        lambda sid: drain_calls.append(sid) or 0,
+    )
+    # Not busy: the retry drain must actually be able to fire.
+    monkeypatch.setattr(bp, "_session_has_active_turn", lambda sid: False)
+
+    routes._rearm_process_wakeup_after_launch_failure(
+        s,
+        "wakeup-retry",
+        "stream-wakeup-retry",
+        pending_user_message="[bg complete] task_id=proc-1 result=done",
+    )
+
+    assert len(_fake_timer) == 1, (
+        f"launch abort must schedule exactly one bounded retry, got {len(_fake_timer)}"
+    )
+    timer = _fake_timer[0]
+    assert timer.started, "the retry timer must be started"
+    assert timer.daemon, "the retry timer must not block interpreter exit"
+    assert 0 < timer.delay <= 30, f"retry delay must be short, got {timer.delay}"
+
+    # The prompt is recorded AND the retry is registered on the module map.
+    entries = bp.claim_deferred_wakeups("wakeup-retry")
+    assert len(entries) == 1, "the wakeup prompt must stay queued for the retry"
+    assert "proc-1" in str(entries[0].get("wakeup_prompt") or "")
+
+    # A second abort while the first retry is still pending coalesces.
+    routes._rearm_process_wakeup_after_launch_failure(
+        s,
+        "wakeup-retry",
+        "stream-wakeup-retry",
+        pending_user_message="[bg complete] task_id=proc-1 result=done",
+    )
+    assert len(_fake_timer) == 1, "a pending retry must not be duplicated"
+
+
+def test_wakeup_retry_drains_once_and_does_not_loop(monkeypatch, _fake_timer):
+    """#7680 finding 3: when the timer fires, it drains exactly once and drops
+    its handle — if the retry's own launch fails, the drain re-defers the
+    prompt but nothing reschedules, so there is no retry loop."""
+    s = _make_session("wakeup-retry-fire")
+    drain_calls = []
+
+    import api.background_process as bp
+
+    monkeypatch.setattr(
+        bp, "drain_deferred_wakeups_for_session",
+        lambda sid: drain_calls.append(sid) or 0,
+    )
+
+    routes._rearm_process_wakeup_after_launch_failure(
+        s,
+        "wakeup-retry-fire",
+        "stream-wakeup-retry-fire",
+        pending_user_message="[bg complete] task_id=proc-2 result=done",
+    )
+    timer = _fake_timer[0]
+
+    # Fire the timer body directly (the fake timer only records).
+    timer.fn(*timer.args)
+
+    assert drain_calls == ["wakeup-retry-fire"], (
+        f"the retry must drain exactly once, got {drain_calls!r}"
+    )
+    # The handle is dropped: a later fire cannot re-enter the drain.
+    assert "wakeup-retry-fire" not in routes._DEFERRED_WAKEUP_RETRY_TIMERS

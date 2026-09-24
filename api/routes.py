@@ -23362,6 +23362,64 @@ def _provisional_title_from_prompt(prompt: str, fallback: str = "Untitled") -> s
 _RETAINED_CONTEXT_USER_UNSET = object()
 
 
+# One-shot bounded retry for a deferred process-wakeup whose worker never
+# started (#7680 finding 3). Maps sid → the live threading.Timer so repeated
+# aborts for one session coalesce into a single pending retry.
+_DEFERRED_WAKEUP_RETRY_TIMERS: dict = {}
+_DEFERRED_WAKEUP_RETRY_TIMERS_LOCK = threading.Lock()
+_DEFERRED_WAKEUP_RETRY_DELAY_SECS = 2.0
+
+
+def _schedule_deferred_wakeup_retry(sid: str) -> None:
+    """Schedule ONE bounded drain retry for a launch-aborted wakeup (#7680).
+
+    The recording call site (``_rearm_process_wakeup_after_launch_failure``)
+    runs on a request thread; the retry must not block it. A short-delay
+    daemon ``threading.Timer`` fires ``drain_deferred_wakeups_for_session``
+    once — the drain itself is the bounded operation: it no-ops while the
+    session has an active turn, claims atomically (so a racing real next
+    turn cannot double-deliver), and on its own launch failure re-defers the
+    prompt without rescheduling. One-shot, no loop.
+
+    Coalescing: if a retry is already pending for this session, keep it —
+    one drain delivers one wakeup, and the prompt is queued either way.
+    """
+    if not sid:
+        return
+    try:
+        with _DEFERRED_WAKEUP_RETRY_TIMERS_LOCK:
+            existing = _DEFERRED_WAKEUP_RETRY_TIMERS.get(sid)
+            if existing is not None and existing.is_alive():
+                return  # one pending retry is enough — the prompt is queued
+            timer = __import__("threading").Timer(
+                _DEFERRED_WAKEUP_RETRY_DELAY_SECS,
+                _run_deferred_wakeup_retry,
+                args=(sid,),
+            )
+            timer.daemon = True
+            _DEFERRED_WAKEUP_RETRY_TIMERS[sid] = timer
+        timer.start()
+    except Exception:
+        logger.debug(
+            "Failed to schedule deferred-wakeup retry for session %s", sid,
+            exc_info=True,
+        )
+
+
+def _run_deferred_wakeup_retry(sid: str) -> None:
+    """Timer body: drain once, then drop the timer handle (#7680)."""
+    try:
+        with _DEFERRED_WAKEUP_RETRY_TIMERS_LOCK:
+            _DEFERRED_WAKEUP_RETRY_TIMERS.pop(sid, None)
+        from api.background_process import drain_deferred_wakeups_for_session
+
+        drain_deferred_wakeups_for_session(sid)
+    except Exception:
+        logger.debug(
+            "Deferred-wakeup retry drain failed for session %s", sid, exc_info=True,
+        )
+
+
 def _rearm_process_wakeup_after_launch_failure(
     s,
     sid: str,
@@ -23426,6 +23484,20 @@ def _rearm_process_wakeup_after_launch_failure(
             logger.debug(
                 "Failed to record deferred wakeup for session %s", sid, exc_info=True,
             )
+        # ── Finding 3 (SILENT, maintainer 9/24): schedule the delivery ──
+        # Recording the prompt only fixes the LOSS half: nothing delivers it,
+        # because ``drain_deferred_wakeups_for_session`` has exactly one
+        # caller — the turn-teardown hook (api/streaming.py:14282) — and a
+        # worker that never started has no teardown. With an autonomous agent
+        # there is no next user turn either, so the wakeup would sit in the
+        # in-memory queue until the user types something (or is lost on
+        # restart). Schedule ONE bounded retry off the request thread: a
+        # short-delay daemon timer that drains once the session is idle.
+        # ``claim_deferred_wakeups`` pops atomically, so the retry racing a
+        # real next turn cannot double-deliver; if the retry's own launch
+        # fails too, the leave-queued path inside the drain re-defers the
+        # prompt and this timer is one-shot (no loop).
+        _schedule_deferred_wakeup_retry(sid)
     # Re-arm the bare PENDING_BG_TASK_COMPLETIONS marker too (preserved
     # behavior for any drain path that does not consult
     # DEFERRED_PROCESS_WAKEUPS).
