@@ -26,6 +26,7 @@ one of those sites.
 """
 
 import threading
+import time
 from unittest.mock import Mock
 
 import pytest
@@ -60,6 +61,27 @@ def _make_session(sid: str) -> Session:
     s = Session(session_id=sid, messages=[])
     models.SESSIONS[sid] = s
     return s
+
+
+def _reset_cfg_state() -> None:
+    """Clear the process-wakeup / deferred-wakeup shared state for a test.
+
+    Local copy of the helper in ``tests/test_wakeup_defer_race.py`` so the
+    launch-abort file stays self-contained: the wakeup retry path reads
+    ``DEFERRED_PROCESS_WAKEUPS``, ``PENDING_BG_TASK_COMPLETIONS`` and
+    ``ACTIVE_RUNS`` from ``api.config`` and a stale row from another test
+    would make the exactly-once assertions flaky.
+    """
+    from api import config as _cfg
+
+    if hasattr(_cfg, "ACTIVE_RUNS"):
+        with _cfg.ACTIVE_RUNS_LOCK:
+            _cfg.ACTIVE_RUNS.clear()
+    with _cfg.STREAMS_LOCK:
+        _cfg.STREAMS.clear()
+    _cfg.PENDING_BG_TASK_COMPLETIONS.clear()
+    with _cfg.DEFERRED_PROCESS_WAKEUPS_LOCK:
+        _cfg.DEFERRED_PROCESS_WAKEUPS.clear()
 
 
 def test_save_throw_after_register_clears_writeback_owner(monkeypatch):
@@ -1206,3 +1228,244 @@ def test_wakeup_retry_drains_once_and_does_not_loop(monkeypatch, _fake_timer):
     )
     # The handle is dropped: a later fire cannot re-enter the drain.
     assert "wakeup-retry-fire" not in routes._DEFERRED_WAKEUP_RETRY_TIMERS
+
+
+# ── #7680 finding 3 (maintainer's required regression tests) ────────────────
+# The maintainer asked for BEHAVIORAL proof, not just schedule inspection:
+#   1) inject a worker-start failure on a process-wakeup launch, send NO
+#      further user turn, assert exactly one wakeup turn runs within the
+#      retry window.
+#   2) make the retry's launch fail too, and assert the prompt stays queued
+#      with no infinite retry and no second wakeup turn.
+#
+# Both drive the REAL retry path end-to-end: a real daemon timer (patched to
+# fire instantly) + the real `drain_deferred_wakeups_for_session` claiming a
+# real `DEFERRED_PROCESS_WAKEUPS` entry. Only `start_session_turn` is faked,
+# exactly like tests/test_wakeup_defer_race.py does.
+
+
+class _InstantTimer:
+    """threading.Timer stand-in that fires its body immediately on start()."""
+
+    instances: list = []
+
+    def __init__(self, delay, fn, args=(), kwargs=None):
+        self.delay = delay
+        self.fn = fn
+        self.args = args
+        self.kwargs = kwargs or {}
+        self.daemon = False
+        self.cancelled = False
+        self.fired = False
+        _InstantTimer.instances.append(self)
+
+    def start(self):
+        self.fired = True
+        # Real timers run the body on a separate thread; do the same so the
+        # drain's own daemon thread can race the assertions the way it does
+        # in production (the tests wait on holder["event"] afterwards).
+        threading.Thread(target=self.fn, args=self.args, kwargs=self.kwargs,
+                         daemon=True).start()
+
+    def cancel(self):
+        self.cancelled = True
+
+    def is_alive(self):
+        return self.fired and not self.cancelled
+
+
+def _install_wakeup_launch(monkeypatch, sid, *, fail_launch):
+    """Patch ``api.routes.start_session_turn`` so a wakeup launch can fail.
+
+    The drain helper resolves ``start_session_turn`` from ``api.routes``
+    inside its daemon thread, so patching the attribute there is what that
+    thread picks up at call time.
+
+    Returns the holder recording every attempted wakeup turn.
+    """
+    holder = {"calls": [], "event": threading.Event()}
+
+    def _fake_start_session_turn(session_id, message, *, source="process_wakeup"):
+        holder["calls"].append(
+            {"session_id": session_id, "message": message, "source": source}
+        )
+        holder["event"].set()
+        if fail_launch is not None and fail_launch():
+            # A worker-start failure surfaces as a raised exception OR a 5xx
+            # response; the drain's `_start_server_side_wakeup_turn` runner
+            # catches the raise and only re-defers on a 409, so model the
+            # hard-fail as a raise to prove the retry leaves the prompt
+            # queued rather than looping.
+            raise RuntimeError("worker start failed")
+        return {"stream_id": "wakeup-stream", "session_id": session_id, "_status": 200}
+
+    monkeypatch.setattr(routes, "start_session_turn", _fake_start_session_turn)
+    return holder
+
+
+def test_abort_retry_delivers_one_wakeup_turn_with_no_user_turn(monkeypatch):
+    """Required regression test 1: worker start fails on a process-wakeup
+    launch → NO further user turn → exactly one wakeup turn runs.
+
+    The session must be genuinely idle (no ACTIVE_RUNS, no STREAMS) so the
+    scheduled retry's drain can actually start the wakeup turn. The retry
+    timer is patched to fire instantly, so the wait is bounded and the
+    test never sleeps on a real 2s clock.
+    """
+    from api import background_process as bp
+    from api import config as _cfg
+
+    sid = "wakeup-e2e-deliver"
+    _reset_cfg_state()
+    holder = _install_wakeup_launch(monkeypatch, sid, fail_launch=None)
+
+    # Instant retry + an idle session: the retry must be able to fire.
+    _InstantTimer.instances = []
+    monkeypatch.setattr(routes.threading, "Timer", _InstantTimer)
+    monkeypatch.setattr(bp, "_session_has_active_turn", lambda _sid: False)
+
+    s = _make_session(sid)
+    s.pending_user_message = (
+        "[IMPORTANT: Background process proc-e2e-1 completed (exit_code=0).\n"
+        "Command: sleep 1\n"
+        "Output:\ndone]"
+    )
+    s.active_stream_id = "stream-e2e-deliver"
+
+    try:
+        # The launch abort: the worker never started, the prompt was recorded
+        # as deferred, and the retry timer was scheduled (and fired).
+        routes._cleanup_chat_start_launch_failure(
+            s,
+            "stream-e2e-deliver",
+            reset_session=True,
+            lock_held=False,
+            preserve_wakeup=True,
+        )
+
+        assert _InstantTimer.instances, (
+            "launch abort must schedule a bounded wakeup retry (#7680 finding 3)"
+        )
+
+        # Exactly one wakeup turn runs, with NO further user turn.
+        assert holder["event"].wait(timeout=3.0), (
+            "no wakeup turn ran within the retry window — the deferred "
+            "wakeup is still undelivered (the 9/24 maintainer finding)"
+        )
+        # Give any spurious second delivery a chance to (correctly) not happen.
+        import time as _t
+
+        _t.sleep(0.25)
+        assert len(holder["calls"]) == 1, (
+            f"expected exactly ONE wakeup turn, got {len(holder['calls'])}: "
+            f"{holder['calls']!r} — the retry double-delivered"
+        )
+        call = holder["calls"][0]
+        assert call["session_id"] == sid
+        assert call["source"] == "process_wakeup"
+        assert "proc-e2e-1" in call["message"]
+
+        # The claimed prompt is gone: nothing left for another turn.
+        assert bp.drain_deferred_wakeups_for_session(sid) == 0
+        assert len(holder["calls"]) == 1, (
+            "a subsequent drain fired a second wakeup turn — not exactly-once"
+        )
+        with _cfg.DEFERRED_PROCESS_WAKEUPS_LOCK:
+            assert sid not in _cfg.DEFERRED_PROCESS_WAKEUPS
+    finally:
+        with routes._DEFERRED_WAKEUP_RETRY_TIMERS_LOCK:
+            routes._DEFERRED_WAKEUP_RETRY_TIMERS.pop(sid, None)
+        _reset_cfg_state()
+
+
+def test_abort_retry_failure_keeps_prompt_queued_and_does_not_loop(monkeypatch):
+    """Required regression test 2: the retry's own wakeup launch ALSO fails.
+
+    The prompt must STAY queued (so a later real turn or teardown can still
+    deliver it), the retry must not reschedule (no infinite loop), and no
+    second wakeup turn may run.
+    """
+    from api import background_process as bp
+    from api import config as _cfg
+
+    sid = "wakeup-e2e-fail1"
+    _reset_cfg_state()
+
+    launch_attempts = {"n": 0}
+
+    def _fail_launch():
+        launch_attempts["n"] += 1
+        return True  # every launch attempt fails
+
+    holder = _install_wakeup_launch(monkeypatch, sid, fail_launch=_fail_launch)
+
+    _InstantTimer.instances = []
+    monkeypatch.setattr(routes.threading, "Timer", _InstantTimer)
+    monkeypatch.setattr(bp, "_session_has_active_turn", lambda _sid: False)
+
+    s = _make_session(sid)
+    s.pending_user_message = (
+        "[IMPORTANT: Background process proc-e2e-2 completed (exit_code=1).\n"
+        "Command: ls /nope\n"
+        "Output:\nfailed]"
+    )
+    s.active_stream_id = "stream-e2e-fail1"
+
+    try:
+        routes._cleanup_chat_start_launch_failure(
+            s,
+            "stream-e2e-fail1",
+            reset_session=True,
+            lock_held=False,
+            preserve_wakeup=True,
+        )
+
+        assert _InstantTimer.instances, "launch abort must schedule one retry"
+        assert holder["event"].wait(timeout=3.0), (
+            "the retry never attempted the wakeup launch"
+        )
+
+        # The retry's launch failed. Assert the two maintainer requirements:
+        #  (a) the prompt is still queued for a later delivery, and
+        #  (b) nothing rescheduled / looped.
+        def _requeued():
+            with _cfg.DEFERRED_PROCESS_WAKEUPS_LOCK:
+                return bool(_cfg.DEFERRED_PROCESS_WAKEUPS.get(sid))
+
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and not _requeued():
+            time.sleep(0.02)
+
+        assert _requeued(), (
+            "the failed retry DROPPED the prompt — it must stay queued so a "
+            "later real turn / teardown can still deliver it (#7680 finding 3)"
+        )
+        with _cfg.DEFERRED_PROCESS_WAKEUPS_LOCK:
+            entries = list(_cfg.DEFERRED_PROCESS_WAKEUPS.get(sid) or [])
+        assert len(entries) == 1, (
+            f"expected exactly one requeued prompt, got {len(entries)} — the "
+            "retry duplicated the deferred entry"
+        )
+        assert "proc-e2e-2" in str(entries[0].get("wakeup_prompt") or "")
+
+        # No loop: no second timer, no second launch attempt beyond the one
+        # bounded retry (plus nothing further once its handle was dropped).
+        import time as _t
+
+        _t.sleep(0.3)
+        assert launch_attempts["n"] == 1, (
+            f"expected exactly ONE launch attempt, got {launch_attempts['n']} — "
+            "the retry looped after its own failure"
+        )
+        assert len(_InstantTimer.instances) == 1, (
+            "the failed retry scheduled another timer — unbounded retry loop"
+        )
+        with routes._DEFERRED_WAKEUP_RETRY_TIMERS_LOCK:
+            assert sid not in routes._DEFERRED_WAKEUP_RETRY_TIMERS, (
+                "the fired retry kept its timer handle — it can re-enter the "
+                "drain and loop"
+            )
+    finally:
+        with routes._DEFERRED_WAKEUP_RETRY_TIMERS_LOCK:
+            routes._DEFERRED_WAKEUP_RETRY_TIMERS.pop(sid, None)
+        _reset_cfg_state()
