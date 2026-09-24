@@ -2466,30 +2466,112 @@ def get_picker_excludes(provider_id: str | None = None) -> set[str]:
         canonical = _resolve_provider_alias(pid) or pid
     except Exception:
         pass
-    # First try the direct keys (canonical, then the user's input
-    # form which may itself be an alias like ``z.ai``).
+    # UNION across every stored key that resolves to the requested
+    # canonical, rather than returning the first match. A user who
+    # imported a settings.json (or edited it by hand) can easily end
+    # up with BOTH ``zai`` and ``z.ai`` keys present, each carrying a
+    # different slice of hides. Returning on the first hit silently
+    # ignored the other list and resurrected the models it named —
+    # the exact resurrection path this policy exists to close.
+    # The direct keys (canonical, then the caller's input form which
+    # may itself be an alias) are included in the union rather than
+    # short-circuiting it.
+    keys_to_union: list[object] = []
+    seen: set[str] = set()
     for key in (canonical, pid):
-        if key in raw:
-            return _clean_ids(raw.get(key))
-    # Second, scan every stored key and pick the first whose alias
-    # resolution matches the requested canonical. Catches cases where
-    # the user stored under an alias that resolves to the same
-    # canonical (e.g. stored=``{"z.ai": [...]}``, requested=``"zai"``).
-    # Always run this scan — even when ``canonical == pid`` the user
-    # may have stored under an alternative alias of the same canonical
-    # (e.g. ``z.ai`` when both the request and the table are already
-    # canonical). Skip only on direct-key hit (handled above).
+        if key in raw and key not in seen:
+            seen.add(key)
+            keys_to_union.append(key)
     for stored_key in raw:
         if not isinstance(stored_key, str):
             continue
-        if stored_key in (canonical, pid):
-            continue  # already covered by the direct-key loop above
+        if stored_key in seen:
+            continue
         try:
             if _resolve_provider_alias(stored_key) == canonical:
-                return _clean_ids(raw.get(stored_key))
+                seen.add(stored_key)
+                keys_to_union.append(stored_key)
         except Exception:
             continue
-    return set()
+    if not keys_to_union:
+        return set()
+    result_ids: set[str] = set()
+    for key in keys_to_union:
+        result_ids |= _clean_ids(raw.get(key))
+    return result_ids
+
+
+def _picker_excludes_payload() -> dict:
+    """Return the raw ``picker_excludes`` settings map for API payloads.
+
+    Unlike ``get_picker_excludes()`` (which resolves a single provider's
+    set, unioning alias-equivalent keys), this returns the *stored*
+    dict — the same shape the user saved — so the browser can apply the
+    exact same policy locally when it would otherwise re-inject an option
+    the server-side filter removed. Returns ``{}`` on any read failure so
+    the field is always a JSON object for the client.
+    """
+    try:
+        raw = load_settings().get("picker_excludes")
+    except Exception:
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, list[str]] = {}
+    for pid, ids in raw.items():
+        if not isinstance(pid, str) or not pid.strip() or not isinstance(ids, list):
+            continue
+        cleaned = [
+            entry.strip()
+            for entry in ids
+            if isinstance(entry, str) and entry.strip()
+        ]
+        if cleaned:
+            out[pid.strip()] = cleaned
+    return out
+
+
+def _strip_provider_prefix_from_model_id(model_id: object) -> str:
+    """Return *model_id* with a complete ``@provider:`` prefix stripped.
+
+    Provider ids themselves can contain colons — a named custom provider is
+    ``custom:<slug>`` — so the prefix boundary is NOT the first colon after
+    the ``@``. Walk the colon boundaries from the LONGEST candidate prefix
+    inward and accept the first one that names a real provider (a known
+    static provider, a plugin provider, a ``custom:``-style named slug, or
+    an alias of any of those):
+
+    * ``@custom:alpha:chat-a`` → ``chat-a`` (prefix ``custom:alpha``)
+    * ``@openrouter:gpt-5.6-luna`` → ``gpt-5.6-luna`` (``openrouter``)
+    * ``@opencode-zen:vendor/model:1`` → ``vendor/model:1`` when the model
+      id itself contains a colon and the full prefix is a known provider
+
+    When no boundary names a real provider (unknown slug, no registry
+    entry) the generic ``@<first segment>:`` form is stripped as a last
+    resort, preserving the historical behaviour for plain
+    ``@provider:model`` values. Values that do not start with ``@`` or
+    carry no colon at all are returned unchanged.
+    """
+    raw = str(model_id or "").strip()
+    if not raw.startswith("@") or ":" not in raw:
+        return raw
+    body = raw[1:]
+    boundaries = [i for i, ch in enumerate(body) if ch == ":"]
+    for index in reversed(boundaries):  # longest (most specific) prefix first
+        candidate = body[:index].strip()
+        if not candidate:
+            continue
+        if _is_known_model_provider(candidate):
+            return body[index + 1 :].strip()
+        try:
+            resolved = _resolve_provider_alias(candidate)
+        except Exception:
+            resolved = ""
+        if resolved and resolved != candidate and _is_known_model_provider(resolved):
+            return body[index + 1 :].strip()
+    # Unknown provider id: fall back to stripping the FIRST colon-delimited
+    # segment only (historical behaviour for plain ``@provider:model``).
+    return body.split(":", 1)[1].strip()
 
 
 def _is_model_id_excluded(model_id: object, exclude_set: set[str]) -> bool:
@@ -2500,6 +2582,20 @@ def _is_model_id_excluded(model_id: object, exclude_set: set[str]) -> bool:
     same exclude entry filters the model out regardless of whether it
     is rendered as the active-provider option or a cross-provider
     option. Case-preserving.
+
+    The prefix strip is **provider-id aware**: ``@custom:alpha:chat-a``
+    is split at the complete ``@custom:alpha:`` boundary, not at the
+    first colon, so an exclusion for the bare ``chat-a`` id still
+    matches a named-custom-provider rendering.
+
+    #7507: the ``provider/model`` slash form is also matched — that is
+    the shape Hermes config's ``model.default`` uses
+    (``custom:alpha/chat-a``), and the default-model re-injection guard
+    compares this value directly. Stripping only a KNOWN provider
+    prefix keeps ids whose model half legitimately contains slashes
+    intact (e.g. ``openrouter/anthropic/claude`` is only stripped when
+    ``openrouter`` is a known provider and the remainder still matches
+    an exclude entry).
     """
     if not exclude_set or not model_id:
         return False
@@ -2509,9 +2605,21 @@ def _is_model_id_excluded(model_id: object, exclude_set: set[str]) -> bool:
     if raw in exclude_set:
         return True
     if raw.startswith("@") and ":" in raw:
-        bare = raw.split(":", 1)[1].strip()
+        bare = _strip_provider_prefix_from_model_id(raw)
         if bare and bare in exclude_set:
             return True
+    # ``provider/model`` slash form (config ``model.default`` shape):
+    # compare the bare model half against the exclude set too.
+    if "/" in raw:
+        head, _, tail = raw.partition("/")
+        if head and tail:
+            if tail in exclude_set:
+                return True
+            try:
+                if _is_known_model_provider(head.strip()) and tail.strip() in exclude_set:
+                    return True
+            except Exception:
+                pass
     return False
 
 
@@ -7179,24 +7287,49 @@ def _minimal_static_models_catalog() -> dict:
         default_model = get_effective_default_model(cfg)
         groups: list[dict] = []
         if default_model:
-            try:
-                label = _get_label_for_model(default_model, [])
-            except Exception:
-                label = default_model
-            groups.append(
-                {
-                    "provider": "Default",
-                    "provider_id": active_provider or "default",
-                    "models": [{"id": default_model, "label": label}],
-                }
-            )
-        return _annotate_fast_tier_model_groups({
+            # #7507: honour the per-provider picker exclude list even on
+            # this emergency fallback path. Without the check, every
+            # "no groups detected" / rebuild-timeout response re-inserts
+            # the default model the user explicitly hid — the fallback
+            # resurrects the excluded id on every cold /api/models call.
+            if not _is_model_id_excluded(
+                default_model, get_picker_excludes(active_provider)
+            ):
+                try:
+                    label = _get_label_for_model(default_model, [])
+                except Exception:
+                    label = default_model
+                groups.append(
+                    {
+                        "provider": "Default",
+                        "provider_id": active_provider or "default",
+                        "models": [{"id": default_model, "label": label}],
+                    }
+                )
+        payload = {
             "active_provider": active_provider,
             "default_model": default_model,
             "configured_model_badges": {},
             "groups": groups,
             "aliases": {},
-        })
+            # #7507: ship the raw policy map so the browser's re-injection
+            # paths honour the same excludes as the server-side filter.
+            "picker_excludes": _picker_excludes_payload(),
+        }
+        # #7507: when the ONLY candidate (the default model) is excluded,
+        # surface an explicit no-eligible-model state so the browser can
+        # render "no models" instead of silently snapping to a phantom
+        # row. ``no_eligible_models`` is additive — clients that don't
+        # know the flag ignore it, and the empty ``groups`` already
+        # renders an empty picker.
+        if default_model and not groups:
+            payload["no_eligible_models"] = True
+            logger.debug(
+                "minimal static catalog: default model %r is excluded by the "
+                "per-provider picker policy (#7507); returning an empty group set",
+                default_model,
+            )
+        return _annotate_fast_tier_model_groups(payload) or payload
     except Exception:
         logger.debug("minimal static models catalog build failed", exc_info=True)
         return {
@@ -7621,6 +7754,9 @@ def _static_models_catalog_without_live_probes() -> dict:
             ),
             "groups": groups,
             "aliases": model_aliases,
+            # #7507: ship the raw policy map so the browser's re-injection
+            # paths honour the same excludes as the server-side filter.
+            "picker_excludes": _picker_excludes_payload(),
         })
     except Exception:
         logger.debug("static models catalog build failed", exc_info=True)
@@ -8121,11 +8257,19 @@ def _models_cache_source_fingerprint() -> dict:
     one of those rewrites (RCA t_16551f61). config.yaml keeps the cheap
     mtime/size fingerprint because it is only rewritten on deliberate user
     edits (which can change anything) and does not churn on a timer.
+
+    The ``picker_excludes`` axis (#7507) closes the last resurrection
+    path: the policy lives in the WebUI settings store, whose mtime is
+    NOT tracked by any other axis here. A catalog cached before a
+    ``picker_excludes`` save (24h TTL) would otherwise keep serving an
+    excluded model long after the save, because ``load_settings()`` was
+    never part of the cache identity.
     """
     return {
         "config_yaml": _models_cache_file_fingerprint(_get_config_path()),
         "auth_json": _auth_store_semantic_fingerprint(_get_auth_store_path()),
         "catalog": _models_cache_catalog_fingerprint(),
+        "picker_excludes": _picker_excludes_payload(),
     }
 
 
@@ -10284,6 +10428,11 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
             "configured_model_badges": _build_configured_model_badges(),
             "groups": groups,
             "aliases": model_aliases,
+            # #7507: ship the raw policy map so the browser can apply the
+            # same excludes when it would otherwise re-inject an option
+            # (boot default, previous pick, synthesized fallback rows)
+            # server-side filtering never sees.
+            "picker_excludes": _picker_excludes_payload(),
         }
 
     # ── FAST PATH ─────────────────────────────────────────────────────────────
@@ -10462,6 +10611,11 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
 
         # Legacy synchronous (unbounded) rebuild — opt-in via budget<=0.
         if _LIVE_REBUILD_BUDGET_SECONDS <= 0:
+            # Capture the picker-excludes policy identity BEFORE the build so
+            # the straddle guard below can discard a result whose policy
+            # changed mid-build (#7507 finding 5 — same guard as the bounded
+            # path, which captures its own before the worker runs).
+            _build_policy_identity = _models_cache_source_fingerprint()
             try:
                 # Foreground thread already carries the request-profile TLS;
                 # apply the mirrored profile env (no-op for default) for the
@@ -10480,6 +10634,18 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                     _cache_build_in_progress = False
                     _cache_build_cv.notify_all()
                 raise
+            # #7507: same straddle guard as the bounded path below — a result
+            # built before a picker-excludes change must not be published with
+            # a fingerprint that claims it is current.
+            if _models_cache_source_fingerprint() != _build_policy_identity:
+                logger.debug(
+                    "discarding legacy models rebuild result: picker_excludes "
+                    "changed while the build was running (#7507)",
+                )
+                with _cache_build_cv:
+                    _cache_build_in_progress = False
+                    _cache_build_cv.notify_all()
+                return copy.deepcopy(_minimal_static_models_catalog())
             with _cache_build_cv:
                 published_at = time.monotonic()
                 _available_models_cache = result
@@ -10523,11 +10689,37 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
         budget_exceeded = threading.Event()
         publish_lock = threading.Lock()
         box: dict = {}
+        # #7507: snapshot the full source identity (which now includes the
+        # picker-excludes axis) at build-start. A build that straddles a
+        # policy change is discarded in _publish_models_result instead of
+        # being published with a congruent fingerprint.
+        _build_policy_identity = _models_cache_source_fingerprint()
 
         def _publish_models_result(result):
+            """Publish *result* unless the policy changed while it was built.
+
+            Returns True when the result was published, False when it was
+            discarded (policy straddle) so the caller can serve a
+            policy-honouring fallback instead of the stale catalog.
+            """
             global _cache_build_in_progress, _available_models_cache
             global _available_models_cache_ts, _available_models_live_rebuild_ts
             global _available_models_cache_source_fingerprint
+            # #7507: capture the policy BEFORE publishing. The rebuild above
+            # ran (possibly for seconds, off-thread) under the policy as it
+            # was when the build started; if ``picker_excludes`` changed in
+            # the meantime the result is stale by construction. Publishing it
+            # with a fingerprint stamped only now would make the very next
+            # request pass the fingerprint check and re-receive an excluded
+            # model for up to the TTL — so the result is dropped and the next
+            # caller rebuilds against the current policy.
+            if _models_cache_source_fingerprint() != _build_policy_identity:
+                logger.debug(
+                    "discarding models rebuild result: picker_excludes changed "
+                    "while the build was running (#7507)",
+                )
+                _clear_build_in_progress()
+                return False
             with _cache_build_cv:
                 published_at = time.monotonic()
                 _available_models_cache = result
@@ -10545,6 +10737,7 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                 with _cache_build_cv:
                     _cache_build_in_progress = False
                     _cache_build_cv.notify_all()
+            return True
 
         def _clear_build_in_progress():
             global _cache_build_in_progress
@@ -10603,8 +10796,14 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
             if "error" in box:
                 _clear_build_in_progress()
                 raise box["error"]
+            published = False
             if _claim_publish():
-                _publish_models_result(box["result"])
+                published = _publish_models_result(box["result"])
+            if not published:
+                # #7507: the result was built under a superseded policy —
+                # serve the exclusion-aware fallback rather than the stale
+                # catalog the user just edited.
+                return copy.deepcopy(_static_models_catalog_without_live_probes())
             return copy.deepcopy(box["result"])
 
         # Budget elapsed. Mark it so the worker knows it owns out-of-band
@@ -10613,9 +10812,12 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
         # so this caller honours the cache contract.
         budget_exceeded.set()
         if build_done.is_set() and "error" not in box and "result" in box:
+            published = False
             if _claim_publish():
-                _publish_models_result(box["result"])
-            return copy.deepcopy(box["result"])
+                published = _publish_models_result(box["result"])
+            if published:
+                return copy.deepcopy(box["result"])
+            return copy.deepcopy(_static_models_catalog_without_live_probes())
 
         # Genuinely slow/hung probe: serve the best fallback now; the worker
         # keeps going and refreshes the cache for the next caller.
