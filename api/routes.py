@@ -23158,13 +23158,16 @@ def _handle_btw(handler, body):
     stream_id = uuid.uuid4().hex
     ephemeral.active_stream_id = stream_id
     register_session_writeback_owner(ephemeral.session_id, stream_id)
-    ephemeral.save()
-    # #6869 re-gate: the remaining steps (channel registration, task tracking,
-    # thread construction and thread start) all run after the writeback owner
-    # was registered, and none of them were guarded. A throw here orphaned the
-    # registries and left the ephemeral session pointing at a dead stream.
-    # Route every one through the shared launch-abort helper.
+    # #6869 re-gate: the remaining steps (the second ephemeral.save(), the
+    # channel registration, task tracking, thread construction and thread
+    # start) all run after the writeback owner was registered, and none of
+    # them were guarded. A throw here orphaned the registries and left the
+    # ephemeral session pointing at a dead stream. Route every one through
+    # the shared launch-abort helper. The second save is inside the try so
+    # an injected save failure (e.g. disk full / permissions error) still
+    # unwinds the just-registered writeback owner (#7680 finding 3).
     try:
+        ephemeral.save()
         stream = create_stream_channel()
         register_stream_owner(stream_id, ephemeral.session_id)
         with STREAMS_LOCK:
@@ -23218,32 +23221,23 @@ def _handle_background(handler, body):
     stream_id = uuid.uuid4().hex
     bg.active_stream_id = stream_id
     register_session_writeback_owner(bg.session_id, stream_id)
-    bg.save()
     task_id = uuid.uuid4().hex[:8]
     from api.background import track_background, complete_background
     parent_sid = body["session_id"]
     bg_sid = bg.session_id
-    # #6869 re-gate: the remaining steps (channel registration, task tracking,
-    # thread construction and thread start) all run after the writeback owner
-    # was registered, and none of them were guarded. A throw here orphaned the
-    # registries, left the hidden bg session pointing at a dead stream, and
-    # left the tracked task in `status="running"` forever — the frontend poll
-    # never saw a result. Route every one through the shared launch-abort
-    # helper, and fail the tracked task so the poll can settle.
-    try:
-        stream = create_stream_channel()
-        register_stream_owner(stream_id, bg.session_id)
-        with STREAMS_LOCK:
-            STREAMS[stream_id] = stream
-        track_background(parent_sid, bg_sid, stream_id, task_id, prompt)
-    except Exception:
-        _cleanup_chat_start_launch_failure(bg, stream_id, reset_session=True)
-        try:
-            complete_background(parent_sid, task_id, "(background task failed)")
-        except Exception:
-            pass
-        raise
-
+    # #6869 re-gate: the remaining steps (the second bg.save(), the channel
+    # registration, task tracking, thread construction and thread start)
+    # all run after the writeback owner was registered, and none of them
+    # were guarded. A throw here orphaned the registries, left the hidden
+    # bg session pointing at a dead stream, and left the tracked task in
+    # `status="running"` forever — the frontend poll never saw a result.
+    # Route every one through the shared launch-abort helper, and fail the
+    # tracked task so the poll can settle. The second save and the thread
+    # constructor are both inside the try so injected save failures
+    # (disk full / permissions error) and thread construction failures
+    # (e.g. Thread(...) raising) still unwind the just-registered writeback
+    # owner (#7680 finding 3, SILENT: "the thread in guarded block 外构造
+    # —注入 save failure 仍保留 active_stream_id 和 writeback ownership").
     def _run_bg_and_notify():
         """Run the background agent, then mark the tracked task `done` with the
         last assistant reply so `/api/background/status` can surface it.  Without
@@ -23290,8 +23284,14 @@ def _handle_background(handler, body):
             except Exception:
                 pass
 
-    thr = threading.Thread(target=_run_bg_and_notify, daemon=True)
     try:
+        bg.save()
+        stream = create_stream_channel()
+        register_stream_owner(stream_id, bg.session_id)
+        with STREAMS_LOCK:
+            STREAMS[stream_id] = stream
+        track_background(parent_sid, bg_sid, stream_id, task_id, prompt)
+        thr = threading.Thread(target=_run_bg_and_notify, daemon=True)
         thr.start()
     except Exception:
         _cleanup_chat_start_launch_failure(bg, stream_id, reset_session=True)
@@ -23380,9 +23380,14 @@ def _rearm_process_wakeup_after_launch_failure(
     logs; the background result is lost with no retry.
 
     The fix is to put the wakeup prompt back into a deliverable retry path
-    (re-mark the session in ``PENDING_BG_TASK_COMPLETIONS``) and append an
-    ``interrupted`` terminal journal event so the turn does not read as
-    in-flight forever.
+    — persist the prompt via ``record_deferred_wakeup`` (finding 1, the
+    bare ``PENDING_BG_TASK_COMPLETIONS`` set is a telemetry flag with no
+    prompt payload, so re-arming it alone is a no-op) AND re-mark the
+    session in ``PENDING_BG_TASK_COMPLETIONS`` for the legacy drain path,
+    then append an ``interrupted`` terminal journal event for the SAME
+    turn as the prior ``submitted`` event (finding 2, so the
+    ``submitted(turn A) + interrupted(turn B)`` drift is impossible) so
+    the turn does not read as in-flight forever.
     """
     # The marker lives in ``api.config`` (``PENDING_BG_TASK_COMPLETIONS``),
     # not in ``api.background_process``; import via the shared config module
@@ -23394,17 +23399,56 @@ def _rearm_process_wakeup_after_launch_failure(
     if not pending_user_message:
         # Nothing to retry — leave the marker state alone.
         return
+    # ── Finding 1 (SILENT): persist the prompt via record_deferred_wakeup ──
+    # ``PENDING_BG_TASK_COMPLETIONS`` is a bare telemetry flag — the drain
+    # path already consumed the marker, the prompt is not in it. We must call
+    # ``record_deferred_wakeup`` (api/background_process.py:1486) so the
+    # wakeup turn-teardown hook (or PR #2279's next-turn drain) has a real
+    # payload to redeliver. Recover the process_id from the pinned wakeup
+    # format via ``wakeup_display_meta`` (same parser the UI uses); fall
+    # back to empty process_id for non-pinned shapes (the function still
+    # appends, just without per-process dedup).
+    try:
+        from api.background_process import record_deferred_wakeup
+    except Exception:
+        record_deferred_wakeup = None
+    if record_deferred_wakeup is not None:
+        try:
+            from api.process_event_utils import wakeup_display_meta
+
+            _meta = wakeup_display_meta(pending_user_message) or {}
+            _process_id = str(_meta.get("task_id") or "").strip()
+        except Exception:
+            _process_id = ""
+        try:
+            record_deferred_wakeup(sid, _process_id, pending_user_message)
+        except Exception:
+            logger.debug(
+                "Failed to record deferred wakeup for session %s", sid, exc_info=True,
+            )
+    # Re-arm the bare PENDING_BG_TASK_COMPLETIONS marker too (preserved
+    # behavior for any drain path that does not consult
+    # DEFERRED_PROCESS_WAKEUPS).
     try:
         _cfg.PENDING_BG_TASK_COMPLETIONS.add(sid)
     except Exception:
         logger.debug(
             "Failed to re-arm process-wakeup marker for session %s", sid, exc_info=True,
         )
+    # ── Finding 2 (SILENT): close the same turn, not a fresh one ──
+    # ``append_turn_journal_event`` (the legacy helper) generates a brand new
+    # turn_id via ``payload.setdefault("turn_id", _make_turn_id())`` whenever
+    # the payload has no ``turn_id`` — that yields
+    # ``submitted(turn A) + interrupted(turn B)`` with turn A forever
+    # pending. ``append_turn_journal_event_for_stream`` looks up the latest
+    # ``turn_id`` already in the journal for this ``stream_id`` and reuses
+    # it, so the ``interrupted`` event closes the right turn.
     try:
-        from api.turn_journal import append_turn_journal_event
+        from api.turn_journal import append_turn_journal_event_for_stream
 
-        append_turn_journal_event(
+        append_turn_journal_event_for_stream(
             sid,
+            stream_id,
             {
                 "event": "interrupted",
                 "stream_id": stream_id,

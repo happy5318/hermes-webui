@@ -616,7 +616,7 @@ def test_chat_start_with_raising_prep_completes_under_real_lock(monkeypatch):
 
 
 def test_abort_preserves_process_wakeup_on_failure(monkeypatch):
-    """#7680 finding 2 (SILENT): a failed worker start on the
+    """#7680 findings 1+2 (SILENT): a failed worker start on the
     process-wakeup path left the wakeup drain with nothing to retry —
     ``PENDING_BG_TASK_COMPLETIONS`` was already consumed upstream, the
     abort cleared ``pending_user_message``, and the ``submitted`` turn
@@ -624,14 +624,28 @@ def test_abort_preserves_process_wakeup_on_failure(monkeypatch):
     with no retry.
 
     The fix: when ``preserve_wakeup=True`` is set and the abort happens
-    with a non-empty ``pending_user_message``, the helper re-arms
-    ``PENDING_BG_TASK_COMPLETIONS`` and appends an ``interrupted`` journal
-    event so the drain can deliver the wakeup on its next pass.
+    with a non-empty ``pending_user_message``, the helper
+
+    (1) **persists the prompt** via ``record_deferred_wakeup`` (finding 1;
+        the bare ``PENDING_BG_TASK_COMPLETIONS`` re-arm is a no-op without
+        a payload — the prompt must go to
+        ``DEFERRED_PROCESS_WAKEUPS``), AND
+    (2) appends an ``interrupted`` journal event via
+        ``append_turn_journal_event_for_stream`` so it closes the SAME
+        turn as the prior ``submitted`` event (finding 2; using the
+        legacy ``append_turn_journal_event`` would mint a brand new
+        ``turn_id`` and leave the ``submitted(turn A)`` event half-open
+        forever).
     """
     import api.turn_journal as turn_journal
 
     s = _make_session("wakeup-preserve")
-    s.pending_user_message = "[IMPORTANT: bg task completed]"
+    wakeup_prompt = (
+        "[IMPORTANT: Background process proc-abc123 completed (exit_code=0).\n"
+        "Command: sleep 1\n"
+        "Output:\nhello]"
+    )
+    s.pending_user_message = wakeup_prompt
     s.active_stream_id = "stream-wakeup-fail"
     config.register_session_writeback_owner(s.session_id, s.active_stream_id)
 
@@ -642,9 +656,17 @@ def test_abort_preserves_process_wakeup_on_failure(monkeypatch):
         captured.append((sid, event))
         return event
 
+    def _capture_append_for_stream(sid, stream_id_arg, event, **kwargs):
+        captured.append((sid, event))
+        return event
+
     monkeypatch.setattr(routes, "_rearm_process_wakeup_after_launch_failure",
                         routes._rearm_process_wakeup_after_launch_failure)
     monkeypatch.setattr(turn_journal, "append_turn_journal_event", _capture_append)
+    monkeypatch.setattr(
+        turn_journal, "append_turn_journal_event_for_stream",
+        _capture_append_for_stream,
+    )
 
     # Pre-condition: the marker is NOT in PENDING_BG_TASK_COMPLETIONS yet
     # (it was consumed upstream before the worker started).
@@ -658,10 +680,30 @@ def test_abort_preserves_process_wakeup_on_failure(monkeypatch):
         preserve_wakeup=True,
     )
 
-    # After: the marker is re-armed so the drain will retry on its next
-    # pass, and the journal event closes the ``submitted`` half-open
-    # turn so it does not read as in-flight forever.
+    # Finding 1: a deferred prompt is now recorded for the session so the
+    # wakeup turn-teardown / next-turn drain has a real payload to
+    # redeliver. (Capture the prompt locally before the helper resets it.)
+    from api import config as _cfg
+
+    deferred = _cfg.DEFERRED_PROCESS_WAKEUPS.get(s.session_id) or []
+    assert deferred, (
+        "aborted wakeup did not call record_deferred_wakeup — the prompt "
+        "would be lost with no retry (#7680 finding 1, SILENT)"
+    )
+    assert any(
+        d.get("wakeup_prompt") == wakeup_prompt for d in deferred
+    ), "the deferred entry's wakeup_prompt must match the actual prompt"
+    # process_id is recovered from the pinned wakeup format.
+    assert any(
+        d.get("process_id") == "proc-abc123" for d in deferred
+    ), "the deferred entry must carry the recovered process_id"
+
+    # The legacy PENDING_BG_TASK_COMPLETIONS marker is also re-armed
+    # (preserved behavior for any drain path that does not consult
+    # DEFERRED_PROCESS_WAKEUPS).
     assert s.session_id in config.PENDING_BG_TASK_COMPLETIONS
+
+    # Finding 2: the journal event closes the right turn.
     interrupted = [e for _sid, e in captured if e.get("event") == "interrupted"]
     assert interrupted, (
         "aborted wakeup turn did not append an 'interrupted' journal event "
@@ -692,3 +734,350 @@ def test_abort_without_preserve_wakeup_leaves_marker_alone(monkeypatch):
 
     assert s.session_id not in config.PENDING_BG_TASK_COMPLETIONS
     assert s.active_stream_id is None
+
+
+# ---------------------------------------------------------------------------
+# #7680 re-gate (9/23) — wakeup prompt lost, wrong-turn closed, /btw &
+# /background still bypass cleanup.
+# ---------------------------------------------------------------------------
+
+
+def test_rearm_wakeup_calls_record_deferred_wakeup(monkeypatch):
+    """#7680 finding 1 (SILENT) regression: launching the launch-abort
+    helper (``_cleanup_chat_start_launch_failure``) with
+    ``preserve_wakeup=True`` for a session whose ``pending_user_message``
+    is a pinned-shape wakeup prompt must (a) call
+    ``record_deferred_wakeup`` so ``DEFERRED_PROCESS_WAKEUPS`` carries a
+    redeliverable payload, and (b) recover the process_id from the
+    pinned format. The old fix re-armed only the bare
+    ``PENDING_BG_TASK_COMPLETIONS`` telemetry flag — drain had nothing
+    to redeliver (``deferred_prompts=null``, ``zero turns started``).
+    """
+    s = _make_session("wakeup-direct")
+    wakeup_prompt = (
+        "[IMPORTANT: Background process proc-xyz789 completed (exit_code=2).\n"
+        "Command: ls /tmp\n"
+        "Output:\nfile1\nfile2]"
+    )
+    s.pending_user_message = wakeup_prompt
+    s.active_stream_id = "stream-direct-wakeup"
+    config.register_session_writeback_owner(s.session_id, s.active_stream_id)
+
+    # Reset state so we observe the call cleanly.
+    from api import config as _cfg
+
+    _cfg.DEFERRED_PROCESS_WAKEUPS.pop(s.session_id, None)
+    _cfg.PENDING_BG_TASK_COMPLETIONS.discard(s.session_id)
+
+    # Spy on record_deferred_wakeup by patching the module attribute
+    # that ``_rearm_process_wakeup_after_launch_failure`` imports at
+    # call time.
+    import api.background_process as _bp
+
+    captured_calls: list[tuple[str, str, str]] = []
+
+    def _capturing_record(sid_arg, pid_arg, prompt_arg):
+        captured_calls.append((sid_arg, pid_arg, prompt_arg))
+        return True
+
+    monkeypatch.setattr(_bp, "record_deferred_wakeup", _capturing_record)
+
+    # Drive the full canonical helper — this is the path the launch
+    # failure actually exercises (``preserve_wakeup=True`` is set by
+    # ``_prepare_chat_start_session_for_stream`` for the
+    # ``process_wakeup`` source).
+    routes._cleanup_chat_start_launch_failure(
+        s,
+        s.active_stream_id,
+        reset_session=True,
+        lock_held=False,
+        preserve_wakeup=True,
+    )
+
+    assert captured_calls, (
+        "preserve_wakeup launch-abort did not invoke record_deferred_wakeup "
+        "at all — the prompt would be lost with no retry (#7680 finding 1, "
+        "SILENT)"
+    )
+    sid_arg, pid_arg, prompt_arg = captured_calls[0]
+    assert sid_arg == s.session_id
+    assert pid_arg == "proc-xyz789", (
+        f"process_id not recovered from the wakeup format: got {pid_arg!r}, "
+        "expected 'proc-xyz789'"
+    )
+    assert prompt_arg == wakeup_prompt
+
+    # And the helper's final state: marker re-armed, writeback owner
+    # cleared, active_stream_id cleared. (DEFERRED_PROCESS_WAKEUPS
+    # itself is populated by the real record_deferred_wakeup which we
+    # patched out — the captured call above is the proof the fix made
+    # the call.)
+    assert s.session_id in config.PENDING_BG_TASK_COMPLETIONS
+    assert config.SESSION_WRITEBACK_OWNERS.get(s.session_id) is None
+    assert s.active_stream_id is None
+
+
+def test_interrupted_journal_event_closes_existing_turn(monkeypatch):
+    """#7680 finding 2 (SILENT) regression: when the abort fires for a
+    stream that already has a ``submitted`` event in the turn journal, the
+    ``interrupted`` event MUST land on the same ``turn_id`` so the turn
+    closes (instead of becoming ``submitted(turn A) + interrupted(turn B)``
+    with turn A forever pending).
+
+    Drive this by writing a real ``submitted`` event with
+    ``stream_id=stream-X`` to the journal, then invoking the abort
+    helper with ``preserve_wakeup=True``. Pin both
+    ``append_turn_journal_event`` and ``append_turn_journal_event_for_stream``
+    so the test sees which one the helper used.
+    """
+    import api.turn_journal as turn_journal
+
+    s = _make_session("turn-close")
+    s.pending_user_message = (
+        "[IMPORTANT: Background process proc-close completed (exit_code=0).\n"
+        "Command: echo hi\n"
+        "Output:\nhi]"
+    )
+    s.active_stream_id = "stream-close"
+    config.register_session_writeback_owner(s.session_id, s.active_stream_id)
+
+    # Write a real ``submitted`` event for stream-close so the journal
+    # has a turn to close. The real append_turn_journal_event is fine
+    # here — we only want to assert what the *helper* writes.
+    submitted = turn_journal.append_turn_journal_event(
+        s.session_id,
+        {
+            "event": "submitted",
+            "stream_id": "stream-close",
+            "turn_id": "turn-pre-existing",
+        },
+    )
+    assert submitted.get("turn_id") == "turn-pre-existing"
+
+    # Capture every journal write the helper performs.
+    captured: list[dict] = []
+
+    def _capture_append(sid, event, **kwargs):
+        captured.append(dict(event))
+        return event
+
+    def _capture_append_for_stream(sid, stream_id_arg, event, **kwargs):
+        # Mark which helper the call came from so the assertion can pin
+        # the fix.
+        event = dict(event)
+        event["_via"] = "for_stream"
+        captured.append(event)
+        return event
+
+    import api.turn_journal as _tj
+
+    monkeypatch.setattr(_tj, "append_turn_journal_event", _capture_append)
+    monkeypatch.setattr(
+        _tj, "append_turn_journal_event_for_stream",
+        _capture_append_for_stream,
+    )
+
+    routes._cleanup_chat_start_launch_failure(
+        s,
+        "stream-close",
+        reset_session=True,
+        lock_held=False,
+        preserve_wakeup=True,
+    )
+
+    interrupted = [e for e in captured if e.get("event") == "interrupted"]
+    assert interrupted, (
+        "abort did not write an 'interrupted' event — the half-open "
+        "turn would read as in-flight forever (#7680 finding 2)"
+    )
+    # The fix must use ``append_turn_journal_event_for_stream`` so the
+    # existing turn_id is reused, NOT ``append_turn_journal_event``
+    # which would mint a brand new turn_id.
+    via = interrupted[0].get("_via")
+    assert via == "for_stream", (
+        f"abort wrote 'interrupted' via {via!r} — the legacy "
+        "append_turn_journal_event mints a fresh turn_id and leaves "
+        "submitted(turn A) half-open forever (#7680 finding 2)"
+    )
+    # And the actual turn_id re-uses the prior ``turn-pre-existing`` (the
+    # real for_stream helper looks it up; the captured event already
+    # contains the resolved turn_id).
+    # We can't assert the exact id here (the journal write path inside
+    # the for_stream helper is patched away), but we can assert the
+    # helper was called with our stream_id so the for_stream resolver
+    # is on the path.
+    assert interrupted[0].get("stream_id") == "stream-close"
+
+
+def test_btw_save_failure_after_register_unwinds_registries(monkeypatch):
+    """#7680 finding 3 (SILENT) regression: ``_handle_btw`` used to do
+    ``ephemeral.save()`` *after* registering the writeback owner but
+    *before* the launch-failure try/except. A throw on that second save
+    (disk full, permissions error) orphaned the writeback owner and
+    pinned the ephemeral session to a dead stream. The fix moves the
+    save into the same try block as the rest of the launch, so the
+    canonical ``_cleanup_chat_start_launch_failure`` helper unwinds
+    every registry.
+    """
+    parent = _make_session("btw-savefail-parent")
+    monkeypatch.setattr(routes, "_agent_runtime_barrier_response", lambda **kw: None)
+    monkeypatch.setattr(routes, "_session_is_subagent_view_only", lambda *a, **kw: False)
+    monkeypatch.setattr(
+        routes, "get_session",
+        lambda sid, metadata_only=False: models.SESSIONS.get(sid) or parent,
+    )
+    monkeypatch.setattr(routes, "bad", lambda h, m, status=400: {"status": status})
+    monkeypatch.setattr(
+        routes, "j", lambda h, payload, status=200: {"status": status, "payload": payload}
+    )
+
+    # Stub the Session class so the second ephemeral.save() raises. The
+    # first save (before the writeback owner is registered) must still
+    # succeed; only the second one (after) must fail.
+    from api import models as _models
+
+    class _BoomSession(_models.Session):
+        save_call_count = 0
+
+        def save(self, *a, **kw):
+            type(self).save_call_count += 1
+            if type(self).save_call_count == 1:
+                return super().save(*a, **kw)
+            raise RuntimeError("ephemeral save failed (disk full)")
+
+    _BoomSession.save_call_count = 0
+    monkeypatch.setattr(_models, "new_session", _BoomSession)
+
+    with pytest.raises(RuntimeError, match="ephemeral save failed"):
+        routes._handle_btw(
+            object(),
+            {"session_id": "btw-savefail-parent", "question": "what?"},
+        )
+
+    # The fix: the launch-abort helper unwinds every registry even when
+    # the failure is on the *post-registration* save.
+    assert config.SESSION_WRITEBACK_OWNERS == {}, (
+        "ephemeral save failure after writeback-owner register leaked the "
+        "owner (writeback owner: "
+        f"{dict(config.SESSION_WRITEBACK_OWNERS)!r})"
+    )
+    assert config.STREAMS == {}
+    assert config.STREAM_SESSION_OWNERS == {}
+    for ephemeral in models.SESSIONS.values():
+        assert getattr(ephemeral, "active_stream_id", None) is None, (
+            "ephemeral session kept an active_stream_id after save failure "
+            "— the next send would 409 on the dead channel"
+        )
+
+
+def test_background_save_failure_after_register_unwinds_registries(monkeypatch):
+    """#7680 finding 3 (SILENT) regression: ``_handle_background`` used
+    to do ``bg.save()`` after registering the writeback owner but before
+    the launch-failure try/except. A throw on that save orphaned the
+    writeback owner. The fix moves the save into the same try block as
+    the rest of the launch.
+    """
+    parent = _make_session("bg-savefail-parent")
+    monkeypatch.setattr(routes, "_agent_runtime_barrier_response", lambda **kw: None)
+    monkeypatch.setattr(
+        routes, "get_session",
+        lambda sid, metadata_only=False: models.SESSIONS.get(sid) or parent,
+    )
+    monkeypatch.setattr(routes, "bad", lambda h, m, status=400: {"status": status})
+    monkeypatch.setattr(
+        routes, "j", lambda h, payload, status=200: {"status": status, "payload": payload}
+    )
+
+    from api import models as _models
+
+    class _BoomBgSession(_models.Session):
+        save_call_count = 0
+
+        def save(self, *a, **kw):
+            type(self).save_call_count += 1
+            if type(self).save_call_count == 1:
+                # The first save (creating the hidden session) succeeds.
+                return super().save(*a, **kw)
+            raise RuntimeError("bg save failed (disk full)")
+
+    _BoomBgSession.save_call_count = 0
+    monkeypatch.setattr(_models, "new_session", _BoomBgSession)
+
+    with pytest.raises(RuntimeError, match="bg save failed"):
+        routes._handle_background(
+            object(),
+            {"session_id": "bg-savefail-parent", "prompt": "do a thing"},
+        )
+
+    # The fix: the second bg.save() (after writeback-owner register) is
+    # now inside the try block, so the abort unwinds the owner.
+    assert config.SESSION_WRITEBACK_OWNERS == {}, (
+        "bg save failure after writeback-owner register leaked the owner "
+        f"(owners: {dict(config.SESSION_WRITEBACK_OWNERS)!r})"
+    )
+    assert config.STREAMS == {}
+    assert config.STREAM_SESSION_OWNERS == {}
+    for bg_session in models.SESSIONS.values():
+        assert getattr(bg_session, "active_stream_id", None) is None
+
+    # The tracked task is not stranded in "running" — track_background
+    # was never reached (the save() throw happened before it), so there
+    # are no tasks for this parent. The point is that the abort didn't
+    # leave any side-effect state behind.
+    import api.background as background
+
+    tasks = background.get_background_tasks("bg-savefail-parent")
+    assert tasks == [], (
+        f"unexpected tracked tasks after save failure: {tasks!r}"
+    )
+
+
+def test_background_thread_construct_failure_unwinds_registries(monkeypatch):
+    """#7680 finding 3 (SILENT) regression: ``_handle_background`` used to
+    construct ``threading.Thread(...)`` OUTSIDE the launch-failure
+    try/except block. A throw at Thread construction (extremely rare in
+    practice but reachable under resource exhaustion) leaked the
+    writeback owner. The fix moves the constructor into the same try
+    block as the rest of the launch.
+    """
+    parent = _make_session("bg-threadfail-parent")
+    monkeypatch.setattr(routes, "_agent_runtime_barrier_response", lambda **kw: None)
+    monkeypatch.setattr(
+        routes, "get_session",
+        lambda sid, metadata_only=False: models.SESSIONS.get(sid) or parent,
+    )
+    monkeypatch.setattr(routes, "bad", lambda h, m, status=400: {"status": status})
+    monkeypatch.setattr(
+        routes, "j", lambda h, payload, status=200: {"status": status, "payload": payload}
+    )
+
+    class _ThrowingThreadCtor:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("thread construction failed (resource exhaustion)")
+
+    monkeypatch.setattr(routes.threading, "Thread", _ThrowingThreadCtor)
+
+    with pytest.raises(RuntimeError, match="thread construction failed"):
+        routes._handle_background(
+            object(),
+            {"session_id": "bg-threadfail-parent", "prompt": "do a thing"},
+        )
+
+    # The fix: thread construction is inside the same try block, so
+    # the launch-abort helper unwinds the owner.
+    assert config.SESSION_WRITEBACK_OWNERS == {}, (
+        "thread construction failure leaked the writeback owner "
+        "(owners: "
+        f"{dict(config.SESSION_WRITEBACK_OWNERS)!r})"
+    )
+    assert config.STREAMS == {}
+    assert config.STREAM_SESSION_OWNERS == {}
+    for bg_session in models.SESSIONS.values():
+        assert getattr(bg_session, "active_stream_id", None) is None
+
+    # The tracked task must not be stranded in "running" either.
+    import api.background as background
+
+    tasks = background.get_background_tasks("bg-threadfail-parent")
+    assert tasks, "aborted background task must still be tracked"
+    assert all(t["status"] != "running" for t in tasks)
