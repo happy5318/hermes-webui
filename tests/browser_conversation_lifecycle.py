@@ -633,6 +633,14 @@ def _terminal_rows(snapshot: dict) -> list[dict]:
     return [row for row in snapshot["rows"] if row["role"] == "terminal"]
 
 
+def _without_terminal_timestamp(text: str) -> str:
+    """Rendered terminal rows end with a locale-formatted clock line
+    (e.g. ``\\n9:14 PM``); strip it so settle-vs-reload comparisons do not
+    depend on wall-clock time crossing a minute boundary."""
+    lines = text.strip().splitlines()
+    return "\n".join(lines[:-1]) if len(lines) > 1 else text
+
+
 def _process_rows(snapshot: dict) -> list[dict]:
     return [
         row for row in snapshot["rows"]
@@ -1204,7 +1212,11 @@ def main() -> int:
                 "settled_terminal": settled_terminal,
                 "reloaded_terminal": reloaded_terminal,
             }
-            assert settled_terminal[0]["text"] == reloaded_terminal[0]["text"], {
+            assert settled_terminal[0]["rowId"] == reloaded_terminal[0]["rowId"], {
+                "settled_terminal": settled_terminal[0],
+                "reloaded_terminal": reloaded_terminal[0],
+            }
+            assert _without_terminal_timestamp(settled_terminal[0]["text"]) == _without_terminal_timestamp(reloaded_terminal[0]["text"]), {
                 "settled_terminal": settled_terminal[0],
                 "reloaded_terminal": reloaded_terminal[0],
             }
