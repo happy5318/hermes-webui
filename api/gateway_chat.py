@@ -1,6 +1,7 @@
 """Default-off Hermes Gateway bridge for browser-originated chat turns."""
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
@@ -319,7 +320,7 @@ def _gateway_api_key(environ: dict[str, str] | None = None) -> str:
 
 
 def _gateway_session_owner_cfg(session) -> dict:
-    """Resolve the config snapshot of the profile that owns ``session``.
+    """Resolve an IMMUTABLE config snapshot for the profile owning ``session``.
 
     Called at /api/chat/start dispatch time (routes.py), on the request
     thread, and handed into the detached gateway worker as ``session_cfg``.
@@ -331,13 +332,33 @@ def _gateway_session_owner_cfg(session) -> dict:
     coercion) leak into another profile's request (issue #7170). Resolving
     the session's own profile home at dispatch (issue #3294 pattern) gives
     the worker the same snapshot the in-process path uses.
+
+    The returned dict MUST be a deep copy: ``get_config_for_profile_home()``
+    has its own fast path that hands back the cached ``get_config()`` object
+    verbatim whenever the session's profile home equals the active home (the
+    common single-profile case). Without the copy, the worker would read a
+    live, shared, MUTABLE object — a later profile-A reload would clear and
+    repopulate that very dict in place, so profile B's still-running worker
+    could observe A's ``reasoning_overrides``, gateway URL, request options
+    and prefill context. A request-owned snapshot removes that coupling: the
+    worker keeps the view it was dispatched with, and reloads can no longer
+    mutate it underneath.
     """
     from api.config import get_config_for_profile_home  # imported lazily to avoid config-cycle churn
     from api.models import _get_profile_home
 
-    return get_config_for_profile_home(
+    resolved = get_config_for_profile_home(
         _get_profile_home(getattr(session, "profile", None))
     )
+    if not isinstance(resolved, dict):
+        return {}
+    try:
+        return copy.deepcopy(resolved)
+    except Exception:
+        # A deep-copy failure must not take the dispatch down; return the
+        # best-effort copy we can make. Prefer a shallow copy so the worker at
+        # least stops sharing the top-level dict.
+        return dict(resolved)
 
 
 def _gateway_use_runs_api_enabled(config_data=None, environ: dict[str, str] | None = None) -> bool:
@@ -1292,11 +1313,20 @@ def _run_gateway_chat_streaming(
         # a snapshot fall back to the session's own profile home (issue #3294
         # pattern) — never the ambient process profile.
         cfg = session_cfg
-        if cfg is None:
+        if not isinstance(cfg, dict):
             # Legacy/direct callers that spawned the worker without a dispatch
             # snapshot: resolve the session's own profile home (issue #3294
-            # pattern) — never the ambient process profile.
+            # pattern) — never the ambient process profile. The resolver deep
+            # copies, so a concurrent reload of another profile cannot mutate
+            # what this worker reads.
             cfg = _gateway_session_owner_cfg(s)
+        # Defensive re-copy for callers that handed in a live cache object
+        # (older dispatch paths / direct test callers): the worker must observe
+        # the snapshot it was dispatched with, never a later profile reload.
+        try:
+            cfg = copy.deepcopy(cfg)
+        except Exception:
+            cfg = dict(cfg) if isinstance(cfg, dict) else {}
         reasoning_effort = _gateway_reasoning_effort_for_request(
             cfg,
             model=model,

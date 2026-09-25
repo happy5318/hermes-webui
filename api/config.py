@@ -2713,7 +2713,7 @@ def _parse_provider_qualified_model_id(model_id: str) -> tuple[str, str] | None:
     return bare_model, provider_hint
 
 
-def _get_provider_base_url(provider_id):
+def _get_provider_base_url(provider_id, config_obj: dict | None = None):
     """Look up the configured base_url for a provider (e.g. lmstudio).
 
     Checks two locations, in order:
@@ -2724,13 +2724,18 @@ def _get_provider_base_url(provider_id):
          shape (the model block carries both the active provider AND the
          base URL for that provider in a single record).
 
+    ``config_obj`` lets a caller scope the lookup to a specific profile's
+    config snapshot instead of the module-global ``cfg``; when omitted the
+    module-global cache is used (historical behaviour).
+
     Returns the URL stripped of trailing ``/`` if configured, otherwise None.
     """
-    prov_cfg = _get_provider_cfg(provider_id)
+    source = config_obj if isinstance(config_obj, dict) else cfg
+    prov_cfg = _get_provider_cfg(provider_id, source)
     explicit = (prov_cfg.get("base_url") or "").strip().rstrip("/")
     if explicit:
         return explicit
-    model_cfg = cfg.get("model", {}) or {}
+    model_cfg = source.get("model", {}) or {}
     if isinstance(model_cfg, dict):
         model_provider = str(model_cfg.get("provider") or "").strip().lower()
         if model_provider == str(provider_id).strip().lower():
@@ -2740,13 +2745,13 @@ def _get_provider_base_url(provider_id):
     return None
 
 
-def _get_providers_cfg() -> dict:
-    providers_cfg = cfg.get("providers")
+def _get_providers_cfg(config_obj: dict | None = None) -> dict:
+    providers_cfg = (config_obj if isinstance(config_obj, dict) else cfg).get("providers")
     return providers_cfg if isinstance(providers_cfg, dict) else {}
 
 
-def _get_provider_cfg(provider_id) -> dict:
-    provider_cfg = _get_providers_cfg().get(provider_id, {})
+def _get_provider_cfg(provider_id, config_obj: dict | None = None) -> dict:
+    provider_cfg = _get_providers_cfg(config_obj).get(provider_id, {})
     return provider_cfg if isinstance(provider_cfg, dict) else {}
 
 
@@ -5480,9 +5485,13 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def _get_lmstudio_reasoning_probe_api_key() -> str | None:
-    """Resolve the LM Studio key for reasoning probes with WebUI precedence."""
-    config_data = cfg
+def _get_lmstudio_reasoning_probe_api_key(config_data: dict | None = None) -> str | None:
+    """Resolve the LM Studio key for reasoning probes with WebUI precedence.
+
+    ``config_data`` scopes the lookup to the caller's profile config snapshot;
+    when omitted the module-global ``cfg`` is used (historical behaviour).
+    """
+    config_data = config_data if isinstance(config_data, dict) else cfg
     model_cfg = config_data.get("model") or {}
     if isinstance(model_cfg, dict):
         active_provider = str(model_cfg.get("provider") or "").strip().lower()
@@ -5650,6 +5659,7 @@ def resolve_model_reasoning_efforts(
     model_id: str | None = None,
     provider_id: str | None = None,
     base_url: str | None = None,
+    config_data: dict | None = None,
 ) -> list[str]:
     """Return supported reasoning-effort levels for *model_id*, or [] if none.
 
@@ -5659,8 +5669,14 @@ def resolve_model_reasoning_efforts(
     applied uniformly. The UI dropdown and coercion therefore agree: ``max`` is
     retained for GPT-5.6 and other models whose native ladder includes it, and
     stripped where it would be rejected or mishandled.
+
+    ``config_data`` scopes config-sourced branches (custom-provider metadata,
+    LM Studio endpoint/key) to the caller's profile snapshot; when omitted the
+    module-global ``cfg`` is used (historical behaviour).
     """
-    raw = _resolve_model_reasoning_efforts_impl(model_id, provider_id, base_url)
+    raw = _resolve_model_reasoning_efforts_impl(
+        model_id, provider_id, base_url, config_data=config_data
+    )
     if not raw:
         return raw
     # Forced-thinking models (GLM-4.7 on native zai) cannot have reasoning
@@ -5712,19 +5728,27 @@ def _resolve_model_reasoning_efforts_impl(
     model_id: str | None = None,
     provider_id: str | None = None,
     base_url: str | None = None,
+    *,
+    config_data: dict | None = None,
 ) -> list[str]:
-    """Return supported reasoning-effort levels for *model_id*, or [] if none."""
+    """Return supported reasoning-effort levels for *model_id*, or [] if none.
+
+    ``config_data`` (when a dict) scopes every config lookup to the caller's
+    profile snapshot so per-profile coercion cannot read another profile's
+    ambient ``cfg``.
+    """
     model = str(model_id or "").strip()
     if not model:
         return []
 
     provider = str(provider_id or "").strip().lower() if provider_id else ""
     resolved_base_url = str(base_url or "").strip() or None
+    _scope_cfg = config_data if isinstance(config_data, dict) else cfg
     if not provider:
         try:
             _, provider, resolved_base_url = resolve_model_provider(model)
         except Exception:
-            provider = str((cfg.get("model") or {}).get("provider") or "").strip().lower()
+            provider = str((_scope_cfg.get("model") or {}).get("provider") or "").strip().lower()
 
     provider = _resolve_provider_alias(provider)
 
@@ -5748,14 +5772,14 @@ def _resolve_model_reasoning_efforts_impl(
     _re_lists = []
     try:
         if provider and provider.startswith("custom:"):
-            for _entry in _custom_provider_entries():
+            for _entry in _custom_provider_entries(config_data):
                 if _custom_provider_slug_from_name(_entry.get("name")) == provider:
                     _re_lists = _configured_reasoning_effort_lists(
                         _entry, hinted_model
                     )
                     break
         elif provider:
-            _prov_entry = (cfg.get("providers") or {}).get(provider, {})
+            _prov_entry = (_scope_cfg.get("providers") or {}).get(provider, {})
             if isinstance(_prov_entry, dict):
                 _re_lists = _configured_reasoning_effort_lists(
                     _prov_entry, hinted_model
@@ -5780,7 +5804,7 @@ def _resolve_model_reasoning_efforts_impl(
         )
 
     if provider == "lmstudio":
-        configured_base = _get_provider_base_url(provider)
+        configured_base = _get_provider_base_url(provider, config_data)
         probe_base = resolved_base_url or configured_base
         # SECURITY: only forward the configured LM Studio credential when the
         # probe target is the configured LM Studio endpoint. /api/reasoning
@@ -5794,7 +5818,7 @@ def _resolve_model_reasoning_efforts_impl(
             and _normalize_base_url_for_match(probe_base)
             == _normalize_base_url_for_match(configured_base)
         ):
-            probe_key = _get_lmstudio_reasoning_probe_api_key()
+            probe_key = _get_lmstudio_reasoning_probe_api_key(config_data)
         opts = _lmstudio_model_reasoning_options(
             hinted_model,
             probe_base,
@@ -5827,8 +5851,15 @@ def coerce_reasoning_effort_for_model(
     model_id: str | None = None,
     provider_id: str | None = None,
     base_url: str | None = None,
+    *,
+    config_data: dict | None = None,
 ) -> str:
-    """Return the closest supported effort for the target model/provider."""
+    """Return the closest supported effort for the target model/provider.
+
+    ``config_data`` (when a dict) scopes the capability lookup to the caller's
+    profile snapshot so coercion cannot read another profile's ambient ``cfg``
+    (custom-provider metadata, LM Studio endpoint/key).
+    """
     raw = str(effort or "").strip().lower()
     if not raw:
         return ""
@@ -5847,6 +5878,7 @@ def coerce_reasoning_effort_for_model(
         model_id,
         provider_id=provider_id,
         base_url=base_url,
+        config_data=config_data,
     )
     # Hard provider ceilings must win regardless of what the sourced capability
     # list says. resolve_model_reasoning_efforts() draws from hermes_cli /
@@ -5991,6 +6023,55 @@ def configured_reasoning_effort_for_model(
                     candidates.append("/".join(_parts[1:]))
                 candidates.append(_parts[-1])
 
+            # Provider-qualified OVERRIDE KEYS must match an unqualified model id
+            # (and an aggregator-wrapped one), mirroring the core resolver's
+            # "known prefixes added" variants.  A bare model ``gpt-5.4-mini``
+            # with override ``openai/gpt-5.4-mini: low`` previously resolved to
+            # the global ``high`` because only the model side was expanded.
+            _MODEL_PREFIX_PROVIDERS = (
+                "anthropic", "openai", "google", "openrouter", "groq", "mistral",
+                "xai", "cohere", "perplexity", "together", "fireworks", "deepseek",
+            )
+            _MODEL_PREFIX_AGGREGATORS = (
+                "openrouter", "opencode", "fireworks", "groq", "together",
+            )
+
+            def _fallback_provider_prefixes(cand: str) -> list[str]:
+                """Provider-prefixed spellings of one BARE candidate.
+
+                Mirrors the core resolver's "known prefixes added" pass so a
+                no-core install resolves a provider-qualified override key
+                (``openai/gpt-5.4-mini``) for a bare model id the same way core
+                does. Only unqualified candidates are prefixed.
+                """
+                if not cand or "/" in cand:
+                    return []
+                return [f"{_p}/{cand}" for _p in _MODEL_PREFIX_PROVIDERS]
+
+            def _fallback_aggregator_prefixes(cand: str) -> list[str]:
+                """Aggregator-prefixed spellings of one single-slash candidate.
+
+                Covers aggregator-qualified override keys
+                (``openrouter/openai/gpt-5.4-mini``) matched against a model id
+                that lost its aggregator segment. Runs over the provider-prefixed
+                forms too, exactly like the core resolver's two prefix passes.
+                """
+                if not cand or cand.count("/") != 1:
+                    return []
+                return [f"{_agg}/{cand}" for _agg in _MODEL_PREFIX_AGGREGATORS]
+
+            # Pass 1: provider prefixes over the base candidates...
+            _provider_qualified: list[str] = []
+            for _cand in list(candidates):
+                _provider_qualified.extend(_fallback_provider_prefixes(_cand))
+            candidates.extend(_provider_qualified)
+            # Pass 2: aggregator prefixes over every single-slash candidate,
+            # INCLUDING the provider-qualified forms pass 1 just added.
+            _aggregator_qualified: list[str] = []
+            for _cand in list(candidates):
+                _aggregator_qualified.extend(_fallback_aggregator_prefixes(_cand))
+            candidates.extend(_aggregator_qualified)
+
             def _fallback_parse(raw):
                 """Parse an override value with CORE semantics.
 
@@ -6048,6 +6129,7 @@ def configured_reasoning_effort_for_model(
         model,
         provider_id=provider_id,
         base_url=base_url,
+        config_data=data,
     )
 
 
