@@ -2442,6 +2442,7 @@ def _settle_result_messages(
     msg_text,
     source,
     active_turn_identity,
+    projected_history=None,
 ):
     (
         result_messages,
@@ -2465,6 +2466,7 @@ def _settle_result_messages(
             next_context_messages,
             msg_text,
             active_turn_identity=active_turn_identity,
+            projected_history=projected_history,
         )
         next_context_messages = _settle_current_turn_boundary(
             previous_context_messages,
@@ -7376,13 +7378,66 @@ def _looks_like_current_user_turn_scan(messages, msg_text):
     return last_strong_match
 
 
-def _dedupe_replayed_context_messages(previous_context, result_messages, msg_text=None, active_turn_identity=None):
+def _proven_current_turn_suffix(projected_history, result_messages):
+    """Return the proven current-turn suffix of ``result_messages``, else None.
+
+    ``result_messages`` is the FULL conversation the Agent returned: the exact
+    projected history this process handed it (``agent.run_conversation``
+    copies it into ``messages`` and appends the turn on top) followed by the
+    current turn's rows. When that projection is still the returned list's
+    prefix, every row after it was produced by the current turn and may be
+    appended to the raw ``previous_context``. Sanitizer-rewritten historical
+    rows are then never examined at all, so they cannot be appended beside the
+    authoritative raw history and duplicated into the next model context
+    (#7237 review data-regression finding, nesquena-hermes 2026-09-23).
+
+    The projection length gates how many rows are compared, so a stale
+    ``previous_context`` can never widen the match: only rows the Agent was
+    actually sent count.
+
+    Returns None when no suffix is proven — the caller must then fail closed
+    and append NOTHING (empty suffix included: there is no current-turn output
+    worth persisting, and guessing one would append unproven rows).
+    """
+    projection = list(projected_history or [])
+    result_messages = list(result_messages or [])
+    if not projection or len(result_messages) <= len(projection):
+        return None
+    if not _messages_have_prefix(
+        result_messages,
+        projection,
+        key_fn=_message_replay_key,
+    ):
+        return None
+    # Proven: everything past the sent projection is this turn's output.
+    # It is appended verbatim — the current turn's user row can legitimately
+    # repeat a historical prompt, so a replayed-suffix strip here would drop
+    # the turn's own leading row instead of a replay.
+    return result_messages[len(projection):]
+
+
+def _dedupe_replayed_context_messages(
+    previous_context,
+    result_messages,
+    msg_text=None,
+    active_turn_identity=None,
+    projected_history=None,
+):
     """Keep model context append-only without replayed blocks/summaries.
 
     When the replayed prefix no longer matches the raw pre-turn context and no
     compression marker explains the rotation, the raw previous context is
     authoritative: only the current-turn slice (located via the active-turn
     checkpoint / current user row) is settled on top of it (#7237 blocker 1).
+
+    ``projected_history`` is the exact conversation-history projection this
+    process sent to the Agent (``_sanitize_messages_for_agent`` output). It is
+    the only ownership signal for rows the sanitizer rewrote: when it is not
+    threaded, or when the returned list does not start with it, no current-turn
+    boundary can be proven and the settle fails closed by keeping the raw
+    ``previous_context`` alone — unproven historical rows are never appended
+    beside it (#7237 review data-regression finding, nesquena-hermes
+    2026-09-23).
     """
     previous_context = list(previous_context or [])
     result_messages = list(result_messages or [])
@@ -7499,16 +7554,37 @@ def _dedupe_replayed_context_messages(previous_context, result_messages, msg_tex
             # still carries. Keep the raw pre-turn context and settle the whole
             # projected delta on top of it (#7237 review ownership defect 1,
             # nesquena-hermes 2026-09-23).
-            _delta = _strip_replayed_prefix(previous_context, result_messages)
-            if _delta:
-                _delta = _strip_replayed_context_items(previous_context, _delta)
+            #
+            # Data-regression guard (#7237 review, nesquena-hermes 2026-09-23):
+            # ``result_messages`` is the FULL conversation, not a current-turn
+            # delta — it is the projected history this process sent the Agent
+            # followed by the new turn's rows. Stripping suffix/prefix overlap
+            # from the full list cannot remove sanitizer-REWRITTEN historical
+            # rows, so the residual used to duplicate projected history beside
+            # the authoritative raw history in the next model context. When the
+            # exact projection sent to the Agent is threaded through, only rows
+            # proven to belong to the current turn may be appended; otherwise
+            # nothing is appended at all (fail closed).
+            _proven_suffix = _proven_current_turn_suffix(
+                projected_history, result_messages,
+            )
+            if _proven_suffix is not None:
+                logger.info(
+                    "Prefix mismatch without compression and no proven current-turn "
+                    "boundary: keeping raw pre-turn context (%d rows) + %d proven "
+                    "current-turn row(s) from the projected replay; sanitized "
+                    "historical projection dropped (#7237 data-regression finding)",
+                    len(previous_context), len(_proven_suffix),
+                )
+                return list(previous_context) + _proven_suffix
             logger.info(
                 "Prefix mismatch without compression and no proven current-turn "
-                "boundary: keeping raw pre-turn context (%d rows) + %d projected "
-                "delta row(s); no boundary guessed (#7237 ownership defect 1)",
-                len(previous_context), len(_delta),
+                "boundary nor projected-history prefix: keeping raw pre-turn "
+                "context (%d rows) verbatim; no unproven historical rows appended "
+                "(#7237 data-regression finding)",
+                len(previous_context),
             )
-            return list(previous_context) + _delta
+            return list(previous_context)
         # A compression marker explains the rotation: wholesale replacement of
         # the historical prefix stays legitimate.
         return result_messages
@@ -7529,9 +7605,11 @@ def _dedupe_replayed_context_messages(previous_context, result_messages, msg_tex
     return previous_context + candidates
 
 
-def _dedupe_replayed_active_context(previous_context, result_messages, msg_text=None):
+def _dedupe_replayed_active_context(previous_context, result_messages, msg_text=None, projected_history=None):
     """Keep model context append-only without re-appending a replayed tail."""
-    return _dedupe_replayed_context_messages(previous_context, result_messages, msg_text)
+    return _dedupe_replayed_context_messages(
+        previous_context, result_messages, msg_text, projected_history=projected_history,
+    )
 
 
 def _is_context_compression_marker(msg):
@@ -12469,6 +12547,16 @@ def _run_agent_streaming(
                     _finalize_cancelled_turn(s, ephemeral=ephemeral, message='Task cancelled before start.', stream_id=stream_id)
                 put('cancel', _cancel_event_payload('Cancelled by user'))
                 return
+            # Thread the EXACT conversation-history projection handed to the
+            # Agent through to the settle path. ``result["messages"]`` is the
+            # full conversation (projection + current turn), so without this
+            # signal the replay dedupe cannot tell which rows the current turn
+            # owns and sanitizer-rewritten historical rows could be appended
+            # beside the authoritative raw history (#7237 review
+            # data-regression finding, nesquena-hermes 2026-09-23).
+            _run_conversation_projected_history = copy.deepcopy(
+                _run_conversation_kwargs.get("conversation_history") or []
+            )
             result = agent.run_conversation(**_run_conversation_kwargs)
             _remember_pending_steer_result(result)
             _active_turn_identity = _resolve_active_turn_authority(
@@ -12629,6 +12717,7 @@ def _run_agent_streaming(
                         msg_text,
                         _turn_pending_source,
                         _active_turn_identity,
+                        _run_conversation_projected_history,
                     )
                 # Strip XML tool-call blocks from assistant message content.
                 # DeepSeek and some other providers emit <function_calls>...</function_calls>
@@ -13023,6 +13112,13 @@ def _run_agent_streaming(
                                     _finalize_cancelled_turn(s, ephemeral=ephemeral, message='Task cancelled before start.', stream_id=stream_id)
                                     put('cancel', _cancel_event_payload('Cancelled by user'))
                                     return
+                                # The heal retry sent its own projection;
+                                # thread it so the settle's ownership signal
+                                # matches the run that produced this result
+                                # (#7237 review data-regression finding).
+                                _heal_projected_history = copy.deepcopy(
+                                    _heal_kwargs.get("conversation_history") or []
+                                )
                                 _heal_result = agent.run_conversation(**_heal_kwargs)
                                 _remember_pending_steer_result(_heal_result)
                                 _active_turn_identity = _resolve_active_turn_authority(
@@ -13075,6 +13171,7 @@ def _run_agent_streaming(
                                     msg_text,
                                     _turn_pending_source,
                                     _active_turn_identity,
+                                    _heal_projected_history,
                                 )
                                 # normal post-result persistence path by
                                 # leaving _assistant_added truthy (set below).
@@ -14390,6 +14487,13 @@ def _run_agent_streaming(
                                 _finalize_cancelled_turn(s, ephemeral=ephemeral, message='Task cancelled before start.', stream_id=stream_id)
                             put('cancel', _cancel_event_payload('Cancelled by user'))
                             return
+                        # Terminal-heal retry: thread the projection this
+                        # retry sent so the settle can prove which rows the
+                        # current turn owns (#7237 review data-regression
+                        # finding).
+                        _heal_projected_history2 = copy.deepcopy(
+                            _heal_kwargs2.get("conversation_history") or []
+                        )
                         _heal_result = _heal_agent.run_conversation(**_heal_kwargs2)
                         _remember_pending_steer_result(_heal_result)
                         _active_turn_identity = _resolve_active_turn_authority(
@@ -14438,6 +14542,7 @@ def _run_agent_streaming(
                                         msg_text,
                                         _turn_pending_source,
                                         _active_turn_identity,
+                                        _heal_projected_history2,
                                     )
                                     # Terminal self-heal success must finalize the
                                     # turn exactly once: clear the pending markers

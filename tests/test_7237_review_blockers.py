@@ -41,6 +41,7 @@ written to avoid. ``_looks_like_current_user_turn_scan`` is the
 through the public dedupe entry point so the same regression cannot
 re-enter via either helper.
 """
+import copy
 import json
 from types import SimpleNamespace
 
@@ -592,11 +593,26 @@ class TestBlockerOwnershipFailClosed:
     Fail-closed rule: with no proven ownership — neither an active-turn
     identity/checkpoint, nor a prompt-derived match — keep the raw
     ``previous_context`` exactly as it is and do NOT slice from a guessed row.
+
+    Data-regression rule (#7237 review, nesquena-hermes 2026-09-23):
+    ``result_messages`` is the FULL conversation the Agent returned — the
+    projected history this process sent it, then the current turn's rows. The
+    only rows that may be appended to the raw ``previous_context`` are those
+    after that exact projection; a projected history that was rewritten by the
+    outbound sanitizer must never be appended beside the authoritative raw
+    history, or the duplicated rows ride the next model context too.
     """
+
+    PROMPT = "please refactor streaming.py"
 
     def _previous_context(self):
         return [
             {"role": "user", "content": "real first question", "timestamp": 1.0},
+            # Reasoning-only assistant row: the outbound sanitizer drops it, so
+            # the projection sent to the Agent is SHORTER than this raw context
+            # and no longer has it as an exact prefix — the production shape
+            # after a history rewrite (#7237 review data-regression finding).
+            {"role": "assistant", "content": "", "reasoning_content": "hidden thought", "timestamp": 1.5},
             {"role": "assistant", "content": "real first answer", "timestamp": 2.0},
             {"role": "user", "content": "second question", "timestamp": 3.0},
             {
@@ -608,6 +624,37 @@ class TestBlockerOwnershipFailClosed:
             {"role": "tool", "tool_call_id": "k1", "content": "tool output", "timestamp": 5.0},
             {"role": "assistant", "content": "second answer", "timestamp": 6.0},
         ]
+
+    def _current_turn_rows(self):
+        """The production current-turn shape: a transformed real user turn,
+        intervening assistant/tool output, then a synthetic continuation
+        user row the agent loop appended AFTER the real turn."""
+        return [
+            {
+                "role": "user",
+                "content": "Mid-turn correction (steer): " + self.PROMPT,
+            },
+            {"role": "assistant", "content": "worked on the refactor"},
+            {"role": "assistant", "content": "", "tool_calls": [_call("k2")]},
+            {"role": "tool", "tool_call_id": "k2", "content": "refactor output"},
+            {"role": "user", "content": "Continue from where you stopped"},
+            {"role": "assistant", "content": "synthetic answer"},
+        ]
+
+    def _agent_result(self, previous_context=None):
+        """Build the REAL production shape: the Agent returns
+        ``projected_history + current_turn_rows``.
+
+        The projection is ``_sanitize_messages_for_agent(raw)``, which
+        rewrites historical rows (timestamps/ids dropped, mergeable
+        assistant rows joined), so it is NOT the raw history and a byte
+        comparison against it always diverges. That divergence is precisely
+        why the settle must prove ownership from the projection rather than
+        from the raw context.
+        """
+        raw = self._previous_context() if previous_context is None else previous_context
+        projected = _sanitize_messages_for_agent(raw)
+        return projected, projected + self._current_turn_rows()
 
     def test_scan_returns_none_when_no_prompt_match(self):
         """Contract: no proven ownership -> None (never an arbitrary row)."""
@@ -632,32 +679,16 @@ class TestBlockerOwnershipFailClosed:
         projected result is NOT wholesale-accepted, so nothing is lost.
         """
         previous_context = self._previous_context()
-        # The submitted prompt survived only in a transformed shape (a steer
-        # preamble was prepended to it), so the strict text match in the scan
-        # cannot prove ownership of this row.
-        transformed = {
-            "role": "user",
-            "content": "Mid-turn correction (steer): please refactor streaming.py",
-        }
-        # A synthetic continuation user row the agent loop appended AFTER the
-        # real turn. The old fallback anchored on this row.
-        synthetic = {"role": "user", "content": "Continue from where you stopped"}
-        result_messages = [
-            transformed,
-            {"role": "assistant", "content": "worked on the refactor"},
-            {"role": "assistant", "content": "", "tool_calls": [_call("k2")]},
-            {"role": "tool", "tool_call_id": "k2", "content": "refactor output"},
-            synthetic,
-            {"role": "assistant", "content": "synthetic answer"},
-        ]
+        projected, result_messages = self._agent_result()
         # Sanity: the scan really cannot prove ownership here.
-        assert _looks_like_current_user_turn_scan(result_messages, "please refactor streaming.py") is None
+        assert _looks_like_current_user_turn_scan(result_messages, self.PROMPT) is None
 
         settled = _dedupe_replayed_context_messages(
-            previous_context, result_messages, "please refactor streaming.py", None,
+            previous_context, result_messages, self.PROMPT, None,
+            projected_history=projected,
         )
-        # Fail closed: raw context preserved, plus whatever the projection
-        # legitimately adds beyond it. Crucially, none of the raw rows may be
+        # Fail closed: raw context preserved, plus the PROVEN current-turn
+        # suffix from the projection. Crucially, none of the raw rows may be
         # dropped by a guessed boundary.
         assert settled[:len(previous_context)] == previous_context, (
             "fail-closed settle must keep the raw pre-turn context intact; "
@@ -672,39 +703,32 @@ class TestBlockerOwnershipFailClosed:
 
     def test_dedupe_does_not_persist_whole_projected_result_without_boundary(self):
         """The no-proven-boundary path must fall through to the shared
-        wholesale-acceptance guard, never to ``result_messages`` as-is.
+        wholesale-acceptance guard, never to ``result_messages`` as-is. With
+        no projection threaded there is no ownership proof at all, so the
+        settle must return the raw context alone rather than append
+        unproven historical rows.
         """
         previous_context = self._previous_context()
-        result_messages = [
-            {"role": "user", "content": "unrelated continued prompt"},
-            {"role": "assistant", "content": "assistant delta"},
-        ]
+        _projected, result_messages = self._agent_result()
+        # NOTE: the projection is deliberately NOT threaded here — this pins
+        # the caller's fail-closed contract when no ownership signal exists.
         settled = _dedupe_replayed_context_messages(
-            previous_context, result_messages, "please refactor streaming.py", None,
+            previous_context, result_messages, self.PROMPT, None,
         )
-        assert settled == previous_context + result_messages, (
-            "with no proven ownership the raw context plus the whole result "
-            "delta must be merged; dropping rows or accepting the projection "
-            "wholesale are both wrong"
+        assert settled == previous_context, (
+            "without a threaded projection the settle must fail closed to the "
+            "raw context alone; appending unproven projected rows duplicates "
+            "history beside the authoritative raw history (#7237 review "
+            "data-regression finding)"
         )
 
     def test_settle_round_trip_preserves_raw_history(self):
         """Full ``_settle_result_messages`` path: with no proven ownership the
-        persisted context keeps the raw pre-turn rows AND the projected delta,
-        so neither the historical pair nor the new turn's output is lost.
+        persisted context keeps the raw pre-turn rows AND the current turn's
+        output, so neither the historical pair nor the new turn is lost.
         """
         raw = self._previous_context()
-        result = [
-            {
-                "role": "user",
-                "content": "Mid-turn correction (steer): please refactor streaming.py",
-            },
-            {"role": "assistant", "content": "worked on the refactor"},
-            {"role": "assistant", "content": "", "tool_calls": [_call("k2")]},
-            {"role": "tool", "tool_call_id": "k2", "content": "refactor output"},
-            {"role": "user", "content": "Continue from where you stopped"},
-            {"role": "assistant", "content": "synthetic answer"},
-        ]
+        projected, result = self._agent_result()
         session = SimpleNamespace(
             messages=list(raw),
             context_messages=list(raw),
@@ -715,9 +739,10 @@ class TestBlockerOwnershipFailClosed:
             list(raw),
             list(raw),
             result,
-            "please refactor streaming.py",
+            self.PROMPT,
             "webui",
             None,
+            projected,
         )
         persisted = session.context_messages
         assert [(m["role"], m["content"]) for m in persisted[:len(raw)]] == [
@@ -733,8 +758,8 @@ class TestBlockerOwnershipFailClosed:
         assert any(
             m.get("role") == "tool" and m.get("tool_call_id") == "k1" for m in persisted
         )
-        # The projected rows are kept too — nothing between the real turn and
-        # the synthetic continuation row was swallowed.
+        # The current-turn rows are appended too — nothing between the real
+        # turn and the synthetic continuation row was swallowed.
         contents = [m.get("content") for m in persisted]
         assert "worked on the refactor" in contents
         assert "refactor output" in contents
@@ -752,6 +777,170 @@ class TestBlockerOwnershipFailClosed:
             previous_context, result_messages, prompt, None,
         )
         assert settled == previous_context + result_messages
+
+
+class TestNoProjectedHistoricalResidual:
+    """#7237 review (nesquena-hermes, 2026-09-23) data-regression finding.
+
+    ``result["messages"]`` is the FULL conversation the Agent returned —
+    ``conversation_history`` (the exact projection this process sent via
+    ``agent.run_conversation``) followed by the current turn's rows. The
+    no-boundary fallback used to pass that full list through
+    ``_strip_replayed_prefix()`` / ``_strip_replayed_context_items()`` and
+    append the residual to the raw ``previous_context``. Those helpers remove
+    suffix/prefix overlap and exact replay blocks, but rows the OUTBOUND
+    SANITIZER rewrote survive the strip as a residual, so the projected
+    history was duplicated beside the authoritative raw history and rode the
+    next model context.
+
+    The fix threads the exact projected ``conversation_history`` so only the
+    rows after that proven projection — the current turn — may be appended.
+    When no sent-history prefix (and no turn-ownership signal) proves a
+    boundary, NOTHING is appended (fail closed).
+
+    Fixtures below use the real projection (``_sanitize_messages_for_agent``),
+    which rewrites history in ways the replay-key strip cannot reverse, so the
+    old residual genuinely survives. ``result_messages`` BEGIN with the
+    projected historical prefix — the production shape the pre-existing tests
+    in ``TestBlockerOwnershipFailClosed`` never built (their
+    ``result_messages`` began at the current turn).
+    """
+
+    PROMPT = "please refactor streaming.py"
+
+    # Raw pre-turn history: the sanitizer merges the two consecutive assistant
+    # rows into ONE row, so the projection is shorter than the raw context and
+    # its surviving row is a rewritten historical row. That is the divergence
+    # that made the old strip leave a residual behind.
+    RAW_HISTORY = [
+        {"role": "user", "content": "real first question", "timestamp": 1.0},
+        {"role": "assistant", "content": "", "reasoning_content": "hidden thought", "timestamp": 1.5},
+        {"role": "assistant", "content": "call row", "tool_calls": [_call("k1")], "timestamp": 2.0},
+        {"role": "tool", "tool_call_id": "k1", "content": "tool output", "timestamp": 3.0},
+        {"role": "assistant", "content": "real first answer", "timestamp": 4.0},
+    ]
+
+    # Current turn: a TRANSFORMED real user turn (a steer preamble was
+    # prepended, so the strict prompt match in
+    # _looks_like_current_user_turn_scan cannot prove ownership), intervening
+    # assistant/tool output, and a LATER synthetic user row the agent loop
+    # appended after the real turn.
+    CURRENT_TURN = [
+        {"role": "user", "content": "Mid-turn correction (steer): " + PROMPT},
+        {"role": "assistant", "content": "worked on the refactor"},
+        {"role": "assistant", "content": "", "tool_calls": [_call("k2")]},
+        {"role": "tool", "tool_call_id": "k2", "content": "refactor output"},
+        {"role": "user", "content": "Continue from where you stopped"},
+        {"role": "assistant", "content": "synthetic answer"},
+    ]
+
+    @classmethod
+    def _fixture(cls):
+        """Build the production shape: the Agent returns
+        ``projected_history + current_turn``."""
+        raw = [copy.deepcopy(m) for m in cls.RAW_HISTORY]
+        projected = _sanitize_messages_for_agent(raw)
+        return (
+            raw,
+            projected,
+            projected + [copy.deepcopy(m) for m in cls.CURRENT_TURN],
+        )
+
+    def test_projection_diverges_from_raw_premise(self):
+        """Premise: the sanitizer rewrite really makes the projection diverge
+        from the raw history, so the old strip could not collapse it.
+        """
+        _raw, _projected, result = self._fixture()
+        # No ownership signal may prove a boundary in this fixture.
+        assert _looks_like_current_user_turn_scan(result, self.PROMPT) is None
+
+    def test_no_projected_historical_residual_is_appended(self):
+        """Direct regression: the exact projection sent to the Agent is
+        threaded, so the settle appends ONLY the proven current-turn suffix —
+        no sanitizer-rewritten historical rows survive beside the raw history.
+        """
+        raw, projected, result = self._fixture()
+        settled = _dedupe_replayed_context_messages(
+            raw, result, self.PROMPT, None,
+            projected_history=projected,
+        )
+        assert settled == raw + self.CURRENT_TURN, (
+            "the settle must be exactly raw context + the proven current-turn "
+            "suffix; a projected historical residual duplicated beside it is "
+            "the #7237 review data-regression defect"
+        )
+
+    def test_unmatched_projection_fails_closed(self):
+        """Fail closed: when the returned list does NOT start with the exact
+        projection (no sent-history prefix, no turn-ownership signal), NO
+        unproven historical rows are appended at all — not even the current
+        turn's, because its boundary is unproven too.
+        """
+        raw, projected, _result = self._fixture()
+        # A different projection (the agent rotated / rewrote history again):
+        # its prefix cannot prove the boundary.
+        mismatch = [{"role": "system", "content": "rotated history"}] + projected
+        settled = _dedupe_replayed_context_messages(
+            raw, mismatch + self.CURRENT_TURN, self.PROMPT, None,
+            projected_history=projected,
+        )
+        assert settled == raw, (
+            "with no proven sent-history prefix and no turn-ownership signal "
+            "the settle must keep the raw pre-turn context and append NOTHING "
+            "(#7237 review data-regression finding, fail closed)"
+        )
+
+    def test_full_settle_persists_raw_plus_proven_suffix_only(self):
+        """Full ``_settle_result_messages`` regression in the production
+        shape: ``result_messages`` starts with the projected historical
+        prefix, so the persisted context is exactly the raw pre-turn history
+        plus the proven current-turn suffix — no projected historical residual.
+        """
+        raw, projected, result = self._fixture()
+        session = SimpleNamespace(
+            messages=[copy.deepcopy(m) for m in raw],
+            context_messages=[copy.deepcopy(m) for m in raw],
+            truncation_watermark=None,
+        )
+        _settle_result_messages(
+            session,
+            [copy.deepcopy(m) for m in raw],
+            [copy.deepcopy(m) for m in raw],
+            result,
+            self.PROMPT,
+            "webui",
+            None,
+            projected,
+        )
+        persisted = session.context_messages
+        expected = (
+            [copy.deepcopy(m) for m in raw]
+            + [copy.deepcopy(m) for m in self.CURRENT_TURN]
+        )
+        # The settle mints stable ids on the new rows, so compare on the
+        # durable payload rather than on row identity.
+        assert [(m.get("role"), m.get("content")) for m in persisted] == [
+            (m.get("role"), m.get("content")) for m in expected
+        ], (
+            "persisted context must be raw history + proven current-turn "
+            "suffix only; a projected historical residual is the #7237 review "
+            "data-regression defect"
+        )
+        # The historical call/result pair survives untouched.
+        assert any(
+            tc.get("id") == "k1"
+            for m in persisted
+            if m.get("role") == "assistant"
+            for tc in (m.get("tool_calls") or [])
+        ), "the raw historical call k1 must survive the settle"
+        assert any(
+            m.get("role") == "tool" and m.get("tool_call_id") == "k1" for m in persisted
+        ), "the raw historical result k1 must survive the settle"
+        # The current turn's rows are all present, in order.
+        tail_contents = [m.get("content") for m in persisted[len(raw):]]
+        assert tail_contents == [m.get("content") for m in self.CURRENT_TURN], (
+            "the proven current-turn suffix must be appended verbatim"
+        )
 
 
 class TestOldGuardStillHolds:
