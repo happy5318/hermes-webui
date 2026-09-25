@@ -17736,7 +17736,13 @@ def handle_post(handler, parsed) -> bool:
             # client can offer a profile switch, while unknown/legacy
             # None-profile rows keep the 404 self-heal firing.
             _arch_profile = cli_meta.get("profile") or None
-            if _arch_profile and not _profiles_match(_arch_profile, _get_active_profile_name()):
+            if not _arch_profile:
+                # #7826: a profile-less metadata row must stay on the bare-404
+                # path. Materializing it into whichever profile happens to be
+                # active would silently re-parent a foreign session — the 404
+                # keeps the browser's stale-URL self-heal firing instead.
+                return bad(handler, "Session not found", 404)
+            if not _profiles_match(_arch_profile, _get_active_profile_name()):
                 j(handler, {
                     "error": "Session belongs to a different profile",
                     "code": "session_profile_mismatch",
