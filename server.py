@@ -355,7 +355,22 @@ class Handler(BaseHTTPRequestHandler):
             remote = '-'
         forwarded_for = None
         try:
-            forwarded_for = (self.headers.get('X-Forwarded-For') or '').split(',')[0].strip() or None
+            # #7863: never trust X-Forwarded-For from a direct client — the
+            # left-most hop is attacker-controlled. Only a trusted raw socket
+            # peer (loopback / allowlisted proxy) may assert a forwarded IP,
+            # and the chain then resolves right-to-left through the existing
+            # security helper. Direct clients fail closed (no field at all).
+            from api.routes import (
+                _forwarded_client_ip_from_trusted_proxy,
+                _raw_peer_is_trusted_proxy,
+            )
+            if _raw_peer_is_trusted_proxy(self):
+                resolved = _forwarded_client_ip_from_trusted_proxy(self)
+                # The helper falls back to the raw socket peer when no real
+                # forwarded chain exists; that value is redundant with
+                # `remote` and not worth logging as a forwarded client.
+                if resolved and resolved != remote:
+                    forwarded_for = resolved
         except Exception:
             forwarded_for = None
         record_data = {
