@@ -9846,6 +9846,14 @@ def get_state_db_session_messages(
                 # sidecar in the WebUI's internal history; the provider-safe
                 # projection strips it before any direct API request.
                 'api_content',
+                # Mid-turn steer rows are typed by the Agent
+                # (``role='user'`` + ``display_kind='steer'``). Without the
+                # type signal a state.db-read steer row renders its raw
+                # ``[OUT-OF-BAND USER MESSAGE ...]`` wrapper as a normal user
+                # bubble, and the settle scrub cannot heal it once the row is
+                # in a display list (#7834). Column presence is gated by
+                # ``available``, so an older state.db simply omits it.
+                'display_kind',
             ]
             id_col = ['id'] if 'id' in available else []
             revision_cols = []
@@ -10259,6 +10267,10 @@ def get_state_db_regeneration_tail_snapshot(
                 'tool_call_id', 'tool_calls', 'tool_name', 'reasoning',
                 'reasoning_details', 'codex_reasoning_items', 'reasoning_content',
                 'codex_message_items', 'api_content',
+                # Keep the steer type signal on the regeneration tail too: the
+                # scrub keys off it, and a row that loses it here renders its
+                # raw OOB wrapper (#7834).
+                'display_kind',
             ]
             tail_select = ['id', 'role', 'content', 'timestamp'] if 'id' in available else ['role', 'content', 'timestamp']
             for col in optional + (['active'] if 'active' in available else []):
