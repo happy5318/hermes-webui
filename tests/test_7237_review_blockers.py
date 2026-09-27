@@ -1855,3 +1855,363 @@ class TestExactPrefixAuthorityGate:
             "turn must be appended verbatim "
             "(#7237 ownership finding 2, exact-prefix authority gate)"
         )
+
+
+class TestReGate20260927RoundN:
+    """Re-gate after nesquena-hermes round-N blocker (2026-09-27).
+
+    A supplied but NON-EXACT ``projected_history`` must fail closed BEFORE
+    every non-compression recovery branch: no stale-merge, assistant/tool-only,
+    checkpoint, or prompt signal may claim ownership of sanitizer-rewritten
+    historical rows. Only ``previous_context`` survives; nothing unproven is
+    appended. Also covers the equal-length exact projection (proven EMPTY
+    suffix).
+    """
+
+    PROMPT = "current turn prompt"
+
+    @staticmethod
+    def _drop_stable_ids(rows):
+        import re as _re
+        out = []
+        for row in rows:
+            row = {k: v for k, v in row.items() if not k.startswith("_") and k not in ("id", "message_id")}
+            out.append(row)
+        return out
+
+    def _settle_with_non_exact_projection(self, raw, drifted_builder):
+        """Settle a turn whose supplied projection is NOT an exact prefix.
+
+        ``drifted_builder`` receives the sanitized projection and returns the
+        full returned list (drifted history + whatever the branch would append).
+        """
+        projected = _sanitize_messages_for_agent([copy.deepcopy(m) for m in raw])
+        result = drifted_builder(copy.deepcopy(projected))
+        session = SimpleNamespace(
+            messages=list(raw), context_messages=list(raw), truncation_watermark=None,
+        )
+        _settle_result_messages(
+            session, list(raw), list(raw), result, self.PROMPT, "webui", None,
+            projected,
+        )
+        return session.context_messages
+
+    def test_non_exact_projection_stale_merge_branch_appends_nothing(self):
+        """Stale-merge branch (history looks replayable) must not append when
+        the supplied projection is non-exact."""
+        raw = [
+            {"role": "user", "content": "hello world", "timestamp": 1.0, "source": "webui"},
+            {"role": "assistant", "content": "first answer", "timestamp": 2.0},
+        ]
+
+        def build(projected):
+            # Workspace-prefix drift: ``_message_identity`` strips the
+            # workspace prefix from user rows, so the REPLAY key still matches
+            # while the exact projection comparison does not. This is the
+            # normalized/truncated bypass that must NOT let the stale-merge
+            # branch claim ownership.
+            drifted = copy.deepcopy(projected)
+            # Combined whitespace + tail drift on the LAST replayed row: the
+            # loose raw-prefix replay path keys on normalized identity, so a
+            # tail-drifted row fails the prefix check and the stale-merge
+            # branch is entered — it must not append anything unproven.
+            drifted[-1]["content"] = "first  answer" + "TAILDRIFT"
+            return drifted + [
+                {"role": "user", "content": self.PROMPT},
+                {"role": "assistant", "content": "UNPROVEN STALE MERGE"},
+            ]
+
+        persisted = self._settle_with_non_exact_projection(raw, build)
+        assert self._drop_stable_ids(persisted) == self._drop_stable_ids(raw), (
+            "non-exact supplied projection must keep previous_context verbatim; "
+            "the stale-merge branch may not append unproven rows "
+            "(#7237 round-N blocker 1)"
+        )
+        assert "UNPROVEN STALE MERGE" not in [m.get("content") for m in persisted]
+
+    def test_non_exact_projection_assistant_tool_only_branch_appends_nothing(self):
+        """Assistant/tool-only branch must not append when the supplied
+        projection is non-exact."""
+        raw = [
+            {"role": "user", "content": "hello world", "timestamp": 1.0, "source": "webui"},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "c1", "name": "t", "input": {}}],
+             "timestamp": 2.0},
+            {"role": "tool", "content": "tool output", "tool_use_id": "c1", "timestamp": 3.0},
+        ]
+
+        def build(projected):
+            # Tool-call argument drift: identity for assistant rows keys on the
+            # visible text + tool_calls json; changing the serialization shape
+            # keeps the row recognizable to the loose replay path while the
+            # exact projection comparison fails.
+            drifted = copy.deepcopy(projected)
+            # Tool-sidecar drift that defeats the loose replay key while the
+            # assistant/tool-only branch is reachable.
+            drifted[-1]["content"] = "tool output DRIFTED"
+            return drifted + [
+                {"role": "assistant", "content": "UNPROVEN ASSISTANT/TOOL ONLY"},
+            ]
+
+        persisted = self._settle_with_non_exact_projection(raw, build)
+        assert self._drop_stable_ids(persisted) == self._drop_stable_ids(raw), (
+            "non-exact supplied projection must keep previous_context verbatim; "
+            "the assistant/tool-only branch may not append unproven rows "
+            "(#7237 round-N blocker 1)"
+        )
+        assert "UNPROVEN ASSISTANT/TOOL ONLY" not in [m.get("content") for m in persisted]
+
+    def test_non_exact_projection_checkpoint_branch_appends_nothing(self):
+        """Checkpoint/prompt-scan branch must not append when the supplied
+        projection is non-exact."""
+        raw = [
+            {"role": "user", "content": "earlier question", "timestamp": 1.0, "source": "webui"},
+            {"role": "assistant", "content": "earlier answer", "timestamp": 2.0},
+        ]
+
+        def build(projected):
+            drifted = copy.deepcopy(projected)
+            drifted[-1]["content"] = "earlier answer DRIFTED"
+            # A prompt-shaped current turn, as the checkpoint scan would pick.
+            return drifted + [
+                {"role": "user", "content": self.PROMPT},
+                {"role": "assistant", "content": "UNPROVEN CHECKPOINT"},
+            ]
+
+        persisted = self._settle_with_non_exact_projection(raw, build)
+        assert self._drop_stable_ids(persisted) == self._drop_stable_ids(raw), (
+            "non-exact supplied projection must keep previous_context verbatim; "
+            "the checkpoint/prompt scan may not append unproven rows "
+            "(#7237 round-N blocker 1)"
+        )
+        assert "UNPROVEN CHECKPOINT" not in [m.get("content") for m in persisted]
+
+    def test_non_exact_projection_prompt_branch_appends_nothing(self):
+        """Prompt-scan branch (current-turn user row discovered by text match)
+        must not append when the supplied projection is non-exact."""
+        raw = [
+            {"role": "user", "content": "repeat this prompt", "timestamp": 1.0, "source": "webui"},
+        ]
+
+        def build(projected):
+            drifted = copy.deepcopy(projected)
+            drifted[-1]["content"] = "repeat this prompt tail DRIFTED"
+            # The returned list repeats the prompt text verbatim — the prompt
+            # scan would treat its index as the turn boundary.
+            return drifted + [
+                {"role": "user", "content": "repeat this prompt"},
+                {"role": "assistant", "content": "UNPROVEN PROMPT SCAN"},
+            ]
+
+        persisted = self._settle_with_non_exact_projection(raw, build)
+        assert self._drop_stable_ids(persisted) == self._drop_stable_ids(raw), (
+            "non-exact supplied projection must keep previous_context verbatim; "
+            "the prompt scan may not append unproven rows "
+            "(#7237 round-N blocker 1)"
+        )
+        assert "UNPROVEN PROMPT SCAN" not in [m.get("content") for m in persisted]
+
+    def test_equal_length_exact_projection_is_proven_empty_suffix(self):
+        """An equal-length exact projection is a proven EMPTY suffix: the
+        current turn produced no rows, and nothing may be appended."""
+        raw = [
+            {"role": "user", "content": "hello world", "timestamp": 1.0, "source": "webui"},
+            {"role": "assistant", "content": "first answer", "timestamp": 2.0},
+        ]
+        projected = _sanitize_messages_for_agent([copy.deepcopy(m) for m in raw])
+        result = copy.deepcopy(projected)  # equal length, exact, non-empty
+        session = SimpleNamespace(
+            messages=list(raw), context_messages=list(raw), truncation_watermark=None,
+        )
+        _settle_result_messages(
+            session, list(raw), list(raw), result, self.PROMPT, "webui", None,
+            projected,
+        )
+        persisted = session.context_messages
+        assert self._drop_stable_ids(persisted) == self._drop_stable_ids(raw), (
+            "an equal-length exact projection proves an EMPTY current-turn "
+            "suffix: raw history survives and nothing is appended "
+            "(#7237 round-N blocker 2)"
+        )
+
+
+class TestRoundNDirectBranchDiscriminators:
+    """Direct dedupe-entry-point discriminators for #7237 round-N blocker 1.
+
+    Each branch (stale-merge, assistant/tool-only, checkpoint, prompt) is
+    exercised TWICE on identical fixtures: first WITHOUT a projection (the
+    control — the branch fires and appends its rows, proving the branch is
+    reachable), then WITH a supplied NON-EXACT projection (the gate fails
+    closed and the settle is exactly ``previous_context``, appending
+    NOTHING). The equal-length exact projection is pinned as a proven EMPTY
+    suffix (``[]`` from ``_proven_current_turn_suffix``, not ``None``).
+    """
+
+    PROMPT = "current turn prompt"
+
+    @staticmethod
+    def _call(cid):
+        return {"id": cid, "type": "function", "function": {"name": "t", "arguments": "{}"}}
+
+    def _raw_with_call_pair(self):
+        """Four-row raw history: two consecutive assistant rows the outbound
+        sanitizer merges, plus the call/result pair. The projection is one
+        row shorter than the raw context — a genuine sanitizer rewrite."""
+        raw = [
+            {"role": "user", "content": "first question", "timestamp": 1.0},
+            {"role": "assistant", "content": "", "tool_calls": [self._call("k1")], "timestamp": 2.0},
+            {"role": "assistant", "content": "progress", "timestamp": 2.5},
+            {"role": "tool", "tool_call_id": "k1", "content": "tool output", "timestamp": 3.0},
+        ]
+        projected = _sanitize_messages_for_agent([copy.deepcopy(m) for m in raw])
+        assert len(projected) < len(raw), (
+            "fixture premise: the sanitizer must rewrite the raw context so the "
+            "projection diverges; otherwise the discriminator is vacuous"
+        )
+        return raw, projected
+
+    def _control_appends(self, previous_context, result_messages, identity):
+        """The branch fires without a projection: the settle appends rows."""
+        settled = _dedupe_replayed_context_messages(
+            list(previous_context), list(result_messages), self.PROMPT, identity,
+        )
+        assert len(settled) > len(previous_context), (
+            "fixture premise: the branch must append rows when NO projection "
+            "is supplied, so the gate is load-bearing"
+        )
+        return settled
+
+    # --- stale-merge branch ------------------------------------------------
+
+    def test_direct_stale_merge_branch_fires_then_non_exact_projection_fails_closed(self):
+        raw, projected = self._raw_with_call_pair()
+        # The stale-merge shape: the last prior user row is replaced by a
+        # repaired current-user row carrying the stale tail + the submitted
+        # prompt, so the result no longer has the raw context as a prefix.
+        result_messages = [
+            {"role": "user", "content": "first question"},
+            {"role": "assistant", "content": "", "tool_calls": [self._call("k1")]},
+            {"role": "assistant", "content": "progress"},
+            {"role": "tool", "tool_call_id": "k1", "content": "tool output"},
+            {"role": "user", "content": "tail\n\n" + self.PROMPT},
+            {"role": "assistant", "content": "UNPROVEN STALE MERGE"},
+        ]
+        control = self._control_appends(raw, result_messages, None)
+        assert any(
+            m.get("role") == "assistant" and m.get("content") == "UNPROVEN STALE MERGE"
+            for m in control
+        ), "premise: the stale-merge branch must be the appender"
+        settled = _dedupe_replayed_context_messages(
+            list(raw), list(result_messages), self.PROMPT, None,
+            projected_history=list(projected),
+        )
+        assert settled == list(raw), (
+            "non-exact supplied projection must keep previous_context verbatim "
+            "before the stale-merge branch (#7237 round-N blocker 1)"
+        )
+
+    # --- assistant/tool-only branch ---------------------------------------
+
+    def test_direct_assistant_tool_only_branch_fires_then_non_exact_projection_fails_closed(self):
+        raw, projected = self._raw_with_call_pair()
+        result_messages = [
+            {"role": "assistant", "content": "UNPROVEN ASSISTANT/TOOL"},
+            {"role": "tool", "tool_call_id": "t1", "content": "result"},
+        ]
+        control = self._control_appends(raw, result_messages, None)
+        assert any(
+            m.get("role") == "assistant" and m.get("content") == "UNPROVEN ASSISTANT/TOOL"
+            for m in control
+        ), "premise: the assistant/tool-only branch must be the appender"
+        settled = _dedupe_replayed_context_messages(
+            list(raw), list(result_messages), self.PROMPT, None,
+            projected_history=list(projected),
+        )
+        assert settled == list(raw), (
+            "non-exact supplied projection must keep previous_context verbatim "
+            "before the assistant/tool-only branch (#7237 round-N blocker 1)"
+        )
+
+    # --- checkpoint branch ------------------------------------------------
+
+    def test_direct_checkpoint_branch_fires_then_non_exact_projection_fails_closed(self):
+        raw, projected = self._raw_with_call_pair()
+        identity = {
+            "token": "tok-1",
+            "turn_id": "turn-1",
+            "agent_turn_boundary_resolved": True,
+            "current_turn_user_idx": 3,
+            "text": self.PROMPT,
+        }
+        result_messages = [
+            {"role": "user", "content": "first question (rewritten)"},
+            {"role": "assistant", "content": "progress", "tool_calls": [self._call("k1")]},
+            {"role": "tool", "tool_call_id": "k1", "content": "tool output"},
+            {"role": "user", "content": self.PROMPT, "_active_turn_token": "tok-1"},
+            {"role": "assistant", "content": "UNPROVEN CHECKPOINT"},
+        ]
+        control = self._control_appends(raw, result_messages, identity)
+        assert any(
+            m.get("role") == "assistant" and m.get("content") == "UNPROVEN CHECKPOINT"
+            for m in control
+        ), "premise: the checkpoint branch must be the appender"
+        settled = _dedupe_replayed_context_messages(
+            list(raw), list(result_messages), self.PROMPT, identity,
+            projected_history=list(projected),
+        )
+        assert settled == list(raw), (
+            "non-exact supplied projection must keep previous_context verbatim "
+            "before the checkpoint branch (#7237 round-N blocker 1)"
+        )
+
+    # --- prompt branch -----------------------------------------------------
+
+    def test_direct_prompt_branch_fires_then_non_exact_projection_fails_closed(self):
+        raw, projected = self._raw_with_call_pair()
+        result_messages = [
+            {"role": "user", "content": "transformed prompt"},
+            {"role": "assistant", "content": "worked"},
+            {"role": "user", "content": self.PROMPT},
+            {"role": "assistant", "content": "UNPROVEN PROMPT SCAN"},
+        ]
+        control = self._control_appends(raw, result_messages, None)
+        assert any(
+            m.get("role") == "assistant" and m.get("content") == "UNPROVEN PROMPT SCAN"
+            for m in control
+        ), "premise: the prompt scan must be the appender"
+        settled = _dedupe_replayed_context_messages(
+            list(raw), list(result_messages), self.PROMPT, None,
+            projected_history=list(projected),
+        )
+        assert settled == list(raw), (
+            "non-exact supplied projection must keep previous_context verbatim "
+            "before the prompt branch (#7237 round-N blocker 1)"
+        )
+
+    # --- equal-length exact projection ------------------------------------
+
+    def test_direct_equal_length_exact_is_proven_empty_suffix_not_none(self):
+        from api.streaming import _proven_current_turn_suffix
+
+        raw = [
+            {"role": "user", "content": "hello world", "timestamp": 1.0},
+            {"role": "assistant", "content": "first answer", "timestamp": 2.0},
+        ]
+        projected = _sanitize_messages_for_agent([copy.deepcopy(m) for m in raw])
+        assert projected, "fixture premise: the projection must be non-empty"
+        result_messages = [copy.deepcopy(m) for m in projected]  # equal length, exact
+        suffix = _proven_current_turn_suffix(list(projected), list(result_messages))
+        assert suffix == [] and suffix is not None, (
+            "an equal-length exact non-empty projection is a PROVEN EMPTY "
+            "suffix ([]), distinct from None (no proof) — the old "
+            "len(result) <= len(projection) rejection collapsed the two "
+            "(#7237 round-N blocker 2)"
+        )
+        settled = _dedupe_replayed_context_messages(
+            list(raw), list(result_messages), self.PROMPT, None,
+            projected_history=list(projected),
+        )
+        assert settled == list(raw), (
+            "equal-length exact projection keeps previous_context and appends "
+            "zero rows; it must not fail closed and drop the raw context "
+            "(#7237 round-N blocker 2)"
+        )
