@@ -9737,6 +9737,21 @@ def _project_state_db_message(row, available, id_col, optional):
         msg['_state_db_row_id'] = row['id']
     if msg.get('role') == 'tool' and msg.get('tool_name') and not msg.get('name'):
         msg['name'] = msg['tool_name']
+    # A typed steer row is display-ready: strip the control wrapper here so a
+    # cold state.db load (and the bounded regeneration tail) never hands the
+    # browser the raw ``[OUT-OF-BAND USER MESSAGE ...]`` frame. The settle scrub
+    # only runs on the streaming path, so without this the wrapper survived
+    # into the UI for every row the reader projected (#7834 review).
+    # Strict by construction: only ``role='user'`` + ``display_kind='steer'``
+    # with exactly one well-formed frame is unwrapped; malformed/nested/
+    # multiple/untyped rows keep their bytes.
+    if msg.get('display_kind') == 'steer' and msg.get('role') == 'user':
+        try:
+            from api.streaming import _unwrap_steer_row_oob_marker
+        except Exception:  # pragma: no cover - streaming module unavailable
+            _unwrap_steer_row_oob_marker = None
+        if _unwrap_steer_row_oob_marker is not None:
+            _unwrap_steer_row_oob_marker(msg)
     return msg
 
 

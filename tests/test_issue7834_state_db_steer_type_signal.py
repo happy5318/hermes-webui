@@ -61,9 +61,10 @@ def test_projection_keeps_display_kind_when_the_caller_lists_it():
     )
     assert msg["display_kind"] == "steer"
     assert msg["role"] == "user"
-    # Content is projected verbatim — unwrapping is the settle scrub's job,
-    # which needs the type signal to fire at all.
-    assert msg["content"] == OOB_FRAME
+    # Content is unwrapped here, on the shared display projection, so no caller
+    # can receive a raw wrapper (the settle scrub cannot run on a cold load).
+    assert msg["content"] == "focus on the failing test"
+    assert "[OUT-OF-BAND USER MESSAGE" not in msg["content"]
 
 
 def test_projection_omits_display_kind_when_the_caller_does_not_list_it():
@@ -136,6 +137,13 @@ def _state_db_with_steer(tmp_path):
         " VALUES ('s1', 'user', ?, 3.0, 'steer', 1)",
         (OOB_FRAME,),
     )
+    # A plain user row that merely *contains* the marker text: it must never be
+    # rewritten (only role=user + display_kind=steer is unwrapped).
+    conn.execute(
+        "INSERT INTO messages (session_id, role, content, timestamp, display_kind, active)"
+        " VALUES ('s1', 'user', ?, 4.0, NULL, 1)",
+        (OOB_FRAME,),
+    )
     conn.commit()
     conn.close()
     return db_path
@@ -163,13 +171,15 @@ def test_canonical_reader_carries_the_steer_type_signal(tmp_path, monkeypatch):
 
     msgs = _read_messages(monkeypatch, tmp_path)
 
-    assert len(msgs) == 1, msgs
-    row = msgs[0]
+    steer_rows = [m for m in msgs if m.get("display_kind") == "steer"]
+    assert len(steer_rows) == 1, msgs
+    row = steer_rows[0]
     assert row["role"] == "user"
-    assert row.get("display_kind") == "steer"
-    # The wrapper is still present at this layer — the point is that the type
-    # signal arrives with it so the scrub can unwrap it downstream.
-    assert "[OUT-OF-BAND USER MESSAGE" in row["content"]
+    # The reader hands back a display-ready row: the wrapper is already
+    # unwrapped here, so a cold load never renders it (the settle scrub only
+    # runs on the streaming path and cannot heal a loaded transcript).
+    assert row["content"] == "focus on the failing test"
+    assert "[OUT-OF-BAND USER MESSAGE" not in row["content"]
 
 
 def test_canonical_reader_omits_the_type_signal_on_older_schemas(tmp_path, monkeypatch):
@@ -197,3 +207,53 @@ def test_canonical_reader_omits_the_type_signal_on_older_schemas(tmp_path, monke
 
     assert msgs and "display_kind" not in msgs[0]
     assert msgs[0]["content"] == "plain row"
+
+
+# ── display projection consumes the type signal (#7834 review round) ─────────
+
+
+def test_state_db_display_projection_unwraps_the_steer_marker(tmp_path, monkeypatch):
+    """A cold ``GET /api/session`` must show the user's text, not the wrapper.
+
+    Preserving ``display_kind`` is necessary but not sufficient: the only
+    unwrap lived in the streaming settlement path, which a cold transcript
+    load never calls, so a state.db-authoritative steer row still reached the
+    browser typed-but-still-wrapped and the reported symptom remained. The
+    reader itself must therefore hand back display-ready rows.
+    """
+    _state_db_with_steer(tmp_path)
+    msgs = _read_messages(monkeypatch, tmp_path)
+
+    steer_rows = [m for m in msgs if m.get("display_kind") == "steer"]
+    assert steer_rows, "the type signal must survive the projection"
+    assert steer_rows[0]["content"] == "focus on the failing test", (
+        "a cold state.db load must not hand the browser the raw OOB wrapper"
+    )
+    assert "[OUT-OF-BAND USER MESSAGE" not in steer_rows[0]["content"]
+
+
+def test_state_db_reader_leaves_untyped_rows_untouched(tmp_path, monkeypatch):
+    """A plain row that merely contains the marker text is never rewritten."""
+    _state_db_with_steer(tmp_path)
+    msgs = _read_messages(monkeypatch, tmp_path)
+
+    plain = [m for m in msgs if m.get("display_kind") is None]
+    assert plain, "the untyped row carrying the same text must survive"
+    assert plain[0]["content"] == OOB_FRAME
+
+
+def test_state_db_reader_preserves_a_malformed_frame(monkeypatch, tmp_path):
+    """Only a single, well-formed frame is unwrapped; anything else stays byte-for-byte.
+
+    Drives the strict unwrap the reader now uses, directly: a malformed frame
+    (no closing marker) must decline rather than half-strip the wrapper.
+    """
+    from api import streaming as streaming_module
+
+    row = {"role": "user", "display_kind": "steer", "content": OOB_FRAME}
+    row["content"] = row["content"].replace("[/OUT-OF-BAND USER MESSAGE]", "")
+
+    streaming_module._strip_oob_markers_from_messages([row])
+
+    assert row["content"].startswith("[OUT-OF-BAND USER MESSAGE")
+    assert row["content"] == OOB_FRAME.replace("[/OUT-OF-BAND USER MESSAGE]", "")
