@@ -138,7 +138,9 @@ def test_untrusted_peer_header_is_recorded_but_not_trusted(log_output):
 
     record = _record(log_output)
     assert record["client_ip"] == "192.0.2.10"
-    assert record["forwarded_for_chain"] == ["203.0.113.7", "198.51.100.9"]
+    # The raw chain is attacker-controlled and unbounded, so it is dropped
+    # from the record for an untrusted peer entirely (bounded log volume).
+    assert "forwarded_for_chain" not in record
 
 
 def test_no_forwarded_header_logs_the_raw_peer(log_output):
@@ -161,3 +163,17 @@ def test_client_ip_is_always_present(log_output):
         lines = [line for line in log_output.getvalue().strip().splitlines() if line]
         record = json.loads(lines[-1].removeprefix("[webui] "))
         assert record["client_ip"] == peer
+
+def test_hostile_repeated_header_leaves_the_record_bounded(log_output):
+    """A direct client spamming X-Forwarded-For cannot inflate the log record."""
+    hostile = ["1.1.1.1, 2.2.2.2, 3.3.3.3"] * 500
+    handler = _handler("192.0.2.10", _Headers(forwarded=hostile))
+
+    Handler.log_request(handler, "200")
+
+    line = log_output.getvalue().strip().splitlines()[-1].removeprefix("[webui] ")
+    record = json.loads(line)
+    assert record["client_ip"] == "192.0.2.10"
+    # 500 injected headers, none of them land in the structured record.
+    assert "forwarded_for_chain" not in record
+    assert len(line) < 1024, "the record must stay bounded regardless of input"

@@ -105,5 +105,7 @@ def test_log_request_ignores_forwarded_for_from_an_untrusted_peer(log_output):
     record = json.loads(line.removeprefix("[webui] "))
     assert record["remote"] == "192.0.2.10"
     assert record["client_ip"] == "192.0.2.10"
-    # The raw chain stays for debugging, explicitly untrustworthy.
-    assert record.get("forwarded_for_chain") == ["203.0.113.7, 198.51.100.9"]
+    # The raw chain is attacker-controlled and unbounded: dropped entirely for
+    # an untrusted peer so a direct client cannot write arbitrary log volume
+    # (the fail2ban-facing field stays the trustworthy raw peer).
+    assert "forwarded_for_chain" not in record

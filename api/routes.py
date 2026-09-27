@@ -6652,6 +6652,37 @@ def _forwarded_client_ip_from_trusted_proxy(handler):
     return _request_client_ip(handler)
 
 
+def _request_log_client_fields(handler, remote):
+    """Shaping helper for the request log's client fields.
+
+    Returns ``(client_ip, forwarded_for_chain)`` where ``client_ip`` is
+    authoritative — the resolved client hop when the raw socket peer is a
+    trusted proxy, otherwise the raw peer — and the chain is diagnostic-only.
+
+    The chain is returned ONLY for a trusted proxy. An untrusted peer's
+    X-Forwarded-For is attacker-controlled and unbounded, so it is dropped
+    from the structured record entirely: emitting it would let any direct
+    client write arbitrary volume into the log line regardless of trust, which
+    the security contract does not need and a fail2ban-style consumer keyed on
+    ``client_ip`` never reads (#7863).
+
+    Resolution fails closed to the raw peer on any malformed chain.
+    """
+    try:
+        xff_values = handler.headers.get_all("X-Forwarded-For") or []
+    except Exception:
+        xff_values = []
+    try:
+        if not (isinstance(remote, str) and remote and remote != "-"):
+            return "-", None
+        if not _raw_peer_is_trusted_proxy(handler):
+            return remote, None
+        resolved = _forwarded_client_ip_from_trusted_proxy(handler)
+        return (resolved or remote), list(xff_values)
+    except Exception:
+        return remote, None
+
+
 def _onboarding_request_is_local(handler) -> bool:
     """Return True when an unauthenticated onboarding request is local/private.
 
