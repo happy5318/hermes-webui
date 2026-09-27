@@ -250,7 +250,18 @@ def discover_launcher_python(agent_dir: Path | None) -> str:
 
 
 def _python_can_run_webui_and_agent(python_exe: str, agent_dir: Path | None = None) -> bool:
-    script = "import yaml\nfrom run_agent import AIAgent\n"
+    # NOTE (order matters, #7848): the agent import must come first. On
+    # PM-managed installs importing the agent relaunches this snippet through
+    # hermes_cli/venv_sync.py with `-I` (which implies -E -s and drops the
+    # caller's PYTHONPATH) and then replays it from the top. In that replay the
+    # agent import is what activates the managed runtime's dependency path, so
+    # a dependency imported *before* it is evaluated against an unprepared
+    # environment and the probe dies with a misleading
+    # `No module named 'yaml'` — reported by the relaunched interpreter, not
+    # the one the probe started with. Bootstrap then concludes that no
+    # interpreter can serve both, which on a systemd unit means a restart loop
+    # and a WebUI that never comes back up.
+    script = "from run_agent import AIAgent\nimport yaml\n"
     env = os.environ.copy()
     if agent_dir:
         # PREPEND agent_dir to PYTHONPATH so an `agent_dir/run_agent.py` wins
