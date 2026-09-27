@@ -3309,23 +3309,22 @@ function _captureModelDropdownSelection(sel){
 }
 function _modelProviderForSend(modelId){
   const model=String(modelId||'').trim();
-  const sessionProvider=(S&&S.session&&S.session.model_provider)||null;
-  const sessionModel=(S&&S.session&&S.session.model)||'';
-  // The stored session provider is only the answer while the session model is
-  // still the model being sent. A session created under provider A that later
-  // selects a model belonging to provider B must send to B — the stale value
-  // is what pinned a Claude model to Codex and surfaced as a bogus
-  // "Codex quota exhausted (429)" (#7860). A freshly created session
-  // (sessionModel empty) keeps the legacy behaviour: nothing has been
-  // selected in the picker yet, so the account default stands.
-  if(sessionProvider&&(!sessionModel||sessionModel===model)) return sessionProvider;
   if(!model) return null;
+  // Precedence (isolated by #7865, applied here for the picker-to-session
+  // hand-off): (1) an explicit provider tag carried by the outgoing value
+  // itself, (2) the provider of the dropdown option whose *normalized* model
+  // equals the outgoing model, (3) the stored session provider as fallback.
+  // Storing a bare model next to a stale provider used to win over all of
+  // them, which pinned a Claude model to Codex and surfaced as a bogus
+  // "Codex quota exhausted (429)" (#7860). Equality of a single stored field
+  // does not prove the pair was updated atomically, so it no longer
+  // short-circuits the option lookup.
   const explicitProvider=typeof _providerFromModelValue==='function'
     ? _providerFromModelValue(model)
     : '';
   if(explicitProvider) return explicitProvider;
   const sel=typeof $==='function' ? $('modelSelect') : null;
-  if(sel&&String(sel.value||'').trim()===model&&typeof _modelStateForSelect==='function'){
+  if(sel&&typeof _modelStateForSelect==='function'){
     try{
       const dropdownState=_modelStateForSelect(sel,sel.value);
       if(dropdownState&&String(dropdownState.model||'').trim()===model){
@@ -3341,6 +3340,11 @@ function _modelProviderForSend(modelId){
       }
     }catch(_){}
   }
+  // (3) The stored session provider is the last resort — a fresh session
+  // (nothing selected in the picker yet) still needs it for the account
+  // default, and no other source answered for this model.
+  const sessionProvider=(S&&S.session&&S.session.model_provider)||null;
+  if(sessionProvider) return sessionProvider;
   return null;
 }
 function _reconcileModelDropdownSelection(sel,data,previousState,opts){
