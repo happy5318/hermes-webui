@@ -1872,7 +1872,6 @@ class TestReGate20260927RoundN:
 
     @staticmethod
     def _drop_stable_ids(rows):
-        import re as _re
         out = []
         for row in rows:
             row = {k: v for k, v in row.items() if not k.startswith("_") and k not in ("id", "message_id")}
