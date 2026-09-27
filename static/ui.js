@@ -3236,21 +3236,44 @@ function _modelStateForSelect(sel, modelId){
     // otherwise mis-parse to provider "custom:backup:model-a" (#6221 re-gate).
     const routedProvider=selected?String(_getOptionProviderId(selected)||'').trim():'';
     // Normally-rendered catalog options only carry the qualified
-    // @custom:<slug>:<model> value — data-model is set solely by the fallback
+    // @<provider>:<model> value — data-model is set solely by the fallback
     // injection path (_ensureModelOptionInDropdown). When it is missing, strip
-    // the @custom:<slug>: prefix instead of sending the raw dropdown value as
-    // the model id (#6884). The prefix must come from the option metadata's
-    // authoritative provider (routedProvider), NOT from explicitProvider: the
-    // latter re-parses the value at its LAST colon, so a colon-bearing model
-    // id like @custom:backup:model-a:free would otherwise strip to just
-    // "free" (re-gate on the #6221 family). Only custom providers are
-    // stripped: a non-custom qualified id like @safe:gpt-4o-mini is a real
-    // provider namespace and must be preserved (#1771).
+    // the leading @<provider>: prefix instead of storing the raw dropdown
+    // value as the model id (#6884, #7860).
+    //
+    // The prefix must come from the option metadata's authoritative provider
+    // (routedProvider), NOT from explicitProvider: the latter re-parses the
+    // value at its LAST colon, so a colon-bearing model id like
+    // @custom:backup:model-a:free would otherwise strip to just "free"
+    // (re-gate on the #6221 family).
+    //
+    // The strip is NOT limited to custom providers: any provider that renders
+    // its options as @<provider>:<model> would otherwise persist the provider
+    // twice (once in model, once in model_provider) and the upstream answers
+    // 404 Model-not-found (#7860). A qualified id whose prefix belongs to a
+    // DIFFERENT provider than the option's own metadata is left intact — that
+    // is a real provider namespace (#1771), and stripping it would silently
+    // re-route the selection to the group's provider.
     const effectiveProvider=routedProvider||explicitProvider;
     const effectiveProviderLc=effectiveProvider.toLowerCase();
     const isCustomProvider=effectiveProviderLc==='custom'||effectiveProviderLc.startsWith('custom:');
     const explicitPrefix=`@${effectiveProvider}:`;
-    const strippedModel=isCustomProvider&&value.toLowerCase().startsWith(explicitPrefix.toLowerCase())
+    const valueCarriesPrefix=value.toLowerCase().startsWith(explicitPrefix.toLowerCase());
+    // Two ways the leading @<provider>: prefix is a genuine duplication we must
+    // strip:
+    //  (a) a custom provider's qualified id (#6884, and the value-encoded
+    //      variant where the option is missing from the catalog), or
+    //  (b) the dropdown rendered the option with a provider prefix that the
+    //      option's own metadata repeats (#7860: a non-default provider such
+    //      as @claude-subscription-…:claude-sonnet-5[1m] used to persist the
+    //      provider twice — once in `model`, once in `model_provider` — and
+    //      the upstream answered 404 Model-not-found).
+    // Anything else keeps the qualified form: a namespace like
+    // @safe:gpt-4o-mini is a real provider namespace and must be preserved
+    // (#1771).
+    const prefixIsDuplicated=(isCustomProvider&&valueCarriesPrefix)
+      ||(!!routedProvider&&valueCarriesPrefix);
+    const strippedModel=prefixIsDuplicated
       ?value.slice(explicitPrefix.length)
       :value;
     return {model:routedModel||strippedModel||value,model_provider:effectiveProvider};
@@ -3285,9 +3308,17 @@ function _captureModelDropdownSelection(sel){
   return {model:String(sel.value||''),model_provider:null};
 }
 function _modelProviderForSend(modelId){
-  const sessionProvider=(S&&S.session&&S.session.model_provider)||null;
-  if(sessionProvider) return sessionProvider;
   const model=String(modelId||'').trim();
+  const sessionProvider=(S&&S.session&&S.session.model_provider)||null;
+  const sessionModel=(S&&S.session&&S.session.model)||'';
+  // The stored session provider is only the answer while the session model is
+  // still the model being sent. A session created under provider A that later
+  // selects a model belonging to provider B must send to B — the stale value
+  // is what pinned a Claude model to Codex and surfaced as a bogus
+  // "Codex quota exhausted (429)" (#7860). A freshly created session
+  // (sessionModel empty) keeps the legacy behaviour: nothing has been
+  // selected in the picker yet, so the account default stands.
+  if(sessionProvider&&(!sessionModel||sessionModel===model)) return sessionProvider;
   if(!model) return null;
   const explicitProvider=typeof _providerFromModelValue==='function'
     ? _providerFromModelValue(model)
