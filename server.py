@@ -352,7 +352,19 @@ class Handler(BaseHTTPRequestHandler):
         emit_request_log(message)
 
     def log_request(self, code: str='-', size: str='-') -> None:
-        """Structured JSON logs for each request."""
+        """Structured JSON logs for each request.
+
+        ``client_ip`` is the TRUSTWORTHY answer: the resolved client hop when
+        the raw socket peer is a trusted proxy, otherwise the raw socket peer
+        itself. It is never an ``X-Forwarded-For`` hop chosen by an untrusted
+        peer (#7863) — the field exists so downstream security tooling
+        (fail2ban) can consume it, and an attacker-chosen value is worse than
+        no field at all: a jail keyed on it would ban a third party the
+        attacker picked.
+
+        ``forwarded_for_chain`` keeps the raw, explicitly-untrusted header
+        values for debugging.
+        """
         import json as _json
         duration_ms = round((time.time() - getattr(self, '_req_t0', time.time())) * 1000, 1)
         remote = '-'
@@ -361,11 +373,6 @@ class Handler(BaseHTTPRequestHandler):
                 remote = str(self.client_address[0])
         except Exception:
             remote = '-'
-        forwarded_for = None
-        try:
-            forwarded_for = (self.headers.get('X-Forwarded-For') or '').split(',')[0].strip() or None
-        except Exception:
-            forwarded_for = None
         record_data = {
             'ts': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
             'remote': remote,
@@ -374,8 +381,31 @@ class Handler(BaseHTTPRequestHandler):
             'status': int(code) if str(code).isdigit() else code,
             'ms': duration_ms,
         }
-        if forwarded_for:
-            record_data['forwarded_for'] = forwarded_for
+        # Raw forwarded header, verbatim — debugging data, NOT authoritative.
+        try:
+            xff_values = self.headers.get_all("X-Forwarded-For") or []
+        except Exception:
+            xff_values = []
+        try:
+            if xff_values and isinstance(record_data.get('remote'), str) and record_data['remote'] != '-':
+                from api.routes import (
+                    _raw_peer_is_trusted_proxy,
+                    _forwarded_client_ip_from_trusted_proxy,
+                )
+                # A direct client must never promote itself: the forwarded chain
+                # is consulted only when the un-spoofable socket peer is a
+                # trusted proxy. Fails closed to the raw peer on any malformed
+                # chain rather than to a header hop.
+                if _raw_peer_is_trusted_proxy(self):
+                    resolved = _forwarded_client_ip_from_trusted_proxy(self)
+                    record_data['client_ip'] = resolved or remote
+                else:
+                    record_data['client_ip'] = remote
+                record_data['forwarded_for_chain'] = list(xff_values)
+            elif isinstance(record_data.get('remote'), str) and record_data['remote'] != '-':
+                record_data['client_ip'] = remote
+        except Exception:
+            record_data['client_ip'] = remote
         record = _json.dumps(record_data)
         self._safe_webui_print(f'[webui] {record}')
 
