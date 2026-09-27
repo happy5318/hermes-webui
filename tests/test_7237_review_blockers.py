@@ -1633,3 +1633,225 @@ class TestReGate20260926OwnershipFindings:
             "strict exact prefix check must still accept a verbatim "
             "projection and return the proven current-turn suffix"
         )
+
+
+class TestExactPrefixAuthorityGate:
+    """Regression for the exact-prefix authority gap (nesquena-hermes,
+    2026-09-26).
+
+    ``_proven_current_turn_suffix`` already compared the supplied
+    model-facing projection strictly, but ``_dedupe_replayed_context_messages``
+    did not consult it when the returned list first passed the loose
+    raw-prefix fast path (``_messages_have_prefix`` with
+    ``_message_replay_key``, which normalizes whitespace and truncates content
+    after 500 characters). A replayed historical row that drifted from the
+    supplied projection only in whitespace or past character 500 was therefore
+    accepted as the old prefix and an UNPROVEN suffix was appended.
+
+    The fix resolves ``projected_history`` strict authority at the top of the
+    dedupe, before every non-compression branch: an exact projection prefix
+    appends exactly its returned suffix, a non-exact projection keeps
+    ``previous_context`` and appends nothing. These tests exercise the REAL
+    dedupe entry point (and the full ``_settle_result_messages`` path) using
+    fixtures built by the actual sanitizer.
+    """
+
+    @staticmethod
+    def _drop_stable_ids(rows):
+        """Compare complete rows, removing only newly minted stable ids."""
+        return [
+            {k: v for k, v in m.items() if k != "id"} if isinstance(m, dict) else m
+            for m in rows
+        ]
+
+    # --- direct dedupe entry point -------------------------------
+
+    def test_direct_whitespace_drift_fails_closed(self):
+        """Direct regression: a replayed historical row that differs from the
+        supplied projection only in whitespace passes the loose replay-key fast
+        path but must be rejected by the strict projection gate — the settle
+        keeps ``previous_context`` and appends NO unproven suffix.
+        """
+        from api.streaming import (
+            _message_replay_key,
+            _messages_have_prefix,
+        )
+        raw = [
+            {"role": "user", "content": "hello world", "timestamp": 1.0},
+        ]
+        projected = _sanitize_messages_for_agent([copy.deepcopy(m) for m in raw])
+        assert projected[0]["content"] == "hello world"
+        result_messages = [
+            {"role": "user", "content": "hello  world"},  # double-space drift
+            {"role": "assistant", "content": "UNPROVEN SUFFIX"},
+        ]
+        # Premise: the loose raw-prefix fast path ACCEPTS the drift — the OLD
+        # code would have taken that branch and appended the unproven suffix.
+        assert _messages_have_prefix(
+            result_messages, raw, key_fn=_message_replay_key
+        ), (
+            "fixture premise: the replay key normalizes whitespace so the "
+            "drift is invisible to the loose fast path"
+        )
+        settled = _dedupe_replayed_context_messages(
+            list(raw), list(result_messages), "hello world", None,
+            projected_history=list(projected),
+        )
+        assert settled == list(raw), (
+            "whitespace drift from the supplied projection must fail closed "
+            "to previous_context; the unproven assistant suffix must not be "
+            "appended (#7237 exact-prefix authority gap)"
+        )
+        assert [m["content"] for m in settled] == ["hello world"], (
+            "no unproven assistant row may ride the settled context"
+        )
+
+    def test_direct_post500_drift_fails_closed(self):
+        """Direct regression: a replayed historical row that diverges from the
+        supplied projection only AFTER character 500 passes the truncated
+        replay-key fast path but must be rejected by the strict projection
+        gate — the settle fails closed to ``previous_context`` alone.
+        """
+        from api.streaming import (
+            _message_replay_key,
+            _messages_have_prefix,
+        )
+        long_content = "x" * 500
+        raw = [
+            {"role": "user", "content": "first question", "timestamp": 1.0},
+            {"role": "assistant", "content": long_content, "timestamp": 2.0},
+        ]
+        projected = _sanitize_messages_for_agent([copy.deepcopy(m) for m in raw])
+        result_messages = [
+            {"role": "user", "content": "first question"},
+            # Diverges past character 500 — invisible to the truncated key.
+            {"role": "assistant", "content": long_content + "TAIL_DRIFT"},
+            {"role": "user", "content": "next question"},
+            {"role": "assistant", "content": "UNPROVEN SUFFIX"},
+        ]
+        assert _messages_have_prefix(
+            result_messages, raw, key_fn=_message_replay_key
+        ), (
+            "fixture premise: the replay key truncates at 500 and would "
+            "accept the post-500 drift on the loose fast path"
+        )
+        assert _message_replay_key(raw[1]) == _message_replay_key(result_messages[1]), (
+            "fixture premise: the two historical rows are replay-key equal"
+        )
+        settled = _dedupe_replayed_context_messages(
+            list(raw), list(result_messages), "next question", None,
+            projected_history=list(projected),
+        )
+        assert settled == list(raw), (
+            "post-500 drift from the supplied projection must fail closed to "
+            "previous_context; no unproven current-turn rows appended "
+            "(#7237 exact-prefix authority gap)"
+        )
+
+    # --- full _settle_result_messages regressions -----------------
+
+    def test_full_settle_whitespace_drift_appends_nothing(self):
+        """Full ``_settle_result_messages`` regression: whitespace drift in the
+        replayed history must fail closed — the persisted context is exactly the
+        raw pre-turn rows (compared as complete rows, only newly minted stable
+        ids stripped), with NO unproven suffix.
+        """
+        raw = [
+            {"role": "user", "content": "hello world", "timestamp": 1.0, "source": "webui"},
+            {"role": "assistant", "content": "first answer", "timestamp": 2.0},
+        ]
+        projected = _sanitize_messages_for_agent([copy.deepcopy(m) for m in raw])
+        drifted = [copy.deepcopy(m) for m in projected]
+        drifted[0]["content"] = "hello  world"
+        result = drifted + [
+            {"role": "user", "content": "next question"},
+            {"role": "assistant", "content": "UNPROVEN SUFFIX"},
+        ]
+        session = SimpleNamespace(
+            messages=list(raw), context_messages=list(raw), truncation_watermark=None,
+        )
+        _settle_result_messages(
+            session, list(raw), list(raw), result, "next question", "webui", None,
+            projected,
+        )
+        persisted = session.context_messages
+        assert self._drop_stable_ids(persisted) == self._drop_stable_ids(raw), (
+            "whitespace drift from the supplied projection must fail closed "
+            "in the full settle path; UNPROVEN SUFFIX must never persist as "
+            "the current turn (#7237 exact-prefix authority gap)"
+        )
+        assert "UNPROVEN SUFFIX" not in [m.get("content") for m in persisted]
+
+    def test_full_settle_post_500_drift_appends_nothing(self):
+        """Full ``_settle_result_messages`` regression: post-500 drift in the
+        replayed history must fail closed. Persisted context is exactly the raw
+        pre-turn rows (complete rows, stable ids stripped).
+        """
+        long_content = "x" * 500
+        raw = [
+            {"role": "user", "content": "first question", "timestamp": 1.0},
+            {"role": "assistant", "content": long_content, "timestamp": 2.0},
+        ]
+        projected = _sanitize_messages_for_agent([copy.deepcopy(m) for m in raw])
+        drifted = [copy.deepcopy(m) for m in projected]
+        drifted[1]["content"] = long_content + "TAIL_DRIFT"
+        result = drifted + [
+            {"role": "user", "content": "next question"},
+            {"role": "assistant", "content": "UNPROVEN SUFFIX"},
+        ]
+        session = SimpleNamespace(
+            messages=list(raw), context_messages=list(raw), truncation_watermark=None,
+        )
+        _settle_result_messages(
+            session, list(raw), list(raw), result, "next question", "webui", None,
+            projected,
+        )
+        persisted = session.context_messages
+        assert self._drop_stable_ids(persisted) == self._drop_stable_ids(raw), (
+            "post-500 drift from the supplied projection must fail closed in "
+            "the full settle path (#7237 exact-prefix authority gap)"
+        )
+        assert "UNPROVEN SUFFIX" not in [m.get("content") for m in persisted]
+
+    def test_full_settle_sanitize_to_empty_appends_full_return(self):
+        """Full settle when non-empty raw history sanitizes to ``[]``: the
+        ``[]`` projection proves the FULL returned list is the current-turn
+        suffix, so the persisted context is exactly raw + the returned rows
+        (complete rows, stable ids stripped) — the previous code dropped the
+        entire current turn.
+        """
+        PROMPT = "continue please"
+        raw = [
+            {
+                "role": "assistant",
+                "content": "",
+                "reasoning_content": "hidden thought",
+                "timestamp": 1.0,
+            },
+        ]
+        projected = _sanitize_messages_for_agent([copy.deepcopy(m) for m in raw])
+        assert projected == [], (
+            "fixture premise: non-empty raw history that sanitizes to [] "
+            "is the shape the empty-projection branch must handle"
+        )
+        current_turn = [
+            {"role": "user", "content": PROMPT},
+            {"role": "assistant", "content": "fresh answer"},
+        ]
+        result = list(projected) + [copy.deepcopy(m) for m in current_turn]
+        assert result == [copy.deepcopy(m) for m in current_turn]
+        session = SimpleNamespace(
+            messages=list(raw), context_messages=list(raw), truncation_watermark=None,
+        )
+        _settle_result_messages(
+            session, list(raw), list(raw), result, PROMPT, "webui", None,
+            list(projected),  # explicit []
+        )
+        persisted = session.context_messages
+        expected = list(raw) + [copy.deepcopy(m) for m in current_turn]
+        assert self._drop_stable_ids(persisted) == self._drop_stable_ids(expected), (
+            "an explicit [] projection proves the full returned list is the "
+            "current-turn suffix; raw history must survive and the current "
+            "turn must be appended verbatim "
+            "(#7237 ownership finding 2, exact-prefix authority gate)"
+        )

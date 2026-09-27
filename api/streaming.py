@@ -7536,6 +7536,49 @@ def _dedupe_replayed_context_messages(
     result_messages = list(result_messages or [])
     if not previous_context or not result_messages:
         return result_messages
+    # A compression marker is the EXPLICIT exception: the model-context layer
+    # legitimately rotated the whole context, so wholesale replacement stays
+    # allowed. Detect it once up front so every projection-authority decision
+    # below honors that exception.
+    _has_compression_marker = any(
+        _is_context_compression_marker(m) for m in result_messages
+    )
+    # The supplied ``projected_history`` is the most authoritative ownership
+    # signal we have: ``agent.run_conversation`` copies it verbatim to the
+    # head of the returned list and appends the current turn on top. Resolve
+    # its authority BEFORE every non-compression branch — raw-prefix fast
+    # path, stale-merge, assistant/tool-only, checkpoint, and prompt. A
+    # STRICT exact projection prefix may append exactly the returned suffix;
+    # a non-exact supplied projection must keep ``previous_context`` and
+    # append nothing unproven (fail closed).
+    #
+    # This closes the bypass where the loose raw-prefix fast path below
+    # (``_messages_have_prefix`` with ``_message_replay_key``, which
+    # normalizes whitespace and truncates content after 500 characters)
+    # accepted a replayed historical row that drifted from the projection only
+    # in whitespace or past character 500 and then appended an unproven suffix
+    # (#7237 review exact-prefix authority gap, nesquena-hermes 2026-09-26).
+    if projected_history is not None and not _has_compression_marker:
+        _proven_suffix = _proven_current_turn_suffix(
+            projected_history, result_messages,
+        )
+        if _proven_suffix is not None:
+            logger.info(
+                "Projected history supplied and a STRICT exact prefix of the "
+                "returned list: keeping raw pre-turn context (%d rows) + %d "
+                "proven current-turn row(s); no unproven suffix appended "
+                "(#7237 exact-prefix authority gap)",
+                len(previous_context), len(_proven_suffix),
+            )
+            return list(previous_context) + list(_proven_suffix)
+        logger.info(
+            "Projected history supplied but not a STRICT exact prefix of the "
+            "returned list (whitespace or post-500 drift): keeping raw "
+            "pre-turn context (%d rows) verbatim; no unproven historical "
+            "rows appended (#7237 exact-prefix authority gap)",
+            len(previous_context),
+        )
+        return list(previous_context)
     previous_user_tail = _stale_user_tail_candidate(_last_user_row(previous_context))
     if not _messages_have_prefix(
         result_messages,
@@ -7607,47 +7650,17 @@ def _dedupe_replayed_context_messages(
         # original call/result pair from session.context_messages (silent
         # data loss, #7237 review blocker 1). Keep the authoritative raw
         # pre-turn context and settle only the current-turn slice on top.
-        _has_compression_marker = any(
-            _is_context_compression_marker(m) for m in result_messages
-        )
+        #
+        # ``_has_compression_marker`` was resolved once at the top of this
+        # function before the projection-authority gate, so it is still in
+        # scope here. When a projection WAS supplied and there is no
+        # compression marker, the gate above already resolved it (returning
+        # ``previous_context + proven suffix`` or ``previous_context``
+        # alone); reaching this point with ``projected_history is not None``
+        # is impossible for the non-compression case. The projection-bearing
+        # branch that used to live here moved to that gate, so only the
+        # projection-less ownership scan remains.
         if not _has_compression_marker:
-            # When the caller threaded ``projected_history`` through, it is the
-            # most authoritative ownership signal we have. The Agent's replay
-            # guarantees the projection we sent is verbatim at the head of the
-            # returned list — resolve that proof FIRST. A prompt match inside
-            # the projected prefix must not become current-turn ownership: if
-            # a sanitizer-rewritten historical user row happens to equal
-            # ``msg_text`` while the real current user row is transformed and
-            # a later synthetic user also does not match, the prompt scan
-            # would otherwise locate the historical row and slice from it,
-            # appending the sanitized historical projection beside the
-            # authoritative raw history and recreating the duplication this
-            # round was intended to close (#7237 review ownership finding 1,
-            # nesquena-hermes 2026-09-26). When the projection is supplied
-            # but is not a verbatim prefix of the returned list, we have no
-            # ownership signal and the settle fails closed.
-            if projected_history is not None:
-                _proven_suffix = _proven_current_turn_suffix(
-                    projected_history, result_messages,
-                )
-                if _proven_suffix is not None:
-                    logger.info(
-                        "Prefix mismatch without compression and projected "
-                        "history supplied: keeping raw pre-turn context "
-                        "(%d rows) + %d proven current-turn row(s) from the "
-                        "projected replay; sanitized historical projection "
-                        "dropped (#7237 ownership finding 1)",
-                        len(previous_context), len(_proven_suffix),
-                    )
-                    return list(previous_context) + list(_proven_suffix)
-                logger.info(
-                    "Prefix mismatch without compression and projected "
-                    "history supplied but not a verbatim prefix: keeping raw "
-                    "pre-turn context (%d rows) verbatim; no unproven "
-                    "historical rows appended (#7237 ownership finding 1)",
-                    len(previous_context),
-                )
-                return list(previous_context)
             _boundary_idx = _find_active_turn_checkpoint_index(
                 result_messages, previous_context, active_turn_identity, msg_text,
             )
