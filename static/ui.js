@@ -3270,9 +3270,19 @@ function _modelStateForSelect(sel, modelId){
     //      the upstream answered 404 Model-not-found).
     // Anything else keeps the qualified form: a namespace like
     // @safe:gpt-4o-mini is a real provider namespace and must be preserved
-    // (#1771).
-    const prefixIsDuplicated=(isCustomProvider&&valueCarriesPrefix)
-      ||(!!routedProvider&&valueCarriesPrefix);
+    // (#1771). The account's configured default (window._defaultModel, e.g.
+    // "@safe:gpt-4o-mini") is the canonical standing default of the active
+    // provider — it is the session model on a missing/unknown-model fallback,
+    // not a catalog group's option, so it must NOT be stripped even though its
+    // own prefix happens to match the routed group provider. Grabbing others
+    // despite a matching routedProvider are genuine duplicates and still strip
+    // (#7860).
+    const configuredDefault=(typeof window!=='undefined'&&window&&window._defaultModel)?String(window._defaultModel||'').trim():'';
+    const isConfiguredDefault=!!configuredDefault&&value.toLowerCase()===configuredDefault.toLowerCase();
+    const prefixIsDuplicated=!isConfiguredDefault&&(
+      (isCustomProvider&&valueCarriesPrefix)
+      ||(!!routedProvider&&valueCarriesPrefix)
+    );
     const strippedModel=prefixIsDuplicated
       ?value.slice(explicitPrefix.length)
       :value;
