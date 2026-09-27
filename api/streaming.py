@@ -7543,42 +7543,32 @@ def _dedupe_replayed_context_messages(
     _has_compression_marker = any(
         _is_context_compression_marker(m) for m in result_messages
     )
-    # The supplied ``projected_history`` is the most authoritative ownership
-    # signal we have: ``agent.run_conversation`` copies it verbatim to the
-    # head of the returned list and appends the current turn on top. Resolve
-    # its authority BEFORE every non-compression branch — raw-prefix fast
-    # path, stale-merge, assistant/tool-only, checkpoint, and prompt. A
-    # STRICT exact projection prefix may append exactly the returned suffix;
-    # a non-exact supplied projection must keep ``previous_context`` and
-    # append nothing unproven (fail closed).
-    #
-    # This closes the bypass where the loose raw-prefix fast path below
-    # (``_messages_have_prefix`` with ``_message_replay_key``, which
-    # normalizes whitespace and truncates content after 500 characters)
-    # accepted a replayed historical row that drifted from the projection only
-    # in whitespace or past character 500 and then appended an unproven suffix
-    # (#7237 review exact-prefix authority gap, nesquena-hermes 2026-09-26).
+    # #7237 review exact-prefix authority gate (nesquena-hermes 2026-09-26):
+    # when ``projected_history`` is supplied and is a STRICT exact prefix of
+    # the returned list, that proof is authoritative and is resolved BEFORE
+    # every branch below — including the prompt/checkpoint scans, which would
+    # otherwise mis-pick a historical user row inside the projection that
+    # happens to equal ``msg_text`` (ownership finding 1) or append sanitized
+    # historical residuals beside the raw history. An explicitly-empty
+    # projection is equally authoritative: the Agent was sent no history, so
+    # the FULL returned list is the current turn's suffix (finding 2).
+    # A non-exact projection falls through to the raw-prefix fast path or the
+    # mismatch chain, where the raw context rules keep their existing
+    # assistant-only / checkpoint / prompt fallbacks (repair scenarios).
     if projected_history is not None and not _has_compression_marker:
         _proven_suffix = _proven_current_turn_suffix(
             projected_history, result_messages,
         )
         if _proven_suffix is not None:
             logger.info(
-                "Projected history supplied and a STRICT exact prefix of the "
-                "returned list: keeping raw pre-turn context (%d rows) + %d "
-                "proven current-turn row(s); no unproven suffix appended "
-                "(#7237 exact-prefix authority gap)",
+                "Projected history supplied and is a STRICT exact prefix of "
+                "the returned list: keeping raw pre-turn context (%d rows) + "
+                "%d proven current-turn row(s); no unproven suffix appended "
+                "(#7237 exact-prefix authority gate)",
                 len(previous_context), len(_proven_suffix),
             )
             return list(previous_context) + list(_proven_suffix)
-        logger.info(
-            "Projected history supplied but not a STRICT exact prefix of the "
-            "returned list (whitespace or post-500 drift): keeping raw "
-            "pre-turn context (%d rows) verbatim; no unproven historical "
-            "rows appended (#7237 exact-prefix authority gap)",
-            len(previous_context),
-        )
-        return list(previous_context)
+
     previous_user_tail = _stale_user_tail_candidate(_last_user_row(previous_context))
     if not _messages_have_prefix(
         result_messages,
@@ -7719,6 +7709,21 @@ def _dedupe_replayed_context_messages(
         # A compression marker explains the rotation: wholesale replacement of
         # the historical prefix stays legitimate.
         return result_messages
+    # Fast-path strict re-check (#7237 exact-prefix authority gap): the
+    # loose raw-prefix match normalized whitespace and truncated content at
+    # 500 characters, so a drifted historical row can look like a replayed
+    # prefix. When a projection was supplied but was NOT an exact prefix
+    # (checked in the authority gate above), a loose-match hit must still
+    # fail closed: no unproven suffix appended beside the raw context.
+    if projected_history is not None and not _has_compression_marker:
+        logger.info(
+            "Raw-prefix fast path hit, projected history supplied but not "
+            "an exact prefix: keeping raw pre-turn context (%d rows) "
+            "verbatim; no unproven suffix appended (#7237 exact-prefix "
+            "authority gap)",
+            len(previous_context),
+        )
+        return list(previous_context)
     candidates = result_messages[len(previous_context):]
     # Strip stale merges only from the new-turn candidate slice so that
     # legitimate historical user rows in the already-committed previous_context
