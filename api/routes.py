@@ -23579,9 +23579,21 @@ def _start_regeneration_stream_locked(
         worker_kwargs["regeneration"] = True
         # #7170: same dispatch-time session-profile config snapshot as the
         # normal /api/chat/start path — the detached gateway worker must not
-        # resolve config on its own thread (ambient profile leak).
-        from api.gateway_chat import _gateway_session_owner_cfg
+        # resolve config on its own thread (ambient profile leak). Capture the
+        # session-owning profile's Gateway api key and base URL alongside the
+        # snapshot so a regeneration turn carries the SESSION profile's
+        # credential: the worker now never substitutes the ambient key when a
+        # snapshot was provided, so failing to capture here would send the
+        # regenerated turn without its key (or, before #7170 round-8, with the
+        # ambient profile's key).
+        from api.gateway_chat import (
+            _gateway_session_api_key,
+            _gateway_session_base_url,
+            _gateway_session_owner_cfg,
+        )
         worker_kwargs["session_cfg"] = _gateway_session_owner_cfg(s)
+        worker_kwargs["session_api_key"] = _gateway_session_api_key(s)
+        worker_kwargs["session_base_url"] = _gateway_session_base_url(s)
     if moa_config and not backend_is_gateway:
         worker_kwargs["moa_config"] = moa_config
 

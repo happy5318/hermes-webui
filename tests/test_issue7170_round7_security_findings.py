@@ -741,3 +741,229 @@ def test_dispatch_snapshot_failure_then_subsequent_dispatch_on_same_session_succ
 
     for k in ("HERMES_WEBUI_CHAT_BACKEND", "HERMES_WEBUI_GATEWAY_BASE_URL", "HERMES_WEBUI_GATEWAY_API_KEY"):
         os.environ.pop(k, None)
+
+
+# ---------------------------------------------------------------------------
+# Finding E: empty session key must NOT fall back to the ambient key
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def two_profiles_empty_session_key(tmp_path, monkeypatch):
+    """Profile A (ambient / process-active) configures a Gateway API key;
+    profile B (the session owner) configures NONE (empty string).
+
+    This is the greptile 2026-09-26 finding on ``api/gateway_chat.py``
+    ("Empty key leaks another profile's credential") layered on top of #7170
+    round-7 P1: ``session_cfg``/``session_api_key`` are captured at dispatch
+    from the session-owning profile, but if that profile's key is EMPTY, a
+    bare ``if session_api_key`` guard in the worker treats ``""`` as absent
+    and falls back to ``_gateway_api_key()`` — which reads ``os.environ`` and
+    holds profile A's AMBIENT key. Profile B's turn is then sent with profile
+    A's credential. A non-None ``session_cfg`` snapshot must therefore force
+    the worker to use exactly the captured (possibly empty) key.
+    """
+    profile_a_home = tmp_path / "profiles" / "a"
+    profile_b_home = tmp_path / "profiles" / "b"
+    _write_profile_cfg(profile_a_home, provider="lmstudio")
+    _write_profile_cfg(profile_b_home, provider="anthropic")
+    # Profile A configures a key; profile B configures NONE (empty).
+    _write_profile_env_full(profile_a_home, api_key="KEY_FOR_PROFILE_A")
+    _write_profile_env_full(profile_b_home, api_key=None)
+
+    # Ambient/process env holds profile A's key (the WRONG key for a
+    # profile-B request).
+    monkeypatch.setenv("HERMES_CONFIG_PATH", str(profile_a_home / "config.yaml"))
+    cfg.reload_config()
+    monkeypatch.setenv("HERMES_WEBUI_GATEWAY_API_KEY", "KEY_FOR_PROFILE_A")
+    monkeypatch.delenv("API_SERVER_KEY", raising=False)
+
+    # Pin session profile -> home resolution to profile B.
+    import api.models as _models_mod
+    monkeypatch.setattr(
+        _models_mod, "_get_profile_home", lambda profile: profile_b_home
+    )
+
+    yield cfg, profile_a_home, profile_b_home, monkeypatch
+
+    monkeypatch.delenv("HERMES_CONFIG_PATH", raising=False)
+    monkeypatch.delenv("HERMES_WEBUI_GATEWAY_API_KEY", raising=False)
+    cfg.reload_config()
+
+
+def test_empty_session_api_key_helper_versus_ambient(two_profiles_empty_session_key):
+    """The dispatch-captured helper returns EMPTY for a profile with no
+    Gateway key, while the ambient ``_gateway_api_key()`` still returns the
+    process profile's key — proving both the empty capture and the leak
+    surface the worker must not fall back into.
+    """
+    _, _, profile_b_home, _ = two_profiles_empty_session_key
+    s = models.new_session(profile="b")
+    s.save()
+    assert gateway_chat._gateway_session_api_key(s) == "", (
+        "_gateway_session_api_key for a keyless profile must be the empty "
+        "string, never inherited from profile A."
+    )
+    assert gateway_chat._gateway_api_key() == "KEY_FOR_PROFILE_A", (
+        "Sanity: ambient env must hold profile A's key — this is exactly the "
+        "credential the worker must NOT fall back to."
+    )
+
+
+def test_dispatch_empty_session_key_does_not_substitute_ambient(
+    two_profiles_empty_session_key,
+):
+    """Dispatch-level: with ambient profile A holding a real key and a
+    profile-B session configuring none, the worker must be handed
+    ``session_cfg`` (owner snapshot) with ``session_api_key == \"\"`` — never
+    the ambient KEY_FOR_PROFILE_A. This is the two-side differential: the
+    dispatch must fail closed for the keyless session instead of pushing the
+    process-active credential through.
+    """
+    _, _, profile_b_home, monkeypatch = two_profiles_empty_session_key
+
+    session_dir = profile_b_home.parent / "sessions_empty"
+    session_dir.mkdir(exist_ok=True)
+    monkeypatch.setattr(models, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
+    monkeypatch.setattr(models, "SESSIONS", OrderedDict())
+    monkeypatch.setattr(routes, "set_last_workspace", lambda workspace, **_kw: None)
+    monkeypatch.setattr(
+        routes, "create_stream_channel", lambda: create_stream_channel()
+    )
+
+    captured_thread: dict = {}
+
+    class ImmediateThread:
+        def __init__(self, *args, **kwargs):
+            captured_thread["kwargs"] = kwargs
+            self.args = args
+
+        def start(self):
+            return None
+
+    monkeypatch.setattr(routes.threading, "Thread", ImmediateThread)
+
+    s = models.new_session(profile="b")
+    s.pending_user_message = "hello"
+    s.pending_attachments = []
+    s.pending_started_at = 1.0
+    s.title = "Profile B (no key)"
+    s.messages = [{"role": "user", "content": "hello"}]
+    s.save()
+
+    os.environ["HERMES_WEBUI_CHAT_BACKEND"] = "gateway"
+    try:
+        response = routes._start_chat_stream_for_session(
+            s,
+            msg="hello",
+            attachments=[],
+            workspace=str(session_dir),
+            model=_GATEWAY_MODEL,
+            model_provider="anthropic",
+            external_runtime_owned=True,
+        )
+    finally:
+        del os.environ["HERMES_WEBUI_CHAT_BACKEND"]
+    assert response and "stream_id" in response
+
+    worker_kwargs = (captured_thread.get("kwargs") or {}).get("kwargs") or {}
+    assert isinstance(worker_kwargs.get("session_cfg"), dict), (
+        "Dispatch must hand the worker a session_cfg owner snapshot."
+    )
+    sent_key = worker_kwargs.get("session_api_key")
+    assert sent_key == "", (
+        f"Dispatch handed worker session_api_key={sent_key!r}; expected ``. "
+        "A session profile with no configured key must NOT receive the "
+        "ambient KEY_FOR_PROFILE_A (empty-key ambient fallback is live)."
+    )
+
+
+def test_gateway_worker_empty_session_key_sends_no_ambient_auth(
+    two_profiles_empty_session_key,
+):
+    """End-to-end: with the dispatch-captured snapshot (``session_cfg``) and
+    an EMPTY session key, the worker's outgoing requests must NOT carry
+    profile A's ``Authorization`` header. Fail closed: no Authorization,
+    never the ambient credential.
+    """
+    _, _, profile_b_home, monkeypatch = two_profiles_empty_session_key
+
+    session_dir = profile_b_home.parent / "sessions_e2e_empty"
+    session_dir.mkdir(exist_ok=True)
+    monkeypatch.setattr(models, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
+    monkeypatch.setattr(models, "SESSIONS", OrderedDict())
+
+    captured: dict = {"headers": [], "urls": []}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def __iter__(self):
+            yield b'data: {"choices":[{"delta":{"content":"done"}}]}\n\n'
+            yield b'data: [DONE]\n\n'
+
+    def fake_urlopen(req, timeout=0):
+        captured["headers"].append(dict(req.headers or {}))
+        captured["urls"].append(
+            req.full_url if hasattr(req, "full_url") else req.get_full_url()
+        )
+        return FakeResponse()
+
+    monkeypatch.setattr(gateway_chat.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(
+        streaming, "_load_webui_prefill_context", lambda c: {"messages": []}
+    )
+    monkeypatch.setattr(
+        streaming, "_prefill_messages_with_webui_context", lambda ctx, c: []
+    )
+    # Force the legacy chat-completions path (no runs-API approval probing)
+    # so the Authorization handling is unambiguous.
+    monkeypatch.setattr(gateway_chat, "_gateway_use_runs_api_enabled", lambda cfg: False)
+
+    s = models.new_session(profile="b")
+    s.pending_user_message = "hello"
+    s.pending_attachments = []
+    s.pending_started_at = 1.0
+    s.save()
+    stream_id = "stream-empty-key"
+    s.active_stream_id = stream_id
+    channel = create_stream_channel()
+    STREAMS[stream_id] = channel
+
+    session_cfg = gateway_chat._gateway_session_owner_cfg(s)
+    session_api_key = gateway_chat._gateway_session_api_key(s)
+    assert session_api_key == "", "test precondition: session key is empty"
+    session_base_url = gateway_chat._gateway_session_base_url(s)
+
+    gateway_chat._run_gateway_chat_streaming(
+        s.session_id,
+        "hello",
+        _GATEWAY_MODEL,
+        str(session_dir),
+        stream_id,
+        [],
+        model_provider="anthropic",
+        session_cfg=session_cfg,
+        session_api_key=session_api_key,
+        session_base_url=session_base_url,
+    )
+
+    assert captured["urls"], "worker never issued an outgoing request"
+    auths = [h.get("Authorization", "") for h in captured["headers"]]
+    for auth in auths:
+        assert "KEY_FOR_PROFILE_A" not in auth, (
+            f"Outgoing request carried the AMBIENT credential {auth!r}; "
+            "a session with no configured Gateway key must fail closed and "
+            "never send profile A's key."
+        )
+    assert all(auth == "" for auth in auths), (
+        f"Outgoing requests carried an Authorization header ({auths!r}); "
+        "an empty session key must produce NO Authorization header (fail "
+        "closed), not the ambient credential."
+    )

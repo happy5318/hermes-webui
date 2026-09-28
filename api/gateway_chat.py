@@ -1462,7 +1462,22 @@ def _run_gateway_chat_streaming(
         # either fails auth or sends the wrong credential to the wrong
         # endpoint. Legacy direct callers that pre-date the dispatch capture
         # pass ``session_api_key=None`` and fall through to the env read.
-        if isinstance(session_api_key, str) and session_api_key:
+        #
+        # Dispatch-captured snapshot (``session_cfg`` is a non-None dict): the
+        # worker must use EXACTLY the captured key, including when it is
+        # EMPTY. An empty captured key means the session-owning profile
+        # configures no Gateway key, so the request goes out without an
+        # ``Authorization`` header (fail closed, issue #7074's anonymous
+        # local-gateway path). Substituting the ambient process-active
+        # profile's key here would attach ANOTHER profile's credential to
+        # this session's request — a bare ``if session_api_key`` guard treats
+        # ``""`` as absent and leaks the ambient key (greptile 2026-09-26 P1
+        # "Empty key leaks another profile's credential"). Only direct/legacy
+        # callers that did NOT hand in a session snapshot may fall back to the
+        # ambient env read.
+        if session_cfg is not None:
+            _api_key = session_api_key if isinstance(session_api_key, str) else ""
+        elif isinstance(session_api_key, str) and session_api_key:
             _api_key = session_api_key
         else:
             _api_key = _gateway_api_key()
