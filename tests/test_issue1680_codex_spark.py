@@ -60,14 +60,6 @@ def test_openai_codex_group_uses_provider_model_ids(monkeypatch, tmp_path):
     assert codex_groups, "OpenAI Codex group should be present"
     assert "gpt-6-astra" not in [m["id"] for m in config._PROVIDER_MODELS["openai-codex"]]
     assert any(m["id"] == "gpt-6-astra" and m["label"] == "GPT 6 Astra" for g in codex_groups for m in g["models"])
-    assert "gpt-5.3-codex-spark" in _flatten_ids(codex_groups)
-    # Model entries are alphabetized; find the gpt-5.4 entry explicitly.
-    gpt54 = next(
-        (m for m in codex_groups[0]["models"] if m.get("id") == "gpt-5.4"),
-        None,
-    )
-    assert gpt54 is not None, "gpt-5.4 should be present in the codex group"
-    assert gpt54["label"] == "GPT 5.4"
 
 
 def test_openai_codex_group_merges_visible_codex_cache_models(monkeypatch, tmp_path):

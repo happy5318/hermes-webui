@@ -270,6 +270,11 @@ function makeNode(tag) {
     querySelector(selector) { return this._qs ? this._qs[selector] || null : null; },
     setAttribute(name, value) { this[name] = value; },
     focus() { this._focused = true; },
+    click() {
+      const event = { stopPropagation() {}, preventDefault() {} };
+      if (this._listeners.click) this._listeners.click(event);
+      if (typeof this.onclick === 'function') this.onclick(event);
+    },
   };
   node.classList = makeClassList();
   defineClassName(node);
@@ -408,7 +413,7 @@ const searchInput = dropdown.children[1].querySelector('.model-search-input');
 searchInput.value = payload.searchTerm;
 searchInput._listeners.input();
 const searched = snapshot(dropdown);
-initialShowAllRow.onclick({ stopPropagation() {} });
+initialShowAllRow.click();
 const searchInputAfterExpand = dropdown.children[1].querySelector('.model-search-input');
 searchInputAfterExpand.value = '';
 searchInputAfterExpand._listeners.input();
@@ -545,6 +550,11 @@ function makeNode(tag) {
     },
     setAttribute(name, value) { this[name] = value; },
     focus() { this._focused = true; },
+    click() {
+      const event = { stopPropagation() {}, preventDefault() {} };
+      if (this._listeners.click) this._listeners.click(event);
+      if (typeof this.onclick === 'function') this.onclick(event);
+    },
   };
   Object.defineProperty(node, 'offsetTop', {
     value: 0,
@@ -765,7 +775,7 @@ const initialShowAllRow = findInTree(dropdown, node => String(node._innerHTML ||
 // fresh DOM with .model-opt-more still present. Searching first would trigger
 // a full re-render that removes .model-opt-more, making the stale onclick
 // reference fall into the full-rerender fallback instead of in-place.
-initialShowAllRow.onclick({ stopPropagation() {} });
+initialShowAllRow.click();
 const expanded = snapshot(dropdown);
 // Now type a search, then clear it, to verify the hiddenByDefault sync
 // keeps the group fully expanded through the search→clear cycle.
@@ -876,6 +886,11 @@ function makeNode(tag) {
     querySelector(selector) { return this._qs ? this._qs[selector] || null : null; },
     setAttribute(name, value) { this[name] = value; },
     focus() { this._focused = true; },
+    click() {
+      const event = { stopPropagation() {}, preventDefault() {} };
+      if (this._listeners.click) this._listeners.click(event);
+      if (typeof this.onclick === 'function') this.onclick(event);
+    },
   };
   node.classList = makeClassList();
   defineClassName(node);
@@ -1121,6 +1136,11 @@ function makeNode(tag) {
     },
     setAttribute(name, value) { this[name] = value; },
     focus() { this._focused = true; },
+    click() {
+      const event = { stopPropagation() {}, preventDefault() {} };
+      if (this._listeners.click) this._listeners.click(event);
+      if (typeof this.onclick === 'function') this.onclick(event);
+    },
   };
   Object.defineProperty(node, 'offsetTop', {
     value: 0,
@@ -1347,7 +1367,7 @@ eval(extractConst('_expandOverflowGroup'));
 
 renderModelDropdown();
 const initialShowAllRow = findInTree(dropdown, node => String(node._innerHTML || '').includes('Show all'));
-initialShowAllRow.onclick({ stopPropagation() {} });
+initialShowAllRow.click();
 
 // Check if preexisting models are now visible - look through all innerHTML or textContent
 const idsToFind = new Set(payload.preexistingModelIds || []);
@@ -1513,6 +1533,11 @@ function makeNode(tag) {
     },
     setAttribute(name, value) { this[name] = value; },
     focus() { this._focused = true; },
+    click() {
+      const event = { stopPropagation() {}, preventDefault() {} };
+      if (this._listeners.click) this._listeners.click(event);
+      if (typeof this.onclick === 'function') this.onclick(event);
+    },
   };
   Object.defineProperty(node, 'offsetTop', { value: 0 });
   Object.defineProperty(node, 'scrollTop', {
@@ -1689,7 +1714,7 @@ eval(extractConst('_expandOverflowGroup'));
 
 renderModelDropdown();
 const showAllRow = findInTree(dropdown, node => String(node._innerHTML || '').includes('Show all'));
-showAllRow.onclick({ stopPropagation() {} });
+showAllRow.click();
 
 const groupWrapper = querySelectorAllImpl(dropdown, '.model-group-body[data-group="g-1"]')[0] || null;
 let sortError = '';
@@ -2249,6 +2274,11 @@ function makeNode(tag) {
     },
     setAttribute(name, value) { this[name] = value; },
     focus() { this._focused = true; },
+    click() {
+      const event = { stopPropagation() {}, preventDefault() {} };
+      if (this._listeners.click) this._listeners.click(event);
+      if (typeof this.onclick === 'function') this.onclick(event);
+    },
   };
   Object.defineProperty(node, 'offsetTop', { value: 0 });
   Object.defineProperty(node, 'scrollTop', {
@@ -2467,11 +2497,39 @@ const beforeOuterDisplay = groupWrapperBefore
   : 'missing';
 const beforeForceOpenHasOpenRouter = !!(window.__modelGroupForceOpenByPicker.composer && window.__modelGroupForceOpenByPicker.composer.has('openrouter'));
 
-// Click the "Show all" expander — the showAll row lives inside the (still
-// collapsed) outer wrapper; findInTree does a depth-first traversal that
-// ignores CSS display, so this still finds and clicks it.
+// #7528 greptile P2: a real user CANNOT click "Show all" while the outer
+// OpenRouter group is collapsed — the wrapper is display:none so the
+// expander is unreachable. Expose that precondition: the expander must be
+// clicked only while the group is user-visible, and reaching it means first
+// expanding the group via its heading (the actual click listener
+// renderModelDropdown wires on the heading node).
+const openRouterHeading = groupWrapperBefore ? groupWrapperBefore.previousElementSibling : null;
+const showHeadingHasClickHandler = !!(openRouterHeading && openRouterHeading._listeners && openRouterHeading._listeners.click);
+const showAllGroupOpenBeforeClick = !!(groupWrapperBefore && groupWrapperBefore.style.display !== 'none');
+
+// Real user step 1: expand the collapsed OpenRouter group by clicking its
+// heading — the ACTUAL click listener renderModelDropdown wired on the
+// heading node (ui.js: heading.addEventListener('click', ...)), found through
+// the DOM tree (the wrapper's previousElementSibling), not a synthetic hook.
+if (openRouterHeading && openRouterHeading._listeners && openRouterHeading._listeners.click) {
+  openRouterHeading.click();
+}
+// The heading toggle must have flipped the wrapper to open, given the heading
+// the 'open' class, and recorded the user's intent on the cross-render
+// force-open set (ui.js heading handler keeps _forceOpenGroups in sync with
+// manual toggles), so the follow-up Show-all re-render keeps the group open.
+const afterHeadingClickOuterDisplay = groupWrapperBefore
+  ? (('display' in groupWrapperBefore.style) ? groupWrapperBefore.style.display : '')
+  : 'missing';
+const afterHeadingClickHasOpen = !!(openRouterHeading && openRouterHeading.classList.contains('open'));
+const afterHeadingClickForceOpenHasOpenRouter = !!(window.__modelGroupForceOpenByPicker.composer && window.__modelGroupForceOpenByPicker.composer.has('openrouter'));
+
+// Real user step 2: the outer group is now open, so the "Show all" expander
+// is genuinely user-reachable; record that precondition right before
+// clicking it, then click it.
+const showAllGroupOpenJustBeforeClick = !!(groupWrapperBefore && groupWrapperBefore.style.display !== 'none');
 const showAllRow = findInTree(dropdown, node => String(node._innerHTML || '').includes('Show all'));
-showAllRow.onclick({ stopPropagation() {} });
+showAllRow.click();
 
 // After expand, the subgroup bodies must STILL be populated and the headings
 // must still be present. Pre-fix, the in-place re-sort moved every
@@ -2516,6 +2574,12 @@ process.stdout.write(JSON.stringify({
   beforeSnapshot,
   beforeOuterDisplay,
   beforeForceOpenHasOpenRouter,
+  showHeadingHasClickHandler,
+  showAllGroupOpenBeforeClick,
+  showAllGroupOpenJustBeforeClick,
+  afterHeadingClickOuterDisplay,
+  afterHeadingClickHasOpen,
+  afterHeadingClickForceOpenHasOpenRouter,
   afterSubgroupCount: subBodiesAfter.length,
   afterSubHeadingCount: subHeadingsAfter.length,
   afterSnapshot,
@@ -2659,6 +2723,48 @@ def test_show_more_preserves_openrouter_subgroup_bodies(_subgroup_driver_path):
     assert out["beforeForceOpenHasOpenRouter"] is False, (
         "Pre-click the cross-render force-open set must not carry "
         f"'openrouter' yet. Got {out['beforeForceOpenHasOpenRouter']!r}."
+    )
+    # #7528 greptile P2: the driver must reach "Show all" exactly the way a
+    # user does — by first expanding the collapsed OpenRouter group through
+    # its heading. Clicking the expander while the outer wrapper is
+    # display:none is impossible in the browser (the control is hidden), so
+    # the driver now drives the heading's real click listener and asserts the
+    # collapsed -> open precondition transitions before poking the expander.
+    assert out["showHeadingHasClickHandler"], (
+        "The OpenRouter heading must expose the click listener "
+        "renderModelDropdown wired on it, so the driver can expand the group "
+        "through the real control instead of a hidden expander."
+    )
+    assert out["showAllGroupOpenBeforeClick"] is False, (
+        "Pre-interaction the openrouter wrapper must be collapsed, so the "
+        "'Show all' row is NOT user-reachable yet. Got "
+        f"showAllGroupOpenBeforeClick={out['showAllGroupOpenBeforeClick']!r}."
+    )
+    assert out["afterHeadingClickOuterDisplay"] != "none", (
+        "Clicking the OpenRouter heading must flip the wrapper open "
+        f"(display != 'none'). Got afterHeadingClickOuterDisplay="
+        f"{out['afterHeadingClickOuterDisplay']!r}."
+    )
+    assert out["afterHeadingClickHasOpen"] is True, (
+        "Clicking the OpenRouter heading must add the 'open' class to it so "
+        f"the user sees the group as expanded. Got afterHeadingClickHasOpen="
+        f"{out['afterHeadingClickHasOpen']!r}."
+    )
+    assert out["afterHeadingClickForceOpenHasOpenRouter"] is True, (
+        "Opening the group through its heading must record the intent on the "
+        "cross-render force-open set (ui.js heading handler syncs "
+        "_forceOpenGroups with manual toggles) so the follow-up Show-all "
+        "survives a re-render. Got "
+        f"afterHeadingClickForceOpenHasOpenRouter="
+        f"{out['afterHeadingClickForceOpenHasOpenRouter']!r}."
+    )
+    assert out["showAllGroupOpenJustBeforeClick"] is True, (
+        "Show all must be clicked only after the user expanded the OpenRouter "
+        "group by clicking its heading. Got "
+        f"showAllGroupOpenJustBeforeClick={out['showAllGroupOpenJustBeforeClick']!r} "
+        "— the wrapper was still display:none, an unreachable state (greptile "
+        "P2: 'driver calls showAllRow.onclick while OpenRouter is collapsed, "
+        "skipping the required heading click')."
     )
     assert out["afterOuterDisplay"] != "none", (
         "Post-click the openrouter wrapper must stay expanded (display "
