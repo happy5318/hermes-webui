@@ -21,6 +21,18 @@ class FakeHeaders(dict):
     def get(self, key, default=None):
         return dict.get(self, key, default)
 
+    def get_all(self, key):
+        # Production HTTPMessage.get_all returns a list of every header line for
+        # the key. A plain single-valued fake holds at most one line, so mirror
+        # it as a one-element list (or empty when absent). Implementing this —
+        # not just get() — is load-bearing: if the resolver calls get_all() on a
+        # double whose get_all is missing, the AttributeError is swallowed by
+        # log_request's broad `except` and the field is absent by exception, not
+        # by the peer/validation check we mean to assert. (test_issue2775 and
+        # the real multi-value-header test below pin real get_all() too.)
+        value = dict.get(self, key)
+        return [value] if value is not None else []
+
 
 def _make_handler(remote_ip, xff=None, real_ip=None):
     headers = FakeHeaders()
