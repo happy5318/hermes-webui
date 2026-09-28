@@ -367,6 +367,343 @@ class TestGenuineRotationStillWholesale:
         )
 
 
+class TestDriftedHistoricalMarkerCannotBypassProjectionAuthority:
+    """Round-N follow-up (nesquena-hermes review, 2026-09-28T04:34:04Z on
+    HEAD ``021c37a7``): residual 1 is only half fixed.
+
+    ``_current_turn_compression_rotation`` recognizes a historical marker by
+    MODEL-FIELD-EXACT equality against a row in the supplied
+    ``projected_history``. A marker can DRIFT between the projection this
+    process sent and the conversation the Agent returned (a re-rendered card,
+    an updated summary, a re-timestamped row). The exact-equality filter then
+    no longer recognizes it as historical, the marker heads the return, the
+    rotation predicate flips True — and the settle reaches the wholesale
+    ``return result_messages`` path, discarding the authoritative raw history.
+
+    Maintainer reproduction: a prior historical marker present in BOTH raw and
+    projected history, with only that marker changed in the returned list.
+    Wholesale replacement must never be authorized by a drifted marker.
+    """
+
+    def test_drifted_historical_marker_non_exact_projection_fails_closed(self):
+        """A historical marker whose text drifted in the return must not
+        authorize wholesale replacement: the raw pre-turn context is kept
+        verbatim and nothing unproven is appended."""
+        raw, projected = _Fixture.assert_fixture_premises()
+        # The projection's own marker, drifted, heads the returned list.
+        drifted_projected = copy.deepcopy(projected)
+        drifted_projected[0] = copy.deepcopy(drifted_projected[0])
+        drifted_projected[0]["content"] = (
+            "[CONTEXT COMPACTION — REFERENCE ONLY] earlier turns were compacted "
+            "(restated with a newer revision)"
+        )
+        # ...and a later non-marker row drifts too, so the supplied projection
+        # is NOT a strict exact prefix of the return.
+        drifted_projected[-1] = copy.deepcopy(drifted_projected[-1])
+        drifted_projected[-1]["content"] = str(
+            drifted_projected[-1].get("content") or ""
+        ) + " DRIFTED"
+        result_messages = drifted_projected + [
+            copy.deepcopy(m) for m in _Fixture.CURRENT_TURN
+        ]
+        # Premises: the return heads with a marker, that marker is NOT
+        # model-field-exact to any supplied projection row, and the strict
+        # exact-prefix proof is defeated. The drifted marker is still the
+        # SAME historical marker, so it must not authorize a new rotation
+        # (round-N residual 1).
+        from api.streaming import (
+            _current_turn_compression_rotation,
+            _model_row_exact_equal,
+        )
+
+        assert _is_context_compression_marker(result_messages[0]), (
+            "fixture premise: the drifted marker still looks like a marker"
+        )
+        assert not any(
+            _model_row_exact_equal(result_messages[0], p) for p in projected
+        ), (
+            "fixture premise: the drift defeats model-field-exact "
+            "recognition of the historical marker"
+        )
+        assert _proven_current_turn_suffix(projected, result_messages) is None, (
+            "fixture premise: a non-exact return defeats the strict suffix proof"
+        )
+        assert not _current_turn_compression_rotation(
+            result_messages, projected, "third question"
+        ), (
+            "a drifted historical marker must NOT be treated as a new "
+            "current-turn rotation (round-N residual 1)"
+        )
+        settled = _dedupe_replayed_context_messages(
+            list(raw), list(result_messages), "third question", None,
+            projected_history=list(projected),
+        )
+        assert settled == raw, (
+            "a DRIFTED historical marker must not authorize wholesale "
+            "replacement: the settle must fail closed to the raw pre-turn "
+            "context (round-N residual 1, drifted-marker case)"
+        )
+
+    def test_drifted_historical_marker_full_settle_preserves_raw_history(self):
+        """Full ``_settle_result_messages`` regression for the drifted-marker
+        case: the persisted model context is the raw history alone — the
+        sanitizer-dropped reasoning row, the merged assistant rows and the
+        tool call/result pair all survive, and no returned historical row
+        replaces them."""
+        raw, projected = _Fixture.assert_fixture_premises()
+        drifted_projected = copy.deepcopy(projected)
+        drifted_projected[0] = copy.deepcopy(drifted_projected[0])
+        drifted_projected[0]["content"] = (
+            "[CONTEXT COMPACTION — REFERENCE ONLY] earlier turns were compacted "
+            "(restated with a newer revision)"
+        )
+        result_messages = drifted_projected + [
+            copy.deepcopy(m) for m in _Fixture.CURRENT_TURN
+        ]
+        session = SimpleNamespace(
+            messages=[copy.deepcopy(m) for m in raw],
+            context_messages=[copy.deepcopy(m) for m in raw],
+            truncation_watermark=None,
+        )
+        _settle_result_messages(
+            session,
+            [copy.deepcopy(m) for m in raw],
+            [copy.deepcopy(m) for m in raw],
+            result_messages,
+            "third question",
+            "webui",
+            None,
+            list(projected),
+        )
+        persisted = session.context_messages
+        assert _role_content(persisted) == _role_content(raw), (
+            "a drifted historical marker must not wholesale-replace the raw "
+            "history: the settled context is the raw pre-turn context verbatim "
+            "(round-N residual 1, drifted-marker case, full settle)"
+        )
+        # The sanitizer-dropped raw rows survived.
+        assert any(
+            m.get("role") == "assistant" and m.get("reasoning_content")
+            for m in persisted
+        ), "the reasoning-only assistant row must survive"
+        assert any(
+            m.get("role") == "assistant"
+            and any(tc.get("id") == "k1" for tc in (m.get("tool_calls") or []))
+            for m in persisted
+        ), "the assistant row carrying tool_calls[k1] must survive"
+        assert any(
+            m.get("role") == "tool" and m.get("tool_call_id") == "k1"
+            for m in persisted
+        ), "the tool result for k1 must survive"
+
+
+class TestHistoricalUserLiteralMarkerCannotBypassProjectionAuthority:
+    """Round-N follow-up (2026-09-28T04:34:04Z): a HISTORICAL user row that
+    literally begins with ``[CONTEXT COMPACTION`` (typed in an earlier turn,
+    persisting inside the projected history) must never grant wholesale
+    replacement when it drifts in the return.
+
+    The current head only rejects a marker that matches the CURRENT turn's
+    ``msg_text``. A historical literal marker from an earlier turn is not that
+    prompt, so it survives the check and authorizes a wholesale swap.
+    """
+
+    LITERAL = "[CONTEXT COMPACTION — REFERENCE ONLY] what does this marker mean?"
+
+    def test_historical_user_literal_marker_drifted_fails_closed(self):
+        raw = [
+            {"role": "user", "content": "first question", "timestamp": 1.0},
+            {"role": "assistant", "content": "first answer", "timestamp": 2.0},
+            {
+                "role": "user",
+                "content": self.LITERAL + " (earlier turn, restated)",
+                "timestamp": 3.0,
+            },
+            {"role": "assistant", "content": "literal explanation", "timestamp": 4.0},
+        ]
+        projected = _sanitize_messages_for_agent([copy.deepcopy(m) for m in raw])
+        # Premise: the historical literal marker row IS inside the projection.
+        assert any(
+            _is_context_compression_marker(m)
+            and m.get("role") == "user"
+            and str(m.get("content") or "").startswith("[CONTEXT COMPACTION")
+            for m in projected
+        ), "fixture premise: a historical user row literal marker is projected"
+        # The return drifts that row and appends the current turn, so the
+        # projection is not a strict exact prefix.
+        drifted_projected = copy.deepcopy(projected)
+        for idx, m in enumerate(drifted_projected):
+            if (
+                _is_context_compression_marker(m)
+                and m.get("role") == "user"
+                and str(m.get("content") or "").startswith("[CONTEXT COMPACTION")
+            ):
+                drifted_projected[idx] = copy.deepcopy(m)
+                drifted_projected[idx]["content"] = str(m.get("content") or "") + " DRIFTED"
+                break
+        result_messages = drifted_projected + [
+            {"role": "user", "content": "current question"},
+            {"role": "assistant", "content": "current answer"},
+        ]
+        from api.streaming import _current_turn_compression_rotation
+
+        assert _proven_current_turn_suffix(projected, result_messages) is None, (
+            "fixture premise: the drift defeats the strict suffix proof"
+        )
+        assert not _current_turn_compression_rotation(
+            result_messages, projected, "current question"
+        ), (
+            "a drifted HISTORICAL user literal marker must NOT be treated as "
+            "a new current-turn rotation (round-N residual 1)"
+        )
+        settled = _dedupe_replayed_context_messages(
+            list(raw), list(result_messages), "current question", None,
+            projected_history=list(projected),
+        )
+        assert settled == raw, (
+            "a drifted historical user-literal marker must not wholesale-"
+            "replace the raw history (round-N residual 1, historical-literal case)"
+        )
+
+
+class TestStrictProvenSuffixIsNotReplayStripped:
+    """Round-N follow-up (2026-09-28T04:34:04Z): the strict-prefix branch
+    deletes a legitimate repeated current turn.
+
+    When the sent projection is a STRICT exact prefix of the returned
+    conversation, ``_proven_current_turn_suffix`` states that the rows after
+    it were produced by the current turn and must be appended verbatim — a
+    current turn may legitimately repeat historical content. The head's new
+    sub-branch discards that proof and runs ``_strip_replayed_prefix`` /
+    ``_strip_replayed_context_items`` over the suffix whenever raw history is
+    ALSO replay-key-prefix-equal, so a legitimate repeat is stripped away.
+
+    Maintainer reproduction: raw/projected ``[user Q, assistant A]`` with a
+    new turn repeating exactly ``[user Q, assistant A]``. The proven suffix is
+    both rows; the strip removes both and only the old history survives.
+    """
+
+    Q = {"role": "user", "content": "question"}
+    A = {"role": "assistant", "content": "answer"}
+
+    def _rows(self, *rows):
+        return [copy.deepcopy(r) for r in rows]
+
+    def test_legitimate_repeated_current_turn_is_not_stripped(self):
+        raw = [self.Q, self.A]
+        projected = _sanitize_messages_for_agent([copy.deepcopy(m) for m in raw])
+        # The current turn legitimately repeats the historical exchange.
+        result_messages = list(projected) + self._rows(self.Q, self.A)
+        assert _proven_current_turn_suffix(projected, result_messages) == (
+            [self.Q, self.A]
+        ), "fixture premise: strict prefix proves both new rows"
+        settled = _dedupe_replayed_context_messages(
+            list(raw), list(result_messages), "question", None,
+            projected_history=list(projected),
+        )
+        assert settled == raw + [self.Q, self.A], (
+            "a strict-proven current-turn suffix must be appended VERBATIM; "
+            "stripping a legitimate repeat deletes the current turn "
+            "(round-N residual 2)"
+        )
+
+    def test_legitimate_repeated_current_turn_survives_full_settle(self):
+        """Same shape through the real ``_settle_result_messages`` entry:
+        the persisted model context is raw + the repeated current turn."""
+        raw = [self.Q, self.A]
+        projected = _sanitize_messages_for_agent([copy.deepcopy(m) for m in raw])
+        result_messages = list(projected) + self._rows(self.Q, self.A)
+        session = SimpleNamespace(
+            messages=[copy.deepcopy(m) for m in raw],
+            context_messages=[copy.deepcopy(m) for m in raw],
+            truncation_watermark=None,
+        )
+        _settle_result_messages(
+            session,
+            [copy.deepcopy(m) for m in raw],
+            [copy.deepcopy(m) for m in raw],
+            result_messages,
+            "question",
+            "webui",
+            None,
+            list(projected),
+        )
+        expected = raw + [self.Q, self.A]
+        assert _role_content(session.context_messages) == _role_content(expected), (
+            "the full settle must persist raw + the strict-proven repeated "
+            "current turn (round-N residual 2, full settle)"
+        )
+
+    def test_control_replay_tail_still_deduplicated(self):
+        """Positive control: a replay of historical rows that is NOT part of
+        the strict-proven suffix must still be deduplicated.
+
+        Here the supplied projection is NOT an exact prefix of the return
+        (the replay is spliced into the middle), so no suffix is proven and
+        the settle fails closed to the raw history — the duplicated
+        historical rows never reach the model context.
+        """
+        raw = [
+            {"role": "user", "content": "first question", "timestamp": 1.0},
+            {"role": "assistant", "content": "first answer", "timestamp": 2.0},
+        ]
+        projected = _sanitize_messages_for_agent([copy.deepcopy(m) for m in raw])
+        current_turn = [
+            {"role": "user", "content": "second question", "timestamp": 3.0},
+            {"role": "assistant", "content": "second answer", "timestamp": 4.0},
+        ]
+        # The projection, then a REPLAY of the projection, then the real turn.
+        # The return still STARTS with the sent projection, so the strict
+        # proof stands: the suffix is the replayed copy plus the current turn.
+        # The replayed historical copy is duplicate material and must be
+        # collapsed; the current turn's own rows survive verbatim.
+        result_messages = list(projected) + list(projected) + current_turn
+        _proven = _proven_current_turn_suffix(projected, result_messages)
+        assert _proven is not None and len(_proven) == len(projected) + len(current_turn), (
+            "fixture premise: the strict proof covers the replayed copy and "
+            "the current turn"
+        )
+        settled = _dedupe_replayed_context_messages(
+            list(raw), list(result_messages), "second question", None,
+            projected_history=list(projected),
+        )
+        assert _role_content(settled) == _role_content(raw + current_turn), (
+            "the replayed historical copy must still be deduped while the "
+            "current turn's own rows survive verbatim"
+        )
+
+    def test_repeated_current_turn_rows_survive_identity_dedupe(self):
+        """The rows the turn generated itself must collapse with nothing:
+        even though they repeat historical content verbatim, the identity
+        dedupe may not remove them (round-N residual 2 through the full
+        settle)."""
+        Q = {"role": "user", "content": "repeated question"}
+        A = {"role": "assistant", "content": "repeated answer"}
+        raw = [copy.deepcopy(Q), copy.deepcopy(A)]
+        projected = _sanitize_messages_for_agent([copy.deepcopy(m) for m in raw])
+        result_messages = list(projected) + self._rows(Q, A)
+        session = SimpleNamespace(
+            messages=[copy.deepcopy(m) for m in raw],
+            context_messages=[copy.deepcopy(m) for m in raw],
+            truncation_watermark=None,
+        )
+        _settle_result_messages(
+            session,
+            [copy.deepcopy(m) for m in raw],
+            [copy.deepcopy(m) for m in raw],
+            result_messages,
+            "repeated question",
+            "webui",
+            None,
+            list(projected),
+        )
+        expected = raw + [Q, A]
+        assert _role_content(session.context_messages) == _role_content(expected), (
+            "the full settle must persist raw + the turn's own repeated rows; "
+            "the identity dedupe must not collapse the current turn"
+        )
+
+
 class TestSyncChatEmptyResultNoDuplicate:
     """Residual 2: sync /api/chat with non-empty raw history, an explicit []
     projected history, and an Agent ``messages=[]`` must NOT re-append the raw

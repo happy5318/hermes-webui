@@ -2476,10 +2476,14 @@ def _settle_result_messages(
             source,
         )
     session.context_messages = (
-        _deduplicate_context_messages(next_context_messages)
+        _deduplicate_context_messages(
+            next_context_messages,
+            protected_rows=PROVEN_CURRENT_TURN_ROWS.get('rows'),
+        )
         if result_messages
         else list(next_context_messages or [])
     )
+    PROVEN_CURRENT_TURN_ROWS['rows'] = None
     if result_messages:
         session.context_messages = _settle_current_turn_boundary(
             previous_context_messages,
@@ -6562,7 +6566,49 @@ def _api_safe_message_positions(messages):
     return final_out
 
 
-def _deduplicate_context_messages(messages):
+def _protected_replay_key(msg, protected_rows):
+    """Return True when ``msg`` is a settle-proven current-turn row that must
+    not be collapsed by the context identity dedupe (#7237 round-N residual 2,
+    nesquena-hermes 2026-09-28)."""
+    if not protected_rows:
+        return False
+    if not isinstance(msg, dict):
+        return False
+    key = _message_replay_key(msg)
+    return key is not None and key in protected_rows
+
+
+def _proven_turn_split(proven_suffix, msg_text):
+    """Split ``proven_suffix`` at the current-turn user row.
+
+    Returns ``(head, tail)`` where ``head`` is the replayed history the Agent
+    echoed inside the suffix (duplicate material the identity dedupe must
+    collapse, per the #1217 full-replay-dedup contract) and ``tail`` is the
+    current turn's own exchange, which must be kept verbatim (the turn may
+    legitimately repeat historical content — #7237 round-N residual 2,
+    nesquena-hermes 2026-09-28).
+
+    Returns ``None`` when no current-turn user row is found, in which case the
+    caller keeps the whole suffix.
+    """
+    rows = list(proven_suffix or [])
+    if not msg_text:
+        return None
+    start = None
+    for idx, row in enumerate(rows):
+        if isinstance(row, dict) and row.get('role') == 'user' and (
+            _looks_like_current_user_turn(row, msg_text)
+        ):
+            start = idx
+    if start is None:
+        return None
+    return rows[:start], rows[start:]
+
+
+PROVEN_CURRENT_TURN_ROWS: dict = {'rows': None}
+
+
+def _deduplicate_context_messages(messages, protected_rows=None):
     """Remove duplicate messages from context by identity, keeping first occurrence.
 
     Prevents the agent from seeing the same message twice in conversation_history
@@ -6570,6 +6616,11 @@ def _deduplicate_context_messages(messages):
     Compression/reference markers are internal recovery material: keep at most
     one canonical assistant reference so a mis-role ``user`` marker cannot become
     the next active user instruction.
+
+    ``protected_rows`` is a set of replay keys the settle PROVED belong to the
+    current turn (the supplied projection was a strict exact prefix of the
+    returned conversation). Such a row may repeat historical content verbatim
+    and must survive (#7237 round-N residual 2, nesquena-hermes 2026-09-28).
     """
     if not messages:
         return messages
@@ -6591,6 +6642,13 @@ def _deduplicate_context_messages(messages):
             deduped.append(msg)
             continue
         if _is_compressed_context_tool_result_summary_message(msg) and not msg.get('tool_call_id'):
+            deduped.append(msg)
+            continue
+        # A row the settle PROVED belongs to the current turn (the sent
+        # projection was a strict exact prefix of the return) may legitimately
+        # repeat historical content verbatim; collapsing it would delete the
+        # current turn (#7237 round-N residual 2, nesquena-hermes 2026-09-28).
+        if _protected_replay_key(msg, protected_rows):
             deduped.append(msg)
             continue
         # Context ownership is provider-facing: two rows with identical visible
@@ -7537,15 +7595,21 @@ def _current_turn_compression_rotation(result_messages, projected_history, msg_t
 
     A marker is rotation proof only when ALL of the following hold:
 
-    * the marker is NOT already part of the supplied exact ``projected_history``
-      — a marker this process sent to the Agent describes a PREVIOUS rotation,
-      never a new one;
+    * the marker is NOT historical material already carried by the supplied
+      ``projected_history``. Historical detection compares POSITION, not
+      text: the supplied projection was handed to the Agent verbatim, so a
+      marker at an index INSIDE that projection describes a PREVIOUS
+      rotation no matter how its text drifted afterwards. A marker that only
+      exists BEYOND the sent projection's length was added by this turn
+      (round-N drifted-marker data-loss defect, nesquena-hermes 2026-09-28);
     * the returned list does not still start with the supplied projection (an
       intact projection means the history did not rotate this turn, so the
       strict gate settles ``previous_context + proven suffix``);
-    * the marker is not the current user's own literal prompt (a user row that
-      matches ``msg_text`` is literal content the user typed, not a synthetic
-      rotation row);
+    * the marker does not belong to the USER-role: a user row beginning with
+      ``[CONTEXT COMPACTION`` is prompt text (current turn OR an earlier
+      turn), never a synthetic context-layer rotation card. Only the
+      context layer's own synthetic rows may authorize wholesale
+      replacement;
     * the marker leads the returned conversation (the context layer rotates
       history from the TOP, so a fresh rotation begins the return; a marker
       appearing after leading rows is replayed historical material).
@@ -7561,12 +7625,35 @@ def _current_turn_compression_rotation(result_messages, projected_history, msg_t
     ]
     if not markers:
         return False
+    # A user row beginning with ``[CONTEXT COMPACTION`` is prompt text — from
+    # the current turn OR an earlier one — never a synthetic rotation card.
+    markers = [(idx, m) for idx, m in markers if str(m.get("role") or "") != "user"]
+    if not markers:
+        return False
     if projected_history is not None:
+        # The projection is exactly what this process sent, so a marker that
+        # sits inside the RETURN's projection-covered region is historical
+        # material — the Agent echoed history we handed it. Matching on
+        # position cannot be fooled by a rewritten summary card (round-N
+        # drifted-marker defect, nesquena-hermes 2026-09-28): a marker whose
+        # text drifted still occupies one of those indices.
+        #
+        # The ONLY leading-marker case that counts as a fresh rotation is a
+        # return whose head the sent projection does NOT cover with marker
+        # material — i.e. index 0 is beyond the projection's own marker
+        # footprint. When the supplied projection's OWN leading rows include a
+        # marker, that marker IS the historical one (drifted or not) and a
+        # leading marker in the return is that same card echoed back.
         projected = list(projected_history)
+        historical_len = len(projected)
+        projected_marker_len = sum(
+            1 for m in projected if _is_context_compression_marker(m)
+        )
         markers = [
             (idx, m)
             for idx, m in markers
-            if not any(_model_row_exact_equal(m, p) for p in projected)
+            if idx >= historical_len
+            or (idx == 0 and projected_marker_len == 0)
         ]
         if not markers:
             return False
@@ -7653,48 +7740,44 @@ def _dedupe_replayed_context_messages(
             projected_history, result_messages,
         )
         if _proven_suffix is not None:
-            # The sent projection is a strict exact prefix of the returned
-            # conversation AND the raw pre-turn context survives as a
-            # replay-key prefix too: both proofs agree the history this
-            # process sent (and the raw rows behind it) reached the Agent
-            # intact, so the loose fast path's strip machinery is safe and
-            # handles replayed tails better than a verbatim suffix append
-            # (e.g. the Agent replayed ``previous_context`` twice after the
-            # sent projection).
-            if _messages_have_prefix(
-                result_messages,
-                previous_context,
-                key_fn=_message_replay_key,
-            ):
-                _candidates = result_messages[len(previous_context):]
-                if msg_text and previous_user_tail:
-                    _candidates = _strip_stale_user_merge_from_messages(
-                        _candidates,
-                        msg_text,
-                        previous_user_tail,
-                        previous_context=previous_context,
-                    )
-                _candidates = _strip_replayed_prefix(previous_context, _candidates)
-                if _candidates:
-                    _candidates = _strip_replayed_context_items(
-                        previous_context, _candidates
-                    )
-                logger.info(
-                    "Projected history is a STRICT exact prefix and the raw "
-                    "pre-turn context also remains a replay-key prefix: "
-                    "keeping raw pre-turn context (%d rows) + %d stripped "
-                    "current-turn row(s) (#7237 exact-prefix authority gate)",
-                    len(previous_context), len(_candidates),
+            # The strict exact-prefix proof is authoritative: every row after
+            # the sent projection was produced by the CURRENT turn, so the
+            # suffix is appended VERBATIM. A current turn may legitimately
+            # repeat historical content (the same user prompt answered
+            # again) and must not be stripped away — the round-N residual-2
+            # data-loss defect (nesquena-hermes 2026-09-28).
+            #
+            # Before appending, one class must still be collapsed: the Agent
+            # echoing the sent history a SECOND time inside the suffix. That
+            # is duplicate historical material (the #1217 full-replay-dedup
+            # contract), not the turn's own exchange. The discriminator is the
+            # current-turn user row: rows BEFORE it are replayed history (strip
+            # their overlap with ``previous_context``); rows FROM it onward are
+            # the turn's own content (keep verbatim).
+            _suffix = list(_proven_suffix)
+            _split = _proven_turn_split(_suffix, msg_text)
+            if _split is None:
+                _append_rows = list(_suffix)
+            else:
+                _head, _tail = _split
+                _append_rows = (
+                    _strip_replayed_prefix(previous_context, _head) + _tail
                 )
-                return list(previous_context) + _candidates
+            _protected = {
+                _message_replay_key(_row)
+                for _row in _append_rows
+                if isinstance(_row, dict)
+            }
+            PROVEN_CURRENT_TURN_ROWS['rows'] = _protected
             logger.info(
                 "Projected history supplied and is a STRICT exact prefix of "
                 "the returned list: keeping raw pre-turn context (%d rows) + "
-                "%d proven current-turn row(s); no unproven suffix appended "
+                "%d proven current-turn row(s); replayed history inside the "
+                "suffix is stripped, the turn's own rows are kept verbatim "
                 "(#7237 exact-prefix authority gate)",
-                len(previous_context), len(_proven_suffix),
+                len(previous_context), len(_append_rows),
             )
-            return list(previous_context) + list(_proven_suffix)
+            return list(previous_context) + _append_rows
         logger.info(
             "Projected history supplied but NOT a STRICT exact prefix of the "
             "returned list: keeping raw pre-turn context (%d rows) verbatim; "
