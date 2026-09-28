@@ -160,7 +160,7 @@ class TestBlocker1WholesaleAcceptanceGuard:
             {"role": "assistant", "content": "third answer"},
         ]
         identity = None  # no active-turn identity: fallback scan must fire
-        settled = _dedupe_replayed_context_messages(raw, result, "third question", identity)
+        settled, _protected = _dedupe_replayed_context_messages(raw, result, "third question", identity)
         # The persisted context must keep the ORIGINAL tool pair verbatim.
         assert settled == raw + [
             {"role": "user", "content": "third question"},
@@ -213,7 +213,7 @@ class TestBlocker1WholesaleAcceptanceGuard:
             {"role": "user", "content": "third question"},
             {"role": "assistant", "content": "third answer"},
         ]
-        settled = _dedupe_replayed_context_messages(raw, result, "third question", None)
+        settled, _protected = _dedupe_replayed_context_messages(raw, result, "third question", None)
         # With a compression marker the wholesale replacement stands.
         assert settled == result
 
@@ -232,7 +232,7 @@ class TestBlocker1WholesaleAcceptanceGuard:
             "agent_turn_boundary_resolved": True,
             "current_turn_user_idx": len(result) - 2,
         }
-        settled = _dedupe_replayed_context_messages(raw, result, "third question", identity)
+        settled, _protected = _dedupe_replayed_context_messages(raw, result, "third question", identity)
         assert settled == raw + [user_row, {"role": "assistant", "content": "third answer"}]
 
 
@@ -683,7 +683,7 @@ class TestBlockerOwnershipFailClosed:
         # Sanity: the scan really cannot prove ownership here.
         assert _looks_like_current_user_turn_scan(result_messages, self.PROMPT) is None
 
-        settled = _dedupe_replayed_context_messages(
+        settled, _protected = _dedupe_replayed_context_messages(
             previous_context, result_messages, self.PROMPT, None,
             projected_history=projected,
         )
@@ -712,7 +712,7 @@ class TestBlockerOwnershipFailClosed:
         _projected, result_messages = self._agent_result()
         # NOTE: the projection is deliberately NOT threaded here — this pins
         # the caller's fail-closed contract when no ownership signal exists.
-        settled = _dedupe_replayed_context_messages(
+        settled, _protected = _dedupe_replayed_context_messages(
             previous_context, result_messages, self.PROMPT, None,
         )
         assert settled == previous_context, (
@@ -773,7 +773,7 @@ class TestBlockerOwnershipFailClosed:
             {"role": "user", "content": prompt},
             {"role": "assistant", "content": "refactored"},
         ]
-        settled = _dedupe_replayed_context_messages(
+        settled, _protected = _dedupe_replayed_context_messages(
             previous_context, result_messages, prompt, None,
         )
         assert settled == previous_context + result_messages
@@ -860,7 +860,7 @@ class TestNoProjectedHistoricalResidual:
         no sanitizer-rewritten historical rows survive beside the raw history.
         """
         raw, projected, result = self._fixture()
-        settled = _dedupe_replayed_context_messages(
+        settled, _protected = _dedupe_replayed_context_messages(
             raw, result, self.PROMPT, None,
             projected_history=projected,
         )
@@ -880,7 +880,7 @@ class TestNoProjectedHistoricalResidual:
         # A different projection (the agent rotated / rewrote history again):
         # its prefix cannot prove the boundary.
         mismatch = [{"role": "system", "content": "rotated history"}] + projected
-        settled = _dedupe_replayed_context_messages(
+        settled, _protected = _dedupe_replayed_context_messages(
             raw, mismatch + self.CURRENT_TURN, self.PROMPT, None,
             projected_history=projected,
         )
@@ -1063,7 +1063,7 @@ class TestBlocker3RepeatedPromptFallback:
             {"role": "user", "content": prompt},  # the actual current turn
             {"role": "assistant", "content": "still 42"},
         ]
-        settled = _dedupe_replayed_context_messages(
+        settled, _protected = _dedupe_replayed_context_messages(
             previous_context, result_messages, prompt, None,
         )
         # With LAST-match the boundary is the second user row (index 1),
@@ -1350,7 +1350,7 @@ class TestReGate20260926OwnershipFindings:
             "projected prefix, not in the real current turn"
         )
 
-        settled = _dedupe_replayed_context_messages(
+        settled, _protected = _dedupe_replayed_context_messages(
             list(raw), list(result_messages), self.PROMPT, None,
             projected_history=list(projected),
         )
@@ -1453,7 +1453,7 @@ class TestReGate20260926OwnershipFindings:
         # The Agent return is the empty projection + the current turn.
         assert result_messages == [copy.deepcopy(m) for m in current_turn]
 
-        settled = _dedupe_replayed_context_messages(
+        settled, _protected = _dedupe_replayed_context_messages(
             list(raw), list(result_messages), self.PROMPT, None,
             projected_history=list(projected),  # explicit []
         )
@@ -1485,7 +1485,7 @@ class TestReGate20260926OwnershipFindings:
         projected = _sanitize_messages_for_agent([copy.deepcopy(m) for m in raw])
         assert projected == []
 
-        settled = _dedupe_replayed_context_messages(
+        settled, _protected = _dedupe_replayed_context_messages(
             list(raw), [], self.PROMPT, None,
             projected_history=list(projected),  # explicit []
         )
@@ -1523,7 +1523,7 @@ class TestReGate20260926OwnershipFindings:
         ]
         # No projection threaded — the settle has no ownership signal and
         # must fail closed to the raw context alone.
-        settled = _dedupe_replayed_context_messages(
+        settled, _protected = _dedupe_replayed_context_messages(
             list(raw), list(result_messages), self.PROMPT, None,
         )
         assert settled == list(raw), (
@@ -1693,7 +1693,7 @@ class TestExactPrefixAuthorityGate:
             "fixture premise: the replay key normalizes whitespace so the "
             "drift is invisible to the loose fast path"
         )
-        settled = _dedupe_replayed_context_messages(
+        settled, _protected = _dedupe_replayed_context_messages(
             list(raw), list(result_messages), "hello world", None,
             projected_history=list(projected),
         )
@@ -1738,7 +1738,7 @@ class TestExactPrefixAuthorityGate:
         assert _message_replay_key(raw[1]) == _message_replay_key(result_messages[1]), (
             "fixture premise: the two historical rows are replay-key equal"
         )
-        settled = _dedupe_replayed_context_messages(
+        settled, _protected = _dedupe_replayed_context_messages(
             list(raw), list(result_messages), "next question", None,
             projected_history=list(projected),
         )
@@ -2070,7 +2070,7 @@ class TestRoundNDirectBranchDiscriminators:
 
     def _control_appends(self, previous_context, result_messages, identity):
         """The branch fires without a projection: the settle appends rows."""
-        settled = _dedupe_replayed_context_messages(
+        settled, _protected = _dedupe_replayed_context_messages(
             list(previous_context), list(result_messages), self.PROMPT, identity,
         )
         assert len(settled) > len(previous_context), (
@@ -2099,7 +2099,7 @@ class TestRoundNDirectBranchDiscriminators:
             m.get("role") == "assistant" and m.get("content") == "UNPROVEN STALE MERGE"
             for m in control
         ), "premise: the stale-merge branch must be the appender"
-        settled = _dedupe_replayed_context_messages(
+        settled, _protected = _dedupe_replayed_context_messages(
             list(raw), list(result_messages), self.PROMPT, None,
             projected_history=list(projected),
         )
@@ -2121,7 +2121,7 @@ class TestRoundNDirectBranchDiscriminators:
             m.get("role") == "assistant" and m.get("content") == "UNPROVEN ASSISTANT/TOOL"
             for m in control
         ), "premise: the assistant/tool-only branch must be the appender"
-        settled = _dedupe_replayed_context_messages(
+        settled, _protected = _dedupe_replayed_context_messages(
             list(raw), list(result_messages), self.PROMPT, None,
             projected_history=list(projected),
         )
@@ -2153,7 +2153,7 @@ class TestRoundNDirectBranchDiscriminators:
             m.get("role") == "assistant" and m.get("content") == "UNPROVEN CHECKPOINT"
             for m in control
         ), "premise: the checkpoint branch must be the appender"
-        settled = _dedupe_replayed_context_messages(
+        settled, _protected = _dedupe_replayed_context_messages(
             list(raw), list(result_messages), self.PROMPT, identity,
             projected_history=list(projected),
         )
@@ -2177,7 +2177,7 @@ class TestRoundNDirectBranchDiscriminators:
             m.get("role") == "assistant" and m.get("content") == "UNPROVEN PROMPT SCAN"
             for m in control
         ), "premise: the prompt scan must be the appender"
-        settled = _dedupe_replayed_context_messages(
+        settled, _protected = _dedupe_replayed_context_messages(
             list(raw), list(result_messages), self.PROMPT, None,
             projected_history=list(projected),
         )
@@ -2205,7 +2205,7 @@ class TestRoundNDirectBranchDiscriminators:
             "len(result) <= len(projection) rejection collapsed the two "
             "(#7237 round-N blocker 2)"
         )
-        settled = _dedupe_replayed_context_messages(
+        settled, _protected = _dedupe_replayed_context_messages(
             list(raw), list(result_messages), self.PROMPT, None,
             projected_history=list(projected),
         )

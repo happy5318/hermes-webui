@@ -141,7 +141,7 @@ class TestHistoricalMarkerCannotBypassProjectionAuthority:
         assert _proven_current_turn_suffix(projected, result_messages) == (
             _Fixture.CURRENT_TURN
         )
-        settled = _dedupe_replayed_context_messages(
+        settled, _protected = _dedupe_replayed_context_messages(
             list(raw), list(result_messages), "third question", None,
             projected_history=list(projected),
         )
@@ -166,7 +166,7 @@ class TestHistoricalMarkerCannotBypassProjectionAuthority:
         assert _proven_current_turn_suffix(projected, result_messages) is None, (
             "fixture premise: the drift must defeat the strict exact-prefix proof"
         )
-        settled = _dedupe_replayed_context_messages(
+        settled, _protected = _dedupe_replayed_context_messages(
             list(raw), list(result_messages), "third question", None,
             projected_history=list(projected),
         )
@@ -243,7 +243,7 @@ class TestLiteralUserMarkerCannotBypassProjectionAuthority:
         ]
         # Premise: today's marker-any() makes the wholesale path reachable.
         assert any(_is_context_compression_marker(m) for m in result_messages)
-        settled = _dedupe_replayed_context_messages(
+        settled, _protected = _dedupe_replayed_context_messages(
             list(raw), list(result_messages), self.LITERAL, None,
             projected_history=list(projected),
         )
@@ -269,7 +269,7 @@ class TestLiteralUserMarkerCannotBypassProjectionAuthority:
             {"role": "assistant", "content": "literal answer"},
         ]
         assert _proven_current_turn_suffix(projected, result_messages) is None
-        settled = _dedupe_replayed_context_messages(
+        settled, _protected = _dedupe_replayed_context_messages(
             list(raw), list(result_messages), self.LITERAL, None,
             projected_history=list(projected),
         )
@@ -290,7 +290,7 @@ class TestLiteralUserMarkerCannotBypassProjectionAuthority:
             {"role": "user", "content": self.LITERAL},
             {"role": "assistant", "content": "literal answer"},
         ]
-        settled = _dedupe_replayed_context_messages(
+        settled, _protected = _dedupe_replayed_context_messages(
             list(raw), list(result_messages), self.LITERAL, None,
         )
         assert settled == raw + result_messages, (
@@ -319,7 +319,7 @@ class TestGenuineRotationStillWholesale:
             {"role": "user", "content": "third question"},
             {"role": "assistant", "content": "third answer"},
         ]
-        settled = _dedupe_replayed_context_messages(
+        settled, _protected = _dedupe_replayed_context_messages(
             list(raw), list(result_messages), "third question", None,
         )
         assert settled == result_messages, (
@@ -356,7 +356,7 @@ class TestGenuineRotationStillWholesale:
         assert _proven_current_turn_suffix(projected, result_messages) is None, (
             "fixture premise: the return is not the projection + turn"
         )
-        settled = _dedupe_replayed_context_messages(
+        settled, _protected = _dedupe_replayed_context_messages(
             list(raw), list(result_messages), "third question", None,
             projected_history=list(projected),
         )
@@ -434,7 +434,7 @@ class TestDriftedHistoricalMarkerCannotBypassProjectionAuthority:
             "a drifted historical marker must NOT be treated as a new "
             "current-turn rotation (round-N residual 1)"
         )
-        settled = _dedupe_replayed_context_messages(
+        settled, _protected = _dedupe_replayed_context_messages(
             list(raw), list(result_messages), "third question", None,
             projected_history=list(projected),
         )
@@ -556,7 +556,7 @@ class TestHistoricalUserLiteralMarkerCannotBypassProjectionAuthority:
             "a drifted HISTORICAL user literal marker must NOT be treated as "
             "a new current-turn rotation (round-N residual 1)"
         )
-        settled = _dedupe_replayed_context_messages(
+        settled, _protected = _dedupe_replayed_context_messages(
             list(raw), list(result_messages), "current question", None,
             projected_history=list(projected),
         )
@@ -597,7 +597,7 @@ class TestStrictProvenSuffixIsNotReplayStripped:
         assert _proven_current_turn_suffix(projected, result_messages) == (
             [self.Q, self.A]
         ), "fixture premise: strict prefix proves both new rows"
-        settled = _dedupe_replayed_context_messages(
+        settled, _protected = _dedupe_replayed_context_messages(
             list(raw), list(result_messages), "question", None,
             projected_history=list(projected),
         )
@@ -663,7 +663,7 @@ class TestStrictProvenSuffixIsNotReplayStripped:
             "fixture premise: the strict proof covers the replayed copy and "
             "the current turn"
         )
-        settled = _dedupe_replayed_context_messages(
+        settled, _protected = _dedupe_replayed_context_messages(
             list(raw), list(result_messages), "second question", None,
             projected_history=list(projected),
         )
@@ -887,7 +887,7 @@ class TestWorkspacePrefixedCurrentUserNotDuplicated:
             self._prefixed_user(),
             {"role": "assistant", "content": self.CORRECTIVE},
         ]
-        settled = _dedupe_replayed_context_messages(
+        settled, _protected = _dedupe_replayed_context_messages(
             list(raw), list(result_messages), self.PROMPT, None,
             projected_history=list(projected),
         )

@@ -25421,6 +25421,7 @@ def _handle_chat_sync(handler, body):
                 _active_turn_boundary,
                 _assign_stable_message_ids,
                 _dedupe_replayed_context_messages,
+                _deduplicate_context_messages,
                 _find_active_turn_checkpoint_index,
                 _merge_display_messages_after_agent_result,
                 _resolve_active_turn_authority,
@@ -25544,11 +25545,21 @@ def _handle_chat_sync(handler, body):
             _result_messages, _previous_messages, _previous_context_messages
         )
         if result.get("messages"):
-            _next_context_messages = _dedupe_replayed_context_messages(
+            # Call-scoped protection (#7237 review blocker 1,
+            # nesquena-hermes 2026-09-28): the dedupe RETURNS the protected
+            # rows it proved; the sync route consumes them in THIS call by
+            # passing them into the identity dedupe — the old module global
+            # was never read here, so a settle that proved current-turn rows
+            # could have them collapsed as duplicates on the sync path.
+            _next_context_messages, _proven_rows = _dedupe_replayed_context_messages(
                 _previous_context_messages,
                 _next_context_messages,
                 msg,
                 projected_history=_run_conversation_projected_history,
+            )
+            s.context_messages = _deduplicate_context_messages(
+                _next_context_messages,
+                protected_rows=_proven_rows,
             )
         else:
             # The Agent produced NO rows for this turn. The previous fallback

@@ -2455,18 +2455,27 @@ def _settle_result_messages(
         active_turn_identity,
         msg_text,
     )
+    # Call-scoped protection (#7237 review blocker 1, nesquena-hermes
+    # 2026-09-28): the protected-row set returned by _dedupe_replayed_
+    # context_messages never leaves this call frame.
+    _proven_current_turn_rows = None
     if result_messages:
         _assign_stable_message_ids(
             result_messages,
             previous_messages,
             previous_context_messages,
         )
-        next_context_messages = _dedupe_replayed_context_messages(
-            previous_context_messages,
-            next_context_messages,
-            msg_text,
-            active_turn_identity=active_turn_identity,
-            projected_history=projected_history,
+        # Call-scoped protection (#7237 review blocker 1): _dedupe_replayed_
+        # context_messages RETURNS the rows it proved belong to this turn;
+        # the set never leaves this call frame.
+        next_context_messages, _proven_current_turn_rows = (
+            _dedupe_replayed_context_messages(
+                previous_context_messages,
+                next_context_messages,
+                msg_text,
+                active_turn_identity=active_turn_identity,
+                projected_history=projected_history,
+            )
         )
         next_context_messages = _settle_current_turn_boundary(
             previous_context_messages,
@@ -2478,12 +2487,17 @@ def _settle_result_messages(
     session.context_messages = (
         _deduplicate_context_messages(
             next_context_messages,
-            protected_rows=PROVEN_CURRENT_TURN_ROWS.get('rows'),
+            protected_rows=_proven_current_turn_rows,
         )
         if result_messages
         else list(next_context_messages or [])
     )
-    PROVEN_CURRENT_TURN_ROWS['rows'] = None
+    # Call-scoped protection handoff (#7237 review blocker 1, nesquena-hermes
+    # 2026-09-28): the protected-row set is computed and consumed INSIDE this
+    # settle call. The old module global (PROVEN_CURRENT_TURN_ROWS) could be
+    # overwritten or cleared by another session's concurrent settle — the
+    # runtime serializes per session, not per process — and the sync route
+    # never consumed it at all. Protection now lives on the call frame only.
     if result_messages:
         session.context_messages = _settle_current_turn_boundary(
             previous_context_messages,
@@ -6605,7 +6619,42 @@ def _proven_turn_split(proven_suffix, msg_text):
     return rows[:start], rows[start:]
 
 
-PROVEN_CURRENT_TURN_ROWS: dict = {'rows': None}
+def _is_active_turn_checkpoint_row(row, active_turn_identity, msg_text):
+    """Return True only when ``row`` is PROVEN to be the checkpoint this
+    invocation's settle is working on (#7237 review blocker 2,
+    nesquena-hermes 2026-09-28).
+
+    Replay-key/text equality alone is not ownership proof: an earlier turn's
+    user row can carry the SAME text as a legitimate re-ask, and dropping
+    the echo then deletes the re-ask outright. Proof requires either:
+
+    * the row carries the active-turn token of the identity being settled;
+      or
+    * the identity carries no token (legacy/tokenless runs) AND the row
+      itself carries an active-turn token — only checkpoint rows persist
+      that marker, so a plain historical row with identical text never
+      qualifies — plus the trusted sentinel-stripped text match against
+      ``msg_text``.
+    """
+    if not isinstance(row, dict) or row.get('role') != 'user':
+        return False
+    token = (
+        active_turn_identity.get('token')
+        if isinstance(active_turn_identity, dict)
+        else None
+    )
+    if token:
+        return row.get('_active_turn_token') == token
+    # No identity token available (legacy/tokenless settle): require
+    # checkpoint SHAPE — the row itself carries an active-turn token, which
+    # only checkpoint rows persist (a plain historical user row never does,
+    # so the reviewer's no-token historical-tail repro stays excluded) —
+    # plus the trusted sentinel-stripped text match against ``msg_text``.
+    if not msg_text:
+        return False
+    return bool(row.get('_active_turn_token')) and _looks_like_current_user_turn(
+        row, msg_text
+    )
 
 
 def _deduplicate_context_messages(messages, protected_rows=None):
@@ -7638,22 +7687,30 @@ def _current_turn_compression_rotation(result_messages, projected_history, msg_t
         # drifted-marker defect, nesquena-hermes 2026-09-28): a marker whose
         # text drifted still occupies one of those indices.
         #
-        # The ONLY leading-marker case that counts as a fresh rotation is a
-        # return whose head the sent projection does NOT cover with marker
-        # material — i.e. index 0 is beyond the projection's own marker
-        # footprint. When the supplied projection's OWN leading rows include a
-        # marker, that marker IS the historical one (drifted or not) and a
-        # leading marker in the return is that same card echoed back.
+        # Rotation proof for the CURRENT turn is scoped to markers BEYOND the
+        # sent projection (#7237 review blocker 3, nesquena-hermes
+        # 2026-09-28): the projection already carrying an older marker
+        # (``projected_marker_len > 0``) must NOT reject a later GENUINE
+        # rotation — the context layer may legitimately rotate AGAIN in a
+        # turn that started from an already-compacted history. The old
+        # ``idx == 0 and projected_marker_len == 0`` gate kept only the raw
+        # history in that shape, losing the new rotation's summary and every
+        # row after it. A leading marker at index 0 is a fresh rotation when
+        # the sent projection does not itself lead with marker material: if
+        # the projection's FIRST row is a marker, a leading marker in the
+        # return is that same historical card echoed back (drifted or not);
+        # otherwise the rotation began after the sent history, so index 0 is
+        # beyond the projection's marker footprint and the marker is new.
         projected = list(projected_history)
         historical_len = len(projected)
-        projected_marker_len = sum(
-            1 for m in projected if _is_context_compression_marker(m)
+        projection_leads_with_marker = bool(
+            projected and _is_context_compression_marker(projected[0])
         )
         markers = [
             (idx, m)
             for idx, m in markers
             if idx >= historical_len
-            or (idx == 0 and projected_marker_len == 0)
+            or (idx == 0 and not projection_leads_with_marker)
         ]
         if not markers:
             return False
@@ -7674,6 +7731,14 @@ def _dedupe_replayed_context_messages(
     projected_history=None,
 ):
     """Keep model context append-only without replayed blocks/summaries.
+
+    Returns ``(settled_context, protected_rows)``. ``protected_rows`` is a
+    set of replay keys the settle PROVED belong to the current turn — the
+    protection is CALL-SCOPED and must be consumed by the caller in the same
+    settle (e.g. ``_settle_result_messages`` passing it to
+    ``_deduplicate_context_messages``). It must never be handed through
+    module state: another session's concurrent settle could overwrite or
+    clear it (#7237 review blocker 1, nesquena-hermes 2026-09-28).
 
     When the replayed prefix no longer matches the raw pre-turn context and no
     compression marker explains the rotation, the raw previous context is
@@ -7698,7 +7763,7 @@ def _dedupe_replayed_context_messages(
     previous_context = list(previous_context or [])
     result_messages = list(result_messages or [])
     if not previous_context or not result_messages:
-        return result_messages
+        return result_messages, None
     previous_user_tail = _stale_user_tail_candidate(_last_user_row(previous_context))
     # A compression marker is the EXPLICIT exception: the model-context layer
     # legitimately rotated the whole context, so wholesale replacement stays
@@ -7778,10 +7843,26 @@ def _dedupe_replayed_context_messages(
                     # content is a legitimate re-ask and must be kept verbatim
                     # (round-N residual 2), so compare against the LAST row
                     # only — never the whole history.
+                    #
+                    # Replay-key equality alone is NOT ownership proof
+                    # (#7237 review blocker 2, nesquena-hermes 2026-09-28):
+                    # an earlier turn's row can carry the SAME text (a
+                    # legitimate re-ask), so the drop fires only when the
+                    # previous tail is PROVEN to be this invocation's
+                    # active-turn checkpoint — the active-turn token matches
+                    # the identity of the turn being settled (or the identity
+                    # is unavailable and the tail IS a checkpoint-shaped
+                    # current-turn row matching ``msg_text`` via the trusted
+                    # sentinel-stripped comparison).
                     if (
                         previous_context
                         and _message_replay_key(_tail[0])
                         == _message_replay_key(previous_context[-1])
+                        and _is_active_turn_checkpoint_row(
+                            previous_context[-1],
+                            active_turn_identity,
+                            msg_text,
+                        )
                     ):
                         _tail = _tail[1:]
                 _append_rows = (
@@ -7792,7 +7873,6 @@ def _dedupe_replayed_context_messages(
                 for _row in _append_rows
                 if isinstance(_row, dict)
             }
-            PROVEN_CURRENT_TURN_ROWS['rows'] = _protected
             logger.info(
                 "Projected history supplied and is a STRICT exact prefix of "
                 "the returned list: keeping raw pre-turn context (%d rows) + "
@@ -7801,7 +7881,7 @@ def _dedupe_replayed_context_messages(
                 "(#7237 exact-prefix authority gate)",
                 len(previous_context), len(_append_rows),
             )
-            return list(previous_context) + _append_rows
+            return list(previous_context) + _append_rows, _protected
         logger.info(
             "Projected history supplied but NOT a STRICT exact prefix of the "
             "returned list: keeping raw pre-turn context (%d rows) verbatim; "
@@ -7810,7 +7890,7 @@ def _dedupe_replayed_context_messages(
             "(#7237 review blocker round N, nesquena-hermes 2026-09-27)",
             len(previous_context),
         )
-        return list(previous_context)
+        return list(previous_context), None
     if not _messages_have_prefix(
         result_messages,
         previous_context,
@@ -7858,7 +7938,7 @@ def _dedupe_replayed_context_messages(
                 candidates = _strip_replayed_prefix(previous_context, candidates)
                 if candidates:
                     candidates = _strip_replayed_context_items(previous_context, candidates)
-                return previous_context + candidates
+                return previous_context + candidates, None
         assistant_or_tool_only_result = bool(result_messages) and all(
             _is_context_compression_marker(m)
             or (
@@ -7871,7 +7951,7 @@ def _dedupe_replayed_context_messages(
             candidates = _strip_replayed_prefix(previous_context, result_messages)
             if candidates:
                 candidates = _strip_replayed_context_items(previous_context, candidates)
-            return previous_context + candidates
+            return previous_context + candidates, None
         # Wholesale replacement of the historical prefix is only legitimate
         # when the model-context layer explicitly rotated the context (a
         # compression turn). Any other prefix mismatch — including one caused
@@ -7920,7 +8000,7 @@ def _dedupe_replayed_context_messages(
                     "acceptance suppressed (#7237 blocker 1)",
                     len(previous_context), _boundary_idx,
                 )
-                return list(previous_context) + _current_slice
+                return list(previous_context) + _current_slice, None
             # No proven boundary: fail closed. The current-turn slice cannot be
             # isolated, so do not guess one — slicing from an unproven user row
             # would drop live assistant/tool rows, and persisting the projected
@@ -7946,11 +8026,11 @@ def _dedupe_replayed_context_messages(
                 "(#7237 data-regression finding)",
                 len(previous_context),
             )
-            return list(previous_context)
+            return list(previous_context), None
         # A marker that proves a NEW current-turn compression rotation
         # explains the rotation: wholesale replacement of the historical
         # prefix stays legitimate.
-        return result_messages
+        return result_messages, None
     # Fast-path strict re-check (#7237 exact-prefix authority gap): the
     # loose raw-prefix match normalized whitespace and truncated content at
     # 500 characters, so a drifted historical row can look like a replayed
@@ -7969,7 +8049,7 @@ def _dedupe_replayed_context_messages(
             "authority gap)",
             len(previous_context),
         )
-        return list(previous_context)
+        return list(previous_context), None
     candidates = result_messages[len(previous_context):]
     # Strip stale merges only from the new-turn candidate slice so that
     # legitimate historical user rows in the already-committed previous_context
@@ -7984,14 +8064,21 @@ def _dedupe_replayed_context_messages(
     candidates = _strip_replayed_prefix(previous_context, candidates)
     if candidates:
         candidates = _strip_replayed_context_items(previous_context, candidates)
-    return previous_context + candidates
+    return previous_context + candidates, None
 
 
 def _dedupe_replayed_active_context(previous_context, result_messages, msg_text=None, projected_history=None):
-    """Keep model context append-only without re-appending a replayed tail."""
-    return _dedupe_replayed_context_messages(
+    """Keep model context append-only without re-appending a replayed tail.
+
+    Compatibility shim: returns the settled context alone. Callers that need
+    the call-scoped protected rows must call ``_dedupe_replayed_context_messages``
+    directly and unpack the ``(settled, protected_rows)`` tuple (#7237 review
+    blocker 1, nesquena-hermes 2026-09-28).
+    """
+    settled, _protected = _dedupe_replayed_context_messages(
         previous_context, result_messages, msg_text, projected_history=projected_history,
     )
+    return settled
 
 
 def _is_context_compression_marker(msg):
