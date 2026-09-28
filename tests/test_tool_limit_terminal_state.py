@@ -437,8 +437,8 @@ def test_verification_nudge_is_removed_while_corrective_followup_persists(
     # (#7237 review 2026-09-27). Returning a bare delta is what previously
     # forced the dedupe gate to be relaxed; maintainer rejected weakening
     # production ownership to accommodate those mocks. The parameter now only
-    # documents which shape the fixture author started from.
-    result_messages = prior_turn + result_messages
+    # documents which shape the fixture author started from, so the sent
+    # result is built ONCE from the full conversation and never re-prefixed.
     result = {"messages": result_messages}
 
     _events, payload = _run_streaming_with_fake_agent(

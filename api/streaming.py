@@ -7760,6 +7760,30 @@ def _dedupe_replayed_context_messages(
                 _append_rows = list(_suffix)
             else:
                 _head, _tail = _split
+                # The WebUI sends the Agent a user_message that carries the
+                # ``[Workspace::v1: <path>]`` sentinel, and a real Agent echoes
+                # that exact row back inside the full conversation. The echo is
+                # the SAME turn as the raw checkpoint already in
+                # ``previous_context`` (``_message_identity`` strips the
+                # sentinel for user rows so both keys match), so appending it
+                # would persist this user turn twice — once bare, once
+                # sentinel-prefixed — and the model would see a duplicated
+                # prompt that is not the submitted text. Drop that single echo;
+                # every row AFTER it is this turn's own output and stays.
+                if _tail:
+                    # Only a row that echoes the checkpoint ALREADY sitting at
+                    # the tail of ``previous_context`` is a duplicate: that is
+                    # the row this process persisted for this turn before the
+                    # Agent ran. A row that merely repeats some EARLIER turn's
+                    # content is a legitimate re-ask and must be kept verbatim
+                    # (round-N residual 2), so compare against the LAST row
+                    # only — never the whole history.
+                    if (
+                        previous_context
+                        and _message_replay_key(_tail[0])
+                        == _message_replay_key(previous_context[-1])
+                    ):
+                        _tail = _tail[1:]
                 _append_rows = (
                     _strip_replayed_prefix(previous_context, _head) + _tail
                 )

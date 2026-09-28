@@ -815,3 +815,103 @@ class TestSyncChatEmptyResultNoDuplicate:
             "continue please" not in str(m.get("content") or "")
             for m in persisted
         ), "no synthetic current turn may be invented for an empty result"
+
+class TestWorkspacePrefixedCurrentUserNotDuplicated:
+    """Round-N+1 (2026-09-28): a workspace-prefixed current user row must not
+    be persisted beside the raw checkpoint it is the same turn as.
+
+    The WebUI hands the Agent a ``user_message`` that starts with the
+    ``[Workspace::v1: <path>]`` sentinel and a real Agent echoes that exact row
+    back inside its full-conversation return. ``_message_replay_key`` (via
+    ``_message_identity``) strips the sentinel for ``role == "user"``, so the
+    echoed row and the raw checkpoint have the SAME identity — that is the
+    documented merge contract (see ``_message_identity``).
+
+    Model-facing history therefore ends up with the same user turn twice: the
+    raw checkpoint row and its sentinel-prefixed echo. The provider then sees a
+    duplicated user turn whose text is not what the human submitted.
+    """
+
+    PROMPT = "Fix the failing test."
+    ANSWER = "The earlier attempt is complete."
+    CORRECTIVE = "Verification failed. I fixed the parser and reran the tests."
+
+    def _raw(self):
+        return [
+            {"role": "user", "content": self.PROMPT, "timestamp": 1.0},
+            {"role": "assistant", "content": self.ANSWER},
+            {
+                "role": "user",
+                "content": self.PROMPT,
+                "timestamp": 2.0,
+                "_source": "webui",
+                "attachments": [],
+                "_active_turn_token": "stream-tool-limit:2",
+            },
+        ]
+
+    def _prefixed_user(self):
+        return {
+            "role": "user",
+            "content": "[Workspace::v1: /tmp/workspace]\n" + self.PROMPT,
+        }
+
+    def _settle(self):
+        raw = self._raw()
+        projected = _sanitize_messages_for_agent([copy.deepcopy(m) for m in raw])
+        result_messages = list(projected) + [
+            self._prefixed_user(),
+            {"role": "assistant", "content": self.CORRECTIVE},
+        ]
+        session = SimpleNamespace(
+            messages=[],
+            context_messages=[],
+            truncation_watermark=None,
+        )
+        _settle_result_messages(
+            session,
+            [copy.deepcopy(m) for m in raw],
+            [copy.deepcopy(m) for m in raw],
+            result_messages,
+            self.PROMPT,
+            "webui",
+            None,
+            list(projected),
+        )
+        return session
+
+    def test_dedupe_keeps_a_single_current_user_turn(self):
+        raw = self._raw()
+        projected = _sanitize_messages_for_agent([copy.deepcopy(m) for m in raw])
+        result_messages = list(projected) + [
+            self._prefixed_user(),
+            {"role": "assistant", "content": self.CORRECTIVE},
+        ]
+        settled = _dedupe_replayed_context_messages(
+            list(raw), list(result_messages), self.PROMPT, None,
+            projected_history=list(projected),
+        )
+        user_rows = [m for m in settled if m.get("role") == "user"]
+        assert len(user_rows) == 2, (
+            "the raw prior-turn user row and exactly ONE current-turn user "
+            f"row must survive; got {_role_content(settled)}"
+        )
+
+    def test_full_settle_persists_one_current_user_turn(self):
+        session = self._settle()
+        user_rows = [m for m in session.context_messages if m.get("role") == "user"]
+        assert len(user_rows) == 2, (
+            "the raw prior-turn user row and exactly ONE current-turn user "
+            f"row must be persisted; got {_role_content(session.context_messages)}"
+        )
+
+    def test_persisted_current_user_row_is_the_submitted_prompt(self):
+        session = self._settle()
+        current = [
+            m for m in session.context_messages
+            if m.get("role") == "user" and m.get("content") != self.PROMPT
+        ]
+        assert not current, (
+            "no workspace-prefixed duplicate of the submitted prompt may "
+            f"reach the model-facing context; got {_role_content(session.context_messages)}"
+        )
