@@ -7521,6 +7521,64 @@ def _proven_current_turn_suffix(projected_history, result_messages):
     return result_messages[len(projection):]
 
 
+def _current_turn_compression_rotation(result_messages, projected_history, msg_text=None):
+    """Return True only when a compression marker in ``result_messages`` proves
+    a rotation performed by the CURRENT turn.
+
+    The wholesale-replacement exception is deliberately narrow (#7237 review
+    residual, nesquena-hermes 2026-09-27). ``is_context_compression_marker``
+    matches any non-tool row whose text begins ``[CONTEXT COMPACTION`` —
+    including a user literally typing that text — and ``result_messages`` is
+    the sent projection followed by the current turn, so an OLD marker
+    replayed inside ``projected_history`` (or a literal user prompt) would
+    otherwise disable the projection-authority gate and let a prefix mismatch
+    reach the wholesale ``return result_messages`` path, discarding the
+    authoritative raw history.
+
+    A marker is rotation proof only when ALL of the following hold:
+
+    * the marker is NOT already part of the supplied exact ``projected_history``
+      — a marker this process sent to the Agent describes a PREVIOUS rotation,
+      never a new one;
+    * the returned list does not still start with the supplied projection (an
+      intact projection means the history did not rotate this turn, so the
+      strict gate settles ``previous_context + proven suffix``);
+    * the marker is not the current user's own literal prompt (a user row that
+      matches ``msg_text`` is literal content the user typed, not a synthetic
+      rotation row);
+    * the marker leads the returned conversation (the context layer rotates
+      history from the TOP, so a fresh rotation begins the return; a marker
+      appearing after leading rows is replayed historical material).
+
+    Returns False when no marker is proven: the caller's projection authority
+    gate (exact prefix or fail-closed) then owns the settle.
+    """
+    result = list(result_messages or [])
+    markers = [
+        (idx, m)
+        for idx, m in enumerate(result)
+        if isinstance(m, dict) and _is_context_compression_marker(m)
+    ]
+    if not markers:
+        return False
+    if projected_history is not None:
+        projected = list(projected_history)
+        markers = [
+            (idx, m)
+            for idx, m in markers
+            if not any(_model_row_exact_equal(m, p) for p in projected)
+        ]
+        if not markers:
+            return False
+        if _messages_have_prefix_exact(result, projected):
+            return False
+    if msg_text is not None:
+        for _idx, m in markers:
+            if _looks_like_current_user_turn(m, msg_text):
+                return False
+    return markers[0][0] == 0
+
+
 def _dedupe_replayed_context_messages(
     previous_context,
     result_messages,
@@ -7545,19 +7603,27 @@ def _dedupe_replayed_context_messages(
     2026-09-23). A supplied but NON-EXACT projection is resolved BEFORE every
     recovery branch (stale-merge, assistant/tool-only, checkpoint, prompt):
     none of those signals may guess ownership of sanitizer-rewritten rows
-    (#7237 review blocker round N, nesquena-hermes 2026-09-27). Only the
-    explicit compression-marker rotation keeps wholesale replacement.
+    (#7237 review blocker round N, nesquena-hermes 2026-09-27). Only a
+    marker that proves a NEW current-turn compression rotation keeps
+    wholesale replacement (#7237 review residual, nesquena-hermes
+    2026-09-27).
     """
     previous_context = list(previous_context or [])
     result_messages = list(result_messages or [])
     if not previous_context or not result_messages:
         return result_messages
+    previous_user_tail = _stale_user_tail_candidate(_last_user_row(previous_context))
     # A compression marker is the EXPLICIT exception: the model-context layer
     # legitimately rotated the whole context, so wholesale replacement stays
-    # allowed. Detect it once up front so every projection-authority decision
-    # below honors that exception.
-    _has_compression_marker = any(
-        _is_context_compression_marker(m) for m in result_messages
+    # allowed. The exception is NARROW (#7237 review residual, nesquena-hermes
+    # 2026-09-27): only a marker that proves a rotation performed by the
+    # CURRENT turn counts — a marker already inside the supplied projection is
+    # historical, a literal ``[CONTEXT COMPACTION ...`` user prompt is content,
+    # and a marker that does not lead the returned conversation is replayed
+    # material. Any other marker must NOT disable the projection-authority
+    # decisions below.
+    _has_compression_rotation = _current_turn_compression_rotation(
+        result_messages, projected_history, msg_text,
     )
     # #7237 review exact-prefix authority gate (nesquena-hermes 2026-09-26,
     # blocker round N 2026-09-27): when ``projected_history`` is supplied and
@@ -7580,13 +7646,47 @@ def _dedupe_replayed_context_messages(
     # returned text, and the whole point of the projection is that the
     # sanitizer can rewrite rows so those guesses are wrong. The settle must
     # keep ``previous_context`` and append NOTHING unproven (round-N
-    # blocker 1). Only the explicit compression-marker exception (detected
-    # once above) may bypass this authority.
-    if projected_history is not None and not _has_compression_marker:
+    # blocker 1). Only a marker that proves a NEW current-turn compression
+    # rotation (resolved once above) may bypass this authority.
+    if projected_history is not None and not _has_compression_rotation:
         _proven_suffix = _proven_current_turn_suffix(
             projected_history, result_messages,
         )
         if _proven_suffix is not None:
+            # The sent projection is a strict exact prefix of the returned
+            # conversation AND the raw pre-turn context survives as a
+            # replay-key prefix too: both proofs agree the history this
+            # process sent (and the raw rows behind it) reached the Agent
+            # intact, so the loose fast path's strip machinery is safe and
+            # handles replayed tails better than a verbatim suffix append
+            # (e.g. the Agent replayed ``previous_context`` twice after the
+            # sent projection).
+            if _messages_have_prefix(
+                result_messages,
+                previous_context,
+                key_fn=_message_replay_key,
+            ):
+                _candidates = result_messages[len(previous_context):]
+                if msg_text and previous_user_tail:
+                    _candidates = _strip_stale_user_merge_from_messages(
+                        _candidates,
+                        msg_text,
+                        previous_user_tail,
+                        previous_context=previous_context,
+                    )
+                _candidates = _strip_replayed_prefix(previous_context, _candidates)
+                if _candidates:
+                    _candidates = _strip_replayed_context_items(
+                        previous_context, _candidates
+                    )
+                logger.info(
+                    "Projected history is a STRICT exact prefix and the raw "
+                    "pre-turn context also remains a replay-key prefix: "
+                    "keeping raw pre-turn context (%d rows) + %d stripped "
+                    "current-turn row(s) (#7237 exact-prefix authority gate)",
+                    len(previous_context), len(_candidates),
+                )
+                return list(previous_context) + _candidates
             logger.info(
                 "Projected history supplied and is a STRICT exact prefix of "
                 "the returned list: keeping raw pre-turn context (%d rows) + "
@@ -7604,7 +7704,6 @@ def _dedupe_replayed_context_messages(
             len(previous_context),
         )
         return list(previous_context)
-    previous_user_tail = _stale_user_tail_candidate(_last_user_row(previous_context))
     if not _messages_have_prefix(
         result_messages,
         previous_context,
@@ -7676,16 +7775,16 @@ def _dedupe_replayed_context_messages(
         # data loss, #7237 review blocker 1). Keep the authoritative raw
         # pre-turn context and settle only the current-turn slice on top.
         #
-        # ``_has_compression_marker`` was resolved once at the top of this
+        # ``_has_compression_rotation`` was resolved once at the top of this
         # function before the projection-authority gate, so it is still in
-        # scope here. When a projection WAS supplied and there is no
-        # compression marker, the gate above already resolved it in BOTH
+        # scope here. When a projection WAS supplied and no marker proves a
+        # NEW current-turn rotation, the gate above already resolved it in BOTH
         # directions (returning ``previous_context + proven suffix`` for an
         # exact prefix, or ``previous_context`` alone for a non-exact
         # projection, round-N blocker 1); reaching this point with
-        # ``projected_history is not None`` and no compression marker is
+        # ``projected_history is not None`` and no rotation proof is
         # impossible. Only the projection-less ownership scan remains.
-        if not _has_compression_marker:
+        if not _has_compression_rotation:
             _boundary_idx = _find_active_turn_checkpoint_index(
                 result_messages, previous_context, active_turn_identity, msg_text,
             )
@@ -7741,19 +7840,21 @@ def _dedupe_replayed_context_messages(
                 len(previous_context),
             )
             return list(previous_context)
-        # A compression marker explains the rotation: wholesale replacement of
-        # the historical prefix stays legitimate.
+        # A marker that proves a NEW current-turn compression rotation
+        # explains the rotation: wholesale replacement of the historical
+        # prefix stays legitimate.
         return result_messages
     # Fast-path strict re-check (#7237 exact-prefix authority gap): the
     # loose raw-prefix match normalized whitespace and truncated content at
     # 500 characters, so a drifted historical row can look like a replayed
     # prefix. The authority gate above already resolves every supplied
-    # non-compression projection in both directions (exact prefix →
-    # ``previous_context + proven suffix``; non-exact → ``previous_context``
-    # alone, round-N blocker 1), so this branch is a redundant safety net
-    # kept for defense-in-depth: if a future edit ever lets a supplied
-    # non-exact projection reach the raw-prefix path, it still fails closed.
-    if projected_history is not None and not _has_compression_marker:
+    # projection in both directions when no marker proves a NEW current-turn
+    # rotation (exact prefix → ``previous_context + proven suffix``;
+    # non-exact → ``previous_context`` alone, round-N blocker 1), so this
+    # branch is a redundant safety net kept for defense-in-depth: if a
+    # future edit ever lets a supplied non-exact projection reach the
+    # raw-prefix path, it still fails closed.
+    if projected_history is not None and not _has_compression_rotation:
         logger.info(
             "Raw-prefix fast path hit, projected history supplied but not "
             "an exact prefix: keeping raw pre-turn context (%d rows) "

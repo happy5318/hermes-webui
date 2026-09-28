@@ -25543,12 +25543,26 @@ def _handle_chat_sync(handler, body):
         _assign_stable_message_ids(
             _result_messages, _previous_messages, _previous_context_messages
         )
-        _next_context_messages = _dedupe_replayed_context_messages(
-            _previous_context_messages,
-            _next_context_messages,
-            msg,
-            projected_history=_run_conversation_projected_history,
-        )
+        if result.get("messages"):
+            _next_context_messages = _dedupe_replayed_context_messages(
+                _previous_context_messages,
+                _next_context_messages,
+                msg,
+                projected_history=_run_conversation_projected_history,
+            )
+        else:
+            # The Agent produced NO rows for this turn. The previous fallback
+            # (``result.get("messages") or _previous_context_messages``) left
+            # the raw pre-turn context substituted as the settle input; with
+            # the exact sent projection ``[]`` that whole substituted raw
+            # history was then treated as the current-turn output and the
+            # settle returned ``previous_context + previous_context``
+            # (#7237 review residual 2, nesquena-hermes 2026-09-27). Settle
+            # an empty Agent result as a no-op for model context — the same
+            # contract the streaming ``_settle_result_messages`` applies —
+            # keeping exactly one raw-history copy with no loss or
+            # duplication.
+            _next_context_messages = list(_previous_context_messages)
         if _active_turn_identity.get("token"):
             _next_context_messages = _settle_current_turn_boundary(
                 _previous_context_messages,
