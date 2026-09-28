@@ -104,6 +104,57 @@ def test_read_instance_label_falls_back_to_config_nested(monkeypatch, tmp_path):
     assert routes._read_instance_label() == "Staging"
 
 
+def test_read_instance_label_expands_env_placeholder(monkeypatch, tmp_path):
+    """A ``${VAR}`` placeholder in ``instance_name`` must resolve to the
+    variable's value, exactly like every other config read does
+    (``api.config._expand_env_vars``).
+
+    A raw YAML read leaves the reference untouched, so an operator deploying
+    with ``instance_name: ${DEPLOYMENT_NAME}`` gets the literal
+    ``${DEPLOYMENT_NAME}`` in the browser tab instead of their deployment
+    name — the placeholder is a deployment-time idiom, and the title is where
+    the user actually sees it.
+    """
+    import api.routes as routes
+    monkeypatch.delenv("HERMES_WEBUI_INSTANCE_NAME", raising=False)
+    monkeypatch.setenv("HERMES_TEST_DEPLOYMENT_NAME", "Prod-East")
+    _install_config(
+        monkeypatch,
+        tmp_path,
+        {
+            "webui": {
+                "instance_name": "Deployment-${HERMES_TEST_DEPLOYMENT_NAME}",
+            }
+        },
+    )
+    label = routes._read_instance_label()
+    assert label == "Deployment-Prod-East", (
+        f"placeholder must be expanded to the variable's value, got {label!r}"
+    )
+    assert "${" not in label, (
+        f"the raw placeholder must never reach the title, got {label!r}"
+    )
+
+
+def test_read_instance_label_keeps_unresolvable_placeholder_literal(monkeypatch, tmp_path):
+    """An UNDEFINED variable is left as the literal reference rather than
+    expanded to an empty string — a label that silently became
+    ``"Deployment-"`` would look like a misconfigured title, whereas the
+    placeholder at least tells the operator which variable failed to resolve.
+    This also pins that expansion never raises out of the helper.
+    """
+    import api.routes as routes
+    monkeypatch.delenv("HERMES_WEBUI_INSTANCE_NAME", raising=False)
+    monkeypatch.delenv("HERMES_TEST_DEFINITELY_UNSET", raising=False)
+    _install_config(
+        monkeypatch,
+        tmp_path,
+        {"instance_name": "Build-${HERMES_TEST_DEFINITELY_UNSET}"},
+    )
+    label = routes._read_instance_label()
+    assert label == "Build-${HERMES_TEST_DEFINITELY_UNSET}"
+
+
 def test_read_instance_label_returns_empty_when_unset(monkeypatch, tmp_path):
     """When neither env var nor config keys are set, the helper
     returns the empty string. The frontend treats the empty
@@ -257,22 +308,38 @@ def test_read_instance_label_env_var_beats_profile_env_override(monkeypatch, tmp
 
     monkeypatch.setattr(profiles, "_DEFAULT_HERMES_HOME", base)
 
+    # The loader records what it loaded in a MODULE-LEVEL set and pops every
+    # one of those keys on the next call — so a test that leaves it polluted
+    # lets a later profile reload delete environment values belonging to
+    # another test (or to the server). Snapshot and restore both halves: the
+    # keys it tracked, and the env values it overwrote.
+    prev_loaded = profiles._loaded_profile_env_keys
+    preexisting = {
+        k: os.environ.get(k)
+        for k in ("HERMES_WEBUI_INSTANCE_NAME", "SOME_OTHER_KEY")
+    }
+
     profiles._reload_dotenv(alice)
 
-    assert os.environ.get("SOME_OTHER_KEY") == "ok", (
-        "non-protected profile .env keys must still load normally"
-    )
-    assert os.environ.get("HERMES_WEBUI_INSTANCE_NAME") != "AliceProfileEnv", (
-        "a profile .env must not be able to override the deployment-level instance label"
-    )
-    assert routes._read_instance_label() == "Deployment", (
-        "the deployment label must survive a profile .env load"
-    )
-
     try:
-        os.environ.pop("SOME_OTHER_KEY", None)
-    except Exception:
-        pass
+        assert os.environ.get("SOME_OTHER_KEY") == "ok", (
+            "non-protected profile .env keys must still load normally"
+        )
+        assert os.environ.get("HERMES_WEBUI_INSTANCE_NAME") != "AliceProfileEnv", (
+            "a profile .env must not be able to override the deployment-level instance label"
+        )
+        assert routes._read_instance_label() == "Deployment", (
+            "the deployment label must survive a profile .env load"
+        )
+    finally:
+        # Restore the exact prior state so this test cannot influence any
+        # other test through the loader's global (greptile P2).
+        profiles._loaded_profile_env_keys = prev_loaded
+        for k, v in preexisting.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 def test_profile_env_cannot_override_protected_instance_label_via_runtime_env(tmp_path):

@@ -14012,6 +14012,21 @@ def _read_installation_config() -> dict:
         loaded = _yaml.safe_load(raw.decode("utf-8", "replace"))
     except Exception:
         return {}
+    if not isinstance(loaded, dict):
+        return {}
+    # Expand ${VAR} references the way every other config read does
+    # (api.config._expand_env_vars). A raw YAML read would surface the
+    # literal placeholder: an operator deploying with
+    # ``instance_name: ${DEPLOYMENT_NAME}`` would see "${DEPLOYMENT_NAME}"
+    # in the tab title instead of the deployment name.
+    try:
+        from api.config import _expand_env_vars
+
+        loaded = _expand_env_vars(loaded)
+    except Exception:
+        # Expansion is best-effort: a lookup miss keeps the literal
+        # reference, which is still better than a 500 on /api/settings.
+        pass
     return loaded if isinstance(loaded, dict) else {}
 
 
