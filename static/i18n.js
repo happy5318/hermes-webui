@@ -27134,6 +27134,13 @@ function applyLocaleToDOM() {
   });
   if (typeof syncWorkspacePanelUI === 'function') syncWorkspacePanelUI();
   if (typeof syncAppTitlebar === 'function') syncAppTitlebar();
+  // #1804/#7686: the composer's primary button carries action-dependent
+  // state (title, aria-label, icon and the busy-mode ``data-label`` pill),
+  // none of which is a static [data-i18n] attribute. While busy the visible
+  // label said e.g. "Stop" but the tooltip/SR label stayed the stale
+  // localized "Send message" until the next composer-state transition.
+  // Re-derive the whole button state with the freshly loaded locale.
+  if (typeof updateSendBtn === 'function') updateSendBtn();
 }
 
 // Apply saved locale immediately so there's no flash of English on reload.

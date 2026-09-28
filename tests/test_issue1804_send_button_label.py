@@ -18,7 +18,9 @@ Two layers are under test:
 """
 from __future__ import annotations
 
+import json
 import re
+import subprocess
 import textwrap
 from pathlib import Path
 
@@ -236,3 +238,69 @@ def test_helper_actually_sets_data_label_in_node_vm():
     assert out["steer"] == "composer_action_steer"
     assert out["send"] is None
     assert out["disabled"] is None
+
+
+# ── #7686: a locale change must re-derive the busy button state ───────────
+
+
+def _extract_apply_locale(i18n_text):
+    """Pull the real ``applyLocaleToDOM`` source out of static/i18n.js."""
+    start = i18n_text.index("function applyLocaleToDOM()")
+    i = i18n_text.index("{", start)
+    depth = 1
+    i += 1
+    while depth:
+        if i18n_text[i] == "{":
+            depth += 1
+        elif i18n_text[i] == "}":
+            depth -= 1
+        i += 1
+    return i18n_text[start:i]
+
+
+def _run_apply_locale(apply_src):
+    script = textwrap.dedent(
+        """
+        const vm = require('vm');
+        const calls = [];
+        const ctx = {
+          console,
+          t: (k) => 'LOCALIZED:' + k,
+          syncWorkspacePanelUI: () => {},
+          syncAppTitlebar: () => {},
+          updateSendBtn: () => { calls.push('updateSendBtn'); },
+          document: {
+            querySelectorAll: () => ({ forEach: () => {} }),
+          },
+        };
+        vm.createContext(ctx);
+        vm.runInContext(__APPLY_SRC__, ctx);
+        ctx.applyLocaleToDOM();
+        console.log(JSON.stringify(calls));
+        """
+    ).replace("__APPLY_SRC__", json.dumps(apply_src))
+    r = subprocess.run(
+        ["node", "-e", script], capture_output=True, text=True, timeout=30
+    )
+    assert r.returncode == 0, r.stderr
+    return json.loads(r.stdout.strip().splitlines()[-1])
+
+
+def test_apply_locale_rederives_the_busy_send_button():
+    """Greptile #7686 P1: ``applyLocaleToDOM`` only re-stamped static
+    [data-i18n] attributes, so while the composer was busy the visible action
+    label said e.g. "Stop" but the tooltip and the screen-reader label still
+    read the stale localized "Send message" until another composer-state
+    transition called ``updateSendBtn()``. The locale application must
+    re-derive the button's action-dependent state, not just its inner HTML.
+    """
+    calls = _run_apply_locale(_extract_apply_locale(I18N_JS))
+    assert calls == ["updateSendBtn"], calls
+
+
+def test_apply_locale_rederivation_is_real_source_not_stub():
+    """Guard against the call being added to a helper the real path never
+    runs: the call must live inside applyLocaleToDOM itself (i18n.js), not in
+    some other restamp helper."""
+    body = _extract_apply_locale(I18N_JS)
+    assert "updateSendBtn" in body, body
