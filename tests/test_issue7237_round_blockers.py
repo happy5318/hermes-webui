@@ -20,8 +20,6 @@ Reproductions and regressions for the review findings at head ``13bc05a1``:
 
 import copy
 
-import pytest
-
 
 def _user(text, **extra):
     row = {"role": "user", "content": text, "timestamp": 1.0}
