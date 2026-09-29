@@ -6599,7 +6599,7 @@ def _forwarded_client_ip_from_trusted_proxy(handler):
     Consumes ALL X-Forwarded-For values (across repeated headers), preserves wire
     order, walks RIGHT-TO-LEFT skipping hops that are themselves trusted-proxy
     addresses, and returns the first non-trusted (i.e. real-client) hop. Falls
-    back to X-Real-IP, then the raw socket peer. Returns None when the chain is
+    back to the raw socket peer. Returns None when the chain is
     present-but-empty / malformed so the caller fails closed. Both the XFF walk's
     final candidate and the raw-peer fallback are validated with
     ``ipaddress.ip_address`` and returned in canonical string form — never raw
