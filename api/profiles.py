@@ -221,6 +221,15 @@ _PROTECTED_ENV_KEYS = frozenset({
     # not be able to rewrite it — otherwise whichever profile loads last wins and
     # two tabs on one deployment disagree on the label.
     'HERMES_WEBUI_INSTANCE_NAME',
+    # #7611: HERMES_CONFIG_PATH points the whole config layer at a specific
+    # config.yaml. It is read LIVE by _installation_config_path(), which exists
+    # so the INSTALLATION-scoped instance label never comes from a request
+    # profile's file. If a profile's .env could set it, activating that profile
+    # would repoint installation configuration at the profile's own config.yaml
+    # — the label could then differ per profile, which is precisely the
+    # profile-scoping this function family is defined against. Only the
+    # operator/launcher env at startup may set it.
+    'HERMES_CONFIG_PATH',
 })
 
 

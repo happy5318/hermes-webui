@@ -863,3 +863,58 @@ def _extract_function_body(src: str, name: str) -> str:
             if depth == 0:
                 return src[brace + 1 : idx]
     raise AssertionError(f"{name} body did not terminate")
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_a_profile_dotenv_cannot_repoint_installation_configuration(tmp_path, monkeypatch):
+    """A profile must not be able to hijack installation-scoped config (#7611).
+
+    ``_installation_config_path`` reads ``HERMES_CONFIG_PATH`` from the LIVE
+    environment, and a profile activation writes that profile's ``.env`` into
+    ``os.environ`` via ``_reload_dotenv``. So a profile whose ``.env`` sets
+    ``HERMES_CONFIG_PATH`` to its own config.yaml repointed installation
+    configuration at a profile file — and because ``_read_installation_config``
+    reads ``instance_name`` from whatever that path resolves to, the
+    installation label could change per profile. That is exactly the
+    profile-scoping the installation-scoped label exists to avoid.
+
+    The protected-key list is the mechanism: the same one that already keeps
+    ``HERMES_WEBUI_INSTANCE_NAME`` unspoofable.
+    """
+    from api import profiles as prof
+
+    assert "HERMES_CONFIG_PATH" in prof._PROTECTED_ENV_KEYS, (
+        "HERMES_CONFIG_PATH resolves installation-scoped config, so a profile "
+        ".env must not be able to set it"
+    )
+
+    # Drive the real loader: a profile .env carrying the key must leave the
+    # process env untouched, and must not be recorded as a loaded key (so a
+    # later restore cannot drop the operator's value either — greptile P2).
+    monkeypatch.setenv("HERMES_CONFIG_PATH", str(tmp_path / "installation.yaml"))
+    profile_home = tmp_path / "profiles" / "sneaky"
+    profile_home.mkdir(parents=True)
+    sneaky_cfg = tmp_path / "sneaky-config.yaml"
+    sneaky_cfg.write_text("instance_name: hijacked\n", encoding="utf-8")
+    (profile_home / ".env").write_text(
+        f"HERMES_CONFIG_PATH={sneaky_cfg}\nSOME_OTHER_KEY=x\n", encoding="utf-8"
+    )
+
+    prof._reload_dotenv(profile_home)
+
+    assert os.environ.get("HERMES_CONFIG_PATH") == str(tmp_path / "installation.yaml"), (
+        "a profile .env overwrote the installation config path"
+    )
+    assert "HERMES_CONFIG_PATH" not in (prof._loaded_profile_env_keys or set()), (
+        "the protected key was recorded as loader state, so a later profile "
+        "reload could remove the operator's value"
+    )
+    # The unrelated key is still projected, so protection is scoped to the
+    # installation-level key and does not freeze the profile's whole env.
+    assert os.environ.get("SOME_OTHER_KEY") == "x"
+
+    # And the label resolver therefore cannot be steered by the profile.
+    routes = _load_routes()
+    installer = tmp_path / "installation.yaml"
+    installer.write_text("instance_name: real-deployment\n", encoding="utf-8")
+    assert routes._read_instance_label() == "real-deployment"
