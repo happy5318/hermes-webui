@@ -6601,10 +6601,19 @@ def _forwarded_client_ip_from_trusted_proxy(handler):
     addresses, and returns the first non-trusted (i.e. real-client) hop. Falls
     back to X-Real-IP, then the raw socket peer. Returns None when the chain is
     present-but-empty / malformed so the caller fails closed. Both the XFF walk's
-    final candidate and the X-Real-IP fallback are validated with
+    final candidate and the raw-peer fallback are validated with
     ``ipaddress.ip_address`` and returned in canonical string form — never raw
     header text (see the ``forwarded_for`` log contract in
     ``trusted_forwarded_client_ip``).
+
+    NOTE: X-Real-IP is deliberately NOT consumed here. It is a second
+    spoofable-by-the-client header (nginx relays client-supplied X-Real-IP
+    through by default instead of overwriting it), and this helper serves
+    consumers — the request log, the local-origin gate, trusted-header auth —
+    whose trust boundary is the raw socket peer. Only the X-Forwarded-For
+    resolution below is guaranteed to walk a chain whose right-most hop was
+    appended by the trusted peer itself. The local-origin gate's separate,
+    opt-in X-Real-IP handling lives in ``_onboarding_request_is_local``.
     """
     import ipaddress
 
@@ -6651,19 +6660,11 @@ def _forwarded_client_ip_from_trusted_proxy(handler):
         # tier itself (loopback/private), i.e. resolve to the raw peer below.
         return _request_client_ip(handler)
 
-    real_ip = handler.headers.get("X-Real-IP", "").strip()
-    if real_ip:
-        try:
-            # Validate and canonicalize: a trusted proxy may assert a client IP,
-            # but the log must return a syntactically-valid, normalised address —
-            # never raw header text (a forwarding proxy that overwrites rather
-            # than strips X-Real-IP could otherwise hand us an attacker marker or
-            # a hostname, corrupting downstream fail2ban parsing).
-            return str(ipaddress.ip_address(real_ip))
-        except ValueError:
-            # Malformed X-Real-IP from a trusted proxy → fail closed.
-            return None
-    # No forwarded header at all → the trusted proxy is speaking for itself.
+    # No X-Forwarded-For at all. X-Real-IP is intentionally NOT consulted (see
+    # the NOTE above): any client can send it, and nginx relays client headers
+    # through by default rather than overwriting X-Real-IP — so honoring it
+    # here would reintroduce the #7863 spoof through a different header.
+    # Without a forwarded chain the trusted proxy is speaking for itself.
     return _request_client_ip(handler)
 
 
@@ -6679,8 +6680,12 @@ def trusted_forwarded_client_ip(handler) -> str | None:
 
     CONTRACT: the value written to the log's ``forwarded_for`` field is a
     resolved, validated client address — canonical (``ipaddress.ip_address``
-    string form), NOT the raw left-most header text. Malformed X-Real-IP and
-    malformed/incomplete XFF chains yield None (field omitted), so downstream
+    string form), NOT the raw left-most header text. It is derived
+    EXCLUSIVELY from the right-to-left X-Forwarded-For resolution: X-Real-IP is
+    never read (any client can send it, and nginx relays it through by
+    default), so a trusted peer cannot smuggle an arbitrary address into the
+    log through that header, nor through any header-only path at all.
+    Malformed/incomplete XFF chains yield None (field omitted), so downstream
     fail2ban-style consumers never see unvalidated or syntactically-invalid data.
 
     Kept here (not inline in server.py) so the process entrypoint stays under

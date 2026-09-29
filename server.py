@@ -601,7 +601,7 @@ def main() -> None:
         print('[ok] Running within container.', flush=True)
 
     # Security: warn if binding non-loopback without authentication
-    from api.auth import get_oidc_startup_warning, is_auth_enabled
+    from api.auth import get_oidc_startup_warning, is_auth_enabled, print_startup_warnings
     if HOST not in ('127.0.0.1', '::1', 'localhost') and not is_auth_enabled():
         print(f'[!!] WARNING: Binding to {HOST} with NO PASSWORD SET.', flush=True)
         print(f'     Anyone on the network can access your filesystem and agent.', flush=True)
@@ -614,9 +614,9 @@ def main() -> None:
         print(f'        and memory via the local API. Set HERMES_WEBUI_PASSWORD to', flush=True)
         print(f'        enable authentication.', flush=True)
 
-    oidc_startup_warning = get_oidc_startup_warning()
-    if oidc_startup_warning:
-        print(f'[!!] WARNING: {oidc_startup_warning}', flush=True)
+    if (w := get_oidc_startup_warning()):
+        print(f'[!!] WARNING: {w}', flush=True)
+    print_startup_warnings()  # #7864 r2: no-op TRUST_FORWARDED_FOR etc.
 
     ok, missing, errors = verify_hermes_imports()
     if not ok and _HERMES_FOUND:

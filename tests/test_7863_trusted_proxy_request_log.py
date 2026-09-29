@@ -99,6 +99,58 @@ class TestTrustedProxyResolution:
         rec = _log_record(cap)
         assert "forwarded_for" not in rec
 
+    def test_x_real_ip_alone_from_trusted_peer_is_not_recorded(self):
+        """Round 2 (blocker): X-Real-IP must not feed forwarded_for.
+
+        nginx passes client-supplied request headers through by default
+        (proxy_pass_request_headers on), so a proxy that does not explicitly
+        overwrite X-Real-IP relays whatever the client sent. With the fallback
+        that this PR previously had, a loopback peer could put any address into
+        X-Real-IP and get it logged as forwarded_for — the #7863 attack
+        through a different header. The field must be absent.
+        """
+        handler, cap = _make_handler(
+            remote_ip="127.0.0.1", xff=None, real_ip="198.51.100.7"
+        )
+        Handler.log_request(handler, "200", "-")
+        rec = _log_record(cap)
+        assert rec["remote"] == "127.0.0.1"
+        assert "forwarded_for" not in rec, (
+            "X-Real-IP alone must never be recorded as forwarded_for"
+        )
+
+    def test_x_real_ip_ignored_even_with_valid_xff_present(self):
+        """X-Real-IP must not override or merge with the XFF resolution.
+
+        A trusted peer sends both headers: X-Real-IP carries the attacker's
+        chosen marker while XFF carries the real chain. Only the XFF walk
+        feeds the log.
+        """
+        handler, cap = _make_handler(
+            remote_ip="127.0.0.1",
+            xff="198.51.100.7",
+            real_ip="203.0.113.99",
+        )
+        Handler.log_request(handler, "200", "-")
+        rec = _log_record(cap)
+        assert rec["forwarded_for"] == "198.51.100.7", (
+            "resolution must come from XFF, never from X-Real-IP"
+        )
+
+    def test_malformed_x_real_ip_from_trusted_peer_has_no_field(self):
+        """X-Real-IP carrying a non-IP token yields no field at all.
+
+        The old fallback validated the value but still honored the header; the
+        fix removes the header from the resolver entirely, so malformed input
+        is as harmless as valid input.
+        """
+        handler, cap = _make_handler(
+            remote_ip="127.0.0.1", xff=None, real_ip="not-an-ip"
+        )
+        Handler.log_request(handler, "200", "-")
+        rec = _log_record(cap)
+        assert "forwarded_for" not in rec
+
     def test_allowlisted_remote_proxy_is_trusted(self, monkeypatch):
         monkeypatch.setenv("HERMES_WEBUI_TRUSTED_PROXY_CIDRS", "10.0.0.0/8")
         import api.routes as routes_mod
