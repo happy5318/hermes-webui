@@ -734,8 +734,75 @@ _REDACT_CACHE_MAX_TEXT_LEN = 16384
 # be redacted.
 
 
+# Static probe over the credential SHAPES the built-in redactor can mask. A
+# large string that matches none of them cannot be rewritten by any pass now
+# installed, so the full redactor may be skipped. The probe is deliberately
+# narrow: it must never return False for text the redactor would change — a
+# miss here is a credential leak, not a slowdown. Registered-plugin patterns
+# are NOT covered (see _probe_fast_path_allowed below).
+# ``ctrl`` mirrors the control/zero-width bytes _mask_control_split_tokens
+# strips, so a token split by an ESC or ZWSP still trips the probe.
+_LARGE_STRING_PROBE_CTRL = r"[\x00-\x1f\x7f\x80-\x9f​-‏  ⁠-⁤]"
+_LARGE_STRING_PROBE_RE = _re.compile(
+    r"("
+    r"sk-[A-Za-z0-9_-]{20,}"                                    # OpenRouter et al.
+    r"|sk-[A-Za-z0-9_-]*" + _LARGE_STRING_PROBE_CTRL + r"[A-Za-z0-9_-]{20,}"  # control-split
+    r"|AKIA[0-9A-Z]{10,}"                                        # AWS access key id
+    r"|ghp_[A-Za-z0-9]{30,}"                                     # GitHub PAT
+    r"|AIza[0-9A-Za-z_-]{20,}"                                   # Google API key
+    r"|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"                # JWT
+    r"|-----BEGIN [A-Z ]*PRIVATE KEY-----"                       # PEM header
+    r"|\b[0-9]{8,}:[A-Za-z0-9_-]{30,}\b"                         # Telegram bot token
+    r"|[a-z][a-z0-9+.-]*://[^/\s:@]+:[^/\s@]+@"                  # URL userinfo
+    r"|[A-Za-z0-9_-]*(?:api_?key|secret|token|password|credential)[A-Za-z0-9_-]*"
+    r"\s*[:=]\s*[\"']?[^\s\"']{12,}"                             # assignment forms
+    r")"
+)
+
+
+def _builtin_prefix_substring_count() -> int:
+    """Number of literal substrings in the agent's built-in prefix matcher.
+
+    Returns 0 when the agent redactor is unavailable — the probe fast path is
+    then disabled entirely and every string re-runs the full redactor.
+    """
+    try:
+        from agent.redact import _PREFIX_SUBSTRINGS
+        return len(_PREFIX_SUBSTRINGS)
+    except Exception:
+        return 0
+
+
+# A plugin registering a credential pattern extends _PREFIX_SUBSTRINGS at
+# runtime (agent.redact.register_redaction_patterns → _rebuild_prefix_matcher),
+# and the static probe above knows nothing about it. Probe once at import and
+# disable the fast path for the process lifetime as soon as the count changes;
+# the disable is monotonic, so a registered secret can never be served raw.
+_BUILTIN_PREFIX_COUNT = _builtin_prefix_substring_count()
+_probe_fast_path_allowed = _BUILTIN_PREFIX_COUNT > 0
+
+
+def _probe_fast_path_enabled() -> bool:
+    """False (fail-closed) once any runtime redaction pattern is registered."""
+    global _probe_fast_path_allowed
+    if not _probe_fast_path_allowed:
+        return False
+    if _builtin_prefix_substring_count() != _BUILTIN_PREFIX_COUNT:
+        _probe_fast_path_allowed = False
+    return _probe_fast_path_allowed
+
+
 def _redact_fn_cached(text):
     if len(text) > _REDACT_CACHE_MAX_TEXT_LEN:
+        # Above the small-cache threshold the redactor re-runs per call (see
+        # the fail-closed note below). Long reasoning/tool blobs make that the
+        # dominant cost of a large session GET, so a probe first: when it finds
+        # no built-in credential shape the redactor provably cannot rewrite
+        # the text and the string is returned as-is. Probe hits, plugin
+        # patterns, and an unavailable agent registry all fall through to the
+        # full redactor, so a newly-registered secret is still masked.
+        if _probe_fast_path_enabled() and not _LARGE_STRING_PROBE_RE.search(text):
+            return text
         return _redact_fn_uncached(text)
     return _redact_fn_lru(text)
 
