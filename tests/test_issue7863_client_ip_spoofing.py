@@ -177,3 +177,84 @@ def test_hostile_repeated_header_leaves_the_record_bounded(log_output):
     # 500 injected headers, none of them land in the structured record.
     assert "forwarded_for_chain" not in record
     assert len(line) < 1024, "the record must stay bounded regardless of input"
+
+
+def test_malformed_x_real_ip_from_trusted_peer_logs_the_raw_peer(log_output):
+    """Trusted peer + malformed X-Real-IP + no XFF → the raw peer, never the text.
+
+    A proxy that appends to (rather than replaces) a client-supplied chain can
+    relay garbage in ``X-Real-IP``; header text must not become the log's
+    identity (the old fallback echoed it verbatim, so no validation raised and
+    the fail-closed branch never ran).
+    """
+    handler = _handler("127.0.0.1", _Headers(real_ip="not-an-ip"))
+
+    Handler.log_request(handler, "200")
+
+    record = _record(log_output)
+    assert record["client_ip"] == "127.0.0.1"
+    assert record["client_ip"] == record["remote"]
+
+
+def test_valid_x_real_ip_and_ipv6_remain_accepted_on_the_log_path(log_output):
+    """A trusted proxy's *valid* X-Real-IP still resolves the log's client_ip.
+
+    The request log never reads ``X-Real-IP`` (see the module docstring) — the
+    right-to-left XFF walk is the only authority — but an IPv4/IPv6-formatted
+    value must not break resolution when XFF is present, and must fall closed
+    to the raw peer when it is absent.
+    """
+    # XFF present: the walk wins over any X-Real-IP.
+    handler = _handler(
+        "127.0.0.1", _Headers(forwarded=["203.0.113.7"], real_ip="198.51.100.99")
+    )
+    Handler.log_request(handler, "200")
+    lines = [l for l in log_output.getvalue().strip().splitlines() if l]
+    assert json.loads(lines[-1].removeprefix("[webui] "))["client_ip"] == "203.0.113.7"
+
+    # XFF absent, X-Real-IP alone: the log falls closed to the raw peer.
+    handler = _handler("127.0.0.1", _Headers(real_ip="2001:db8::1"))
+    Handler.log_request(handler, "200")
+    lines = [l for l in log_output.getvalue().strip().splitlines() if l]
+    assert json.loads(lines[-1].removeprefix("[webui] "))["client_ip"] == "127.0.0.1"
+
+
+def test_trusted_peer_oversized_chain_stays_bounded(log_output):
+    """A trusted proxy relaying a hostile chain cannot inflate the record.
+
+    Trusting the immediate peer is necessary for resolution but does not bound
+    the inbound volume: the proxy may append to a client-supplied chain. The
+    diagnostic ``forwarded_for_chain`` is therefore capped by entry count and
+    serialized characters while ``client_ip`` keeps the full validated walk.
+    """
+    hostile = [f"203.0.113.{i % 250 + 1}" for i in range(500)]
+    handler = _handler("127.0.0.1", _Headers(forwarded=hostile))
+
+    Handler.log_request(handler, "200")
+
+    line = log_output.getvalue().strip().splitlines()[-1].removeprefix("[webui] ")
+    record = json.loads(line)
+    # Resolution still uses the full validated semantics: right-most hop.
+    assert record["client_ip"] == "203.0.113.250"
+    assert record["remote"] == "127.0.0.1"
+    chain = record["forwarded_for_chain"]
+    assert len(chain) <= 32, f"chain not bounded: {len(chain)} entries"
+    assert sum(len(e) for e in chain) <= 512
+    assert len(line) < 4096, "the record must stay bounded even from a trusted peer"
+
+
+def test_trusted_chain_truncation_keeps_the_resolution_semantics(log_output):
+    """After diagnostic truncation the trusted-chain client selection is unchanged.
+
+    A proxy appends its own hop to a client chain that already ends in the real
+    client; truncation is diagnostic-only, so ``client_ip`` must still be the
+    first non-trusted hop from the right, not the truncated tail.
+    """
+    hops = ["192.0.2.5"] + [f"10.0.0.{i}" for i in range(1, 60)] + ["203.0.113.99"]
+    handler = _handler("127.0.0.1", _Headers(forwarded=hops))
+
+    Handler.log_request(handler, "200")
+
+    record = _record(log_output)
+    assert record["client_ip"] == "203.0.113.99"
+    assert len(record["forwarded_for_chain"]) <= 32

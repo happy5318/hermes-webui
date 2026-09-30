@@ -6592,15 +6592,33 @@ def _raw_peer_is_trusted_proxy(handler) -> bool:
     return _ip_in_networks(addr, _trusted_proxy_networks())
 
 
-def _forwarded_client_ip_from_trusted_proxy(handler):
+def _forwarded_client_ip_from_trusted_proxy(handler, consult_real_ip: bool = True):
     """Resolve the real client IP from a chain fronted by a trusted proxy.
 
     Precondition: the caller has verified the raw socket peer is a trusted proxy.
     Consumes ALL X-Forwarded-For values (across repeated headers), preserves wire
     order, walks RIGHT-TO-LEFT skipping hops that are themselves trusted-proxy
-    addresses, and returns the first non-trusted (i.e. real-client) hop. Falls
-    back to X-Real-IP, then the raw socket peer. Returns None when the chain is
-    present-but-empty / malformed so the caller fails closed.
+    addresses, and returns the first non-trusted (i.e. real-client) hop. Both the
+    XFF walk's final candidate and the raw-peer fallback are validated with
+    ``ipaddress.ip_address`` and returned in canonical string form — never raw
+    header text.
+
+    ``consult_real_ip`` selects the no-XFF fallback:
+      * ``True`` (default, the plain master behaviour) falls back to ``X-Real-IP``
+        and then the raw peer. The local-origin gate, trusted-header SSO and other
+        consumers that predate #7863 keep exactly the resolution they had.
+      * ``False`` never reads ``X-Real-IP`` at all and goes straight to the raw
+        peer. This is the request-log path only: the structured log is a security
+        boundary (its ``forwarded_for`` feed fail2ban), and ``X-Real-IP`` is a
+        second client-writable header (nginx relays client-supplied values through
+        by default instead of overwriting it), so honoring it there would
+        reintroduce #7863 through a different header. The malformed-value case
+        fails closed: header text never becomes the log's identity.
+
+    The XFF walk is identical either way — the right-most hop was appended by the
+    trusted peer itself, so it carries the same guarantee with or without the
+    fallback. Returns None when the chain is present-but-empty / malformed so
+    callers fail closed.
     """
     import ipaddress
 
@@ -6645,11 +6663,41 @@ def _forwarded_client_ip_from_trusted_proxy(handler):
         # tier itself (loopback/private), i.e. resolve to the raw peer below.
         return _request_client_ip(handler)
 
-    real_ip = handler.headers.get("X-Real-IP", "").strip()
-    if real_ip:
-        return real_ip
-    # No forwarded header at all → the trusted proxy is speaking for itself.
+    # No X-Forwarded-For at all.
+    if consult_real_ip:
+        # Master behaviour, kept for the pre-#7863 consumers (local-origin
+        # gate, trusted-header SSO): a proxy that asserts X-Real-IP is honoured.
+        # Validate it like the XFF path so header text can never become a log
+        # identity on the request-log boundary (consult_real_ip=False below
+        # simply never reaches this branch).
+        real_ip = handler.headers.get("X-Real-IP", "").strip()
+        if real_ip:
+            try:
+                return str(ipaddress.ip_address(real_ip))
+            except ValueError:
+                # Malformed X-Real-IP: fail closed rather than echo garbage.
+                return None
+    # Without a forwarded chain the trusted proxy is speaking for itself. On the
+    # request-log path (consult_real_ip=False) this is also the fail-closed
+    # fallback: no forwarded chain, no forwarded identity.
     return _request_client_ip(handler)
+
+
+def _bounded_trusted_chain(xff_values, *, max_entries: int = 32, max_chars: int = 512) -> list:
+    """Bound the trusted-peer diagnostic chain before it reaches the log.
+
+    Trusting the immediate proxy is necessary for client-IP resolution, but it
+    does NOT make the inbound chain bounded: a proxy may append to a
+    client-supplied chain rather than replace it, so an unbounded XFF could
+    otherwise write unbounded volume into the structured record even from a
+    trusted peer. Bound by entry count and serialized characters, keeping the
+    most recent (right-most) hops — the ones closest to the trusted peer, which
+    are the ones the peer itself vouched for.
+    """
+    entries = [str(v) for v in xff_values if v]
+    if len(entries) <= max_entries and sum(len(e) for e in entries) <= max_chars:
+        return entries
+    return entries[-max_entries:]
 
 
 def _request_log_client_fields(handler, remote):
@@ -6659,14 +6707,19 @@ def _request_log_client_fields(handler, remote):
     authoritative — the resolved client hop when the raw socket peer is a
     trusted proxy, otherwise the raw peer — and the chain is diagnostic-only.
 
-    The chain is returned ONLY for a trusted proxy. An untrusted peer's
-    X-Forwarded-For is attacker-controlled and unbounded, so it is dropped
-    from the structured record entirely: emitting it would let any direct
-    client write arbitrary volume into the log line regardless of trust, which
-    the security contract does not need and a fail2ban-style consumer keyed on
-    ``client_ip`` never reads (#7863).
+    The chain is returned ONLY for a trusted proxy, and then BOUNDED (see
+    ``_bounded_trusted_chain``): a proxy may append to rather than replace a
+    client-supplied chain, so trust alone does not bound the inbound volume.
+    An untrusted peer's X-Forwarded-For is attacker-controlled and unbounded,
+    so it is dropped from the structured record entirely: emitting it would let
+    any direct client write arbitrary volume into the log line regardless of
+    trust, which the security contract does not need and a fail2ban-style
+    consumer keyed on ``client_ip`` never reads (#7863).
 
-    Resolution fails closed to the raw peer on any malformed chain.
+    Resolution fails closed to the raw peer on any malformed chain —
+    including a malformed ``X-Real-IP``, which is parsed with
+    ``ipaddress.ip_address`` in the same fail-closed shape as the XFF path so
+    header text can never become the log's identity.
     """
     try:
         xff_values = handler.headers.get_all("X-Forwarded-For") or []
@@ -6677,8 +6730,8 @@ def _request_log_client_fields(handler, remote):
             return "-", None
         if not _raw_peer_is_trusted_proxy(handler):
             return remote, None
-        resolved = _forwarded_client_ip_from_trusted_proxy(handler)
-        return (resolved or remote), list(xff_values)
+        resolved = _forwarded_client_ip_from_trusted_proxy(handler, consult_real_ip=False)
+        return (resolved or remote), _bounded_trusted_chain(xff_values)
     except Exception:
         return remote, None
 
