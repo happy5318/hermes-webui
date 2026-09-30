@@ -132,9 +132,12 @@ The same allowlist governs the trusted identity-header SSO setup
 (`HERMES_WEBUI_TRUSTED_AUTH_HEADER`) described in `.env.example`.
 
 > **Note:** nginx relays client-supplied request headers through by default
-> (`proxy_pass_request_headers on`), which includes `X-Real-IP`. WebUI never
-> trusts `X-Real-IP` for client-IP resolution, so configure your proxy to
-> overwrite it (`proxy_set_header X-Real-IP $remote_addr;`) only if you need
-> it for your own logging.
+> (`proxy_pass_request_headers on`), which includes `X-Real-IP`. The request
+> log therefore never trusts `X-Real-IP` for its `forwarded_for` field (only
+> the right-to-left `X-Forwarded-For` walk is accepted, and only from an
+> allowlisted peer). The local-origin gate and trusted-header SSO still honor
+> `X-Real-IP` when the peer is trusted, as they did before; configure your
+> proxy to overwrite it (`proxy_set_header X-Real-IP $remote_addr;`) to keep
+> those paths honest, or just for your own logging.
 
 ---
