@@ -11395,23 +11395,22 @@ STREAM_LAST_EVENT_ID: dict = {}  # stream_id -> latest journal event_id for `id:
 PENDING_GOAL_CONTINUATION: set = set()  # session_ids awaiting a goal continuation turn (#1932)
 # #6885 admission correction (round 2, maintainer review): marker and prompt
 # are ONE record so the two collections cannot drift apart. Value shape:
-#   {"prompt": str, "expires_at": float}
-# The routes.py consumer matches the incoming /chat/start text (after
-# client-envelope normalization) against "prompt" so a genuine user/queued
-# turn is not misclassified as goal-related — the bare session-scoped marker
-# is ambiguous. Written atomically next to the set add in streaming/gateway
-# goal_continue paths; consumed together with the marker by
-# _consume_pending_goal_continuation. "expires_at" bounds the lifecycle so an
-# abandoned browser dispatch (queued turn never fired) cannot leak a record
-# forever: past the expiry the pair is swept together by
-# sweep_expired_goal_continuations(), called from the goal-command handler.
+#   {"prompt": str, "continuation_id": str}
+# #7855: the routes.py consumer admits the turn by "continuation_id" — the
+# token the server issues here and carries on the goal_continue SSE event,
+# which the browser keeps on the queued entry through inline edits and
+# combines. A genuine user/queued turn carries no ID, so it keeps user
+# priority and the record stays for the real continuation dispatch.
+# Written atomically next to the set add in streaming/gateway goal_continue
+# paths; consumed together with the marker by
+# _consume_pending_goal_continuation.
+# There is deliberately no wall-clock expiry: the browser keeps a queued
+# continuation across refreshes and restores it into the composer for a
+# later send, so a TTL retired perfectly usable records (#7855 blocker 1).
+# A record lives until it is consumed or explicitly retired (goal clear /
+# pause / session retirement, plus an orphan sweep for broken halves).
 PENDING_GOAL_CONTINUATION_PROMPTS: dict = {}
 PENDING_GOAL_CONTINUATION_LOCK = threading.Lock()
-# A pending continuation outlives its turn by design: the browser needs one
-# full SSE-receive → queue → POST /api/chat/start round trip (plus queued
-# messages ahead of it). Half an hour is generous for that round trip while
-# still bounding a leaked record to a single idle window.
-GOAL_CONTINUATION_TTL_SECONDS: float = 1800.0
 
 
 def register_stream_owner(stream_id: str, session_id: str) -> None:

@@ -24607,23 +24607,41 @@ def _agent_runtime_barrier_response(
     return None
 
 
+def _normalize_goal_continuation_id(raw) -> str:
+    """Coerce a client-supplied continuation ID to a safe token (#7855).
+
+    Rejects anything that is not a compact hex string so a malformed or
+    hostile value can never reach the matcher: returns "" (the "no ID"
+    signal, which keeps the turn a genuine user turn) for None, non-strings,
+    empty/whitespace, wrong length or non-hex characters.
+    """
+    if raw is None:
+        return ""
+    token = str(raw).strip().lower()
+    if not token:
+        return ""
+    if len(token) != 32 or any(c not in "0123456789abcdef" for c in token):
+        return ""
+    return token
+
+
 def _consume_pending_goal_continuation(session_id: str, msg: str) -> bool:
-    """#6885 admission correction: consume the goal-continuation record only
-    when the incoming turn text matches the pending continuation prompt.
+    """#7855 admission: consume the goal-continuation record only when the
+    incoming turn carries the matching continuation ID.
 
     The marker is session-scoped (#1932) and set when goal_continue fires;
-    without the prompt match, a genuine user/queued turn arriving before the
-    browser's auto-dispatch would be misclassified as goal-related and would
-    inherit goal-continuation semantics. When the text differs, the user turn
-    keeps priority and the record is left in place for the browser's actual
-    continuation dispatch.
+    the ID is issued at the same moment and travels with the browser's queued
+    continuation. Without the ID match, a genuine user/queued turn arriving
+    before the browser's auto-dispatch would be misclassified as goal-related
+    and would inherit goal-continuation semantics. When the ID differs (or is
+    absent), the user turn keeps priority and the record is left in place for
+    the browser's actual continuation dispatch.
 
-    Round 2 (maintainer review): the comparison runs over the CANONICAL
-    SEMANTIC text, not the transport-decorated wire message — the browser
-    prepends the `/use` forced-skill directive + envelope (static/messages.js
-    ``send()``) before POSTing, so a raw exact compare fails legitimate
-    continuations. Marker, prompt and expiry are one record in api.goals; the
-    admission check delegates there so check + drop stay atomic.
+    Admission is by ID, not text (#7855): the queue UI lets the user edit or
+    combine a queued entry, and there is no wall-clock expiry, so a late or
+    edited continuation is still admitted. Marker, prompt and ID are one
+    record in api.goals; the admission check delegates there so check + drop
+    stay atomic.
     """
     from api.goals import consume_pending_goal_continuation
 
@@ -24643,6 +24661,7 @@ def _start_chat_stream_for_session(
     normalized_model: bool = False,
     diag=None,
     goal_related: bool = False,
+    goal_continuation_id: str = "",
     source: str = "webui",
     moa_config=None,
     external_runtime_owned: bool | None = None,
@@ -24697,10 +24716,14 @@ def _start_chat_stream_for_session(
     # #1932: check if this session has a pending goal continuation flag.
     # The streaming hook sets PENDING_GOAL_CONTINUATION when goal_continue fires,
     # so the next chat/start for this session is automatically treated as
-    # goal-related. #6885: the marker is consumed ONLY when the incoming text
-    # matches the pending continuation prompt — a genuine user/queued turn
-    # keeps priority and leaves the marker for the browser's auto-dispatch.
-    if not goal_related and _consume_pending_goal_continuation(s.session_id, msg):
+    # goal-related. #6885 + #7855: the marker is consumed ONLY when the request
+    # carries the continuation ID the server issued at goal_continue time — a
+    # genuine user/queued turn (no ID) keeps priority and leaves the marker for
+    # the browser's auto-dispatch, while an edited / combined / late-sent
+    # continuation still carries its ID and keeps the goal.
+    if not goal_related and goal_continuation_id and _consume_pending_goal_continuation(
+        s.session_id, goal_continuation_id,
+    ):
         goal_related = True
 
     def consume_continuation_markers() -> None:
@@ -25112,6 +25135,7 @@ def _start_run(
     gateway_chat_enabled: bool | None = None,
     regeneration=None,
     goal_related: bool = False,
+    goal_continuation_id: str = "",
     process_id: str = "",
     retry_attempt: int = 0,
     rearm_deferred_wakeup: bool = False,
@@ -25199,6 +25223,7 @@ def _start_run(
                 goal_related=goal_related,
                 external_runtime_owned=gateway_chat_enabled,
                 regeneration=regeneration,
+                goal_continuation_id=goal_continuation_id,
                 process_id=process_id,
                 retry_attempt=retry_attempt,
                 rearm_deferred_wakeup=rearm_deferred_wakeup,
@@ -25250,6 +25275,7 @@ def _start_run(
         goal_related=goal_related,
         external_runtime_owned=gateway_chat_enabled,
         regeneration=regeneration,
+        goal_continuation_id=goal_continuation_id,
         process_id=process_id,
         retry_attempt=retry_attempt,
         rearm_deferred_wakeup=rearm_deferred_wakeup,
@@ -26347,6 +26373,12 @@ def _handle_chat_start(handler, body, diag=None):
             "diag": diag,
             "gateway_chat_enabled": gateway_chat_enabled,
             "regeneration": regeneration,
+            # #7855: the server-issued continuation ID travels with the browser's
+            # queued continuation through inline edits and combines; admission
+            # is by ID, never by text, so an edited/late/combined continuation
+            # keeps its goal semantics and a genuine user message (no ID) does
+            # not. Rejected as malformed here rather than by the matcher.
+            "goal_continuation_id": _normalize_goal_continuation_id(body.get("goal_continuation_id")),
         }
         if not gateway_chat_enabled and moa_config is not None:
             start_run_kwargs["moa_config"] = moa_config

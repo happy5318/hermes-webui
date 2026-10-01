@@ -14492,19 +14492,25 @@ def _run_agent_streaming(
                     })
                 if decision.get('should_continue'):
                     continuation_prompt = str(decision.get('continuation_prompt') or '').strip()
+                    continuation_id = None
                     if continuation_prompt:
                         # #1932: mark this session as pending a goal continuation
                         # so the next /chat/start creates a goal-related stream.
-                        # #6885: register marker + prompt + expiry as ONE record
+                        # #6885 + #7855: register marker + prompt + continuation
+                        # ID as ONE record
                         # (api/goals.register_pending_goal_continuation) so the
                         # routes.py consumer can tell a genuine user turn from
-                        # the browser's continuation dispatch.
-                        if not register_pending_goal_continuation(session_id, continuation_prompt):
+                        # the browser's continuation dispatch. Admission is by
+                        # ID, so the browser may edit or combine the queued
+                        # entry without losing the goal.
+                        continuation_id = register_pending_goal_continuation(session_id, continuation_prompt)
+                        if not continuation_id:
                             continuation_prompt = ''
                     if continuation_prompt:
                         put('goal_continue', {
                             'session_id': session_id,
                             'continuation_prompt': continuation_prompt,
+                            'continuation_id': continuation_id,
                             'text': continuation_prompt,
                             'message': _goal_message,
                             'message_key': decision.get('message_key') or 'goal_continuing',

@@ -1842,8 +1842,14 @@ async function send(){
       profile:S.activeProfile||S.session.profile||'default',
       explicit_model_pick:_explicitPick||undefined,
       attachments:uploaded.length?uploaded:undefined,
-      moa_config:_pendingMoaConfig?true:undefined
+      moa_config:_pendingMoaConfig?true:undefined,
+      // #7855: the admission token for a continuation being drained from the
+      // queue (kept through edits/combines/late sends). Absent on a genuine
+      // user turn, which is exactly the #6885 distinction.
+      goal_continuation_id:_drainingGoalContinuationId||undefined
     })});
+    // One-shot: the ID belongs to this send only, never to a later message.
+    _drainingGoalContinuationId='';
     _pendingMoaConfig=null;
     postStartData = startData;
   }catch(e){
@@ -2268,6 +2274,12 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   let visibleInterimSnippets=[];
   let _latestGoalStatus=null;
   let _pendingGoalContinuation=null;
+  // #7855: the continuation ID of the queue entry currently being drained by
+  // setBusy()'s drain path. send() consumes it into the /api/chat/start body
+  // and clears it immediately, so it applies to exactly one turn and cannot
+  // leak into a later genuine user message.
+  let _drainingGoalContinuationId='';
+  function _setDrainingGoalContinuationId(id){_drainingGoalContinuationId=String(id||'').trim();}
   let assistantRow=null;
   let assistantBody=null;
   // On reconnect with recorded burst anchors, the rendered DOM has multiple
@@ -6224,9 +6236,14 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         if(!continuation_prompt||sid!==activeSid)return;
         _applyToAnchor('goal_continue',d,e);
         const _modelState=_chatPayloadModelState();
+        // #7855: the server's continuation ID — not the prompt text — is what
+        // admits this turn later, so carry it on the queued entry through
+        // inline edits and combines. An edited/combined/late continuation
+        // keeps its ID and keeps the goal; a genuine user message has none.
         _pendingGoalContinuation={
           sid,
           text:continuation_prompt,
+          goal_continuation_id:String(d.continuation_id||'').trim(),
           model:_modelState.model,
           model_provider:_modelState.model_provider,
           profile:S.activeProfile||'default',
@@ -6545,6 +6562,8 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
             model:_goalNext.model,
             model_provider:_goalNext.model_provider,
             profile:_goalNext.profile,
+            // #7855: the admission token survives into the queue entry.
+            goal_continuation_id:_goalNext.goal_continuation_id||'',
           });
           if(typeof updateQueueBadge==='function')updateQueueBadge(_goalNext.sid);
         }

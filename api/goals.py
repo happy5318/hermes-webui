@@ -5,7 +5,9 @@ from __future__ import annotations
 import copy
 import logging
 import re
+import secrets
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -720,14 +722,6 @@ def evaluate_goal_after_turn(
 from api import config as _cfg
 
 
-def _goal_continuation_ttl_seconds() -> float:
-    try:
-        ttl = float(getattr(_cfg, "GOAL_CONTINUATION_TTL_SECONDS", 0) or 0)
-    except (TypeError, ValueError):
-        ttl = 0.0
-    return ttl if ttl > 0 else 1800.0
-
-
 def _goal_continuation_normalize_wire_text(text: str) -> str:
     """Strip the browser's transport decorations from an outgoing /chat/start
     message, yielding the canonical semantic user text (#6885 round 2).
@@ -766,56 +760,103 @@ def _goal_continuation_normalize_wire_text(text: str) -> str:
     return value
 
 
-def register_pending_goal_continuation(session_id: str, continuation_prompt: str) -> bool:
-    """Record a pending goal continuation as ONE marker+prompt+expiry record.
+def register_pending_goal_continuation(session_id: str, continuation_prompt: str) -> str | None:
+    """Record a pending goal continuation as ONE marker+prompt+ID record.
 
-    Returns True when a record was written (non-empty prompt), False when
-    there was nothing to register — callers must only emit the goal_continue
-    SSE event when this returns True so the frontend queue and the server
-    record cannot disagree.
+    Returns the continuation ID when a record was written (non-empty prompt),
+    or None when there was nothing to register — callers must only emit the
+    goal_continue SSE event when this returns a truthy ID so the frontend
+    queue and the server record cannot disagree.
+
+    The ID is the admission token (#7855): the browser carries it on the
+    queued entry through inline edits and combines, and /api/chat/start
+    validates it. A genuine user message never carries it, which is the
+    #6885 distinction. Matching on the prompt text is what previously
+    dropped the goal after an edit or a late send.
+
+    No wall-clock expiry (#7855): the browser deliberately keeps a queued
+    continuation — it survives a refresh and is restored into the composer
+    for the user to send later — so a TTL retired a continuation that was
+    still perfectly usable. A record now lives until it is consumed
+    (admitted-and-consumed by its ID) or explicitly retired (goal cleared /
+    paused / session retired).
     """
     session_id = str(session_id or "").strip()
     prompt = str(continuation_prompt or "").strip()
     if not session_id or not prompt:
-        return False
+        return None
     record = {
         "prompt": prompt,
-        "expires_at": time.time() + _goal_continuation_ttl_seconds(),
+        "continuation_id": uuid.uuid4().hex,
     }
     with _cfg.PENDING_GOAL_CONTINUATION_LOCK:
         _cfg.PENDING_GOAL_CONTINUATION.add(session_id)
         _cfg.PENDING_GOAL_CONTINUATION_PROMPTS[session_id] = record
-    return True
+    return str(record["continuation_id"])
 
 
-def consume_pending_goal_continuation(session_id: str, msg: str) -> bool:
-    """Admit-and-consume the pending continuation record for *session_id*.
+def peek_pending_goal_continuation_id(session_id: str) -> str | None:
+    """Return the pending continuation ID for *session_id* without consuming.
 
-    True only when the normalized incoming text equals the recorded prompt:
-    the record is removed and the turn becomes goal-related. Any other text
-    (a genuine user/queued turn) keeps user priority and the record stays for
-    the browser's real dispatch. Fails closed when no record or no prompt is
-    present. An expired record is swept (not consumed) and returns False: the
-    browser dispatch that would have matched is long gone.
+    Used by the gateway when it re-emits the goal_continue event for a
+    reconnecting stream so the browser and the server record agree.
     """
     session_id = str(session_id or "").strip()
     if not session_id:
+        return None
+    with _cfg.PENDING_GOAL_CONTINUATION_LOCK:
+        record = _cfg.PENDING_GOAL_CONTINUATION_PROMPTS.get(session_id)
+        if not isinstance(record, dict):
+            return None
+        cont_id = str(record.get("continuation_id") or "").strip()
+        return cont_id or None
+
+
+def consume_pending_goal_continuation(session_id: str, msg: str) -> bool:
+    """Admit the pending continuation record for *session_id* by its ID.
+
+    *msg* is the continuation ID issued by
+    :func:`register_pending_goal_continuation`. True only when it matches the
+    record: the record is removed and the turn becomes goal-related. Any
+    other value (a genuine user turn, or a queued turn whose entry lost its
+    ID) keeps user priority and the record stays for the browser's real
+    dispatch. Fails closed when no record is present.
+
+    Matching on the ID rather than the prompt text is the #7855 fix: the
+    browser's queue lets the user edit or combine a queued continuation, and
+    an exact-text comparison silently turned those into ordinary turns.
+    There is no wall-clock expiry — a late send (after any amount of time,
+    including across a refresh) is still admitted, because the browser
+    deliberately keeps queued continuations alive.
+    """
+    session_id = str(session_id or "").strip()
+    if not session_id:
+        return False
+    incoming = str(msg or "").strip()
+    if not incoming:
+        return False
+    # A genuine user turn is arbitrary text (any language). Admission is by
+    # ID, so a non-ASCII-ineligible value can never match — reject it before
+    # compare_digest, which raises TypeError on non-ASCII input.
+    if any(c not in "0123456789abcdef" for c in incoming.lower()) or len(incoming) != 32:
         return False
     with _cfg.PENDING_GOAL_CONTINUATION_LOCK:
         if session_id not in _cfg.PENDING_GOAL_CONTINUATION:
             return False
         record = _cfg.PENDING_GOAL_CONTINUATION_PROMPTS.get(session_id)
-        expected = str(record.get("prompt") if isinstance(record, dict) else "").strip()
-        expires_at = float(record.get("expires_at") or 0.0) if isinstance(record, dict) else 0.0
-        if not expected:
-            # Marker without prompt (legacy/abnormal state): fail closed, but
-            # the pair is broken — clear both so the session is not stuck.
+        if not isinstance(record, dict):
+            # Marker without record (legacy/abnormal state): fail closed and
+            # clear the broken half so the session is not stuck (#6885).
             _drop_pending_goal_continuation(session_id)
             return False
-        if expires_at and time.time() >= expires_at:
+        cont_id = str(record.get("continuation_id") or "").strip()
+        if not cont_id:
+            # Legacy record without an ID (pre-#7855 process): fail closed and
+            # clear, so the session is not stuck with an unmatchable record.
             _drop_pending_goal_continuation(session_id)
             return False
-        if _goal_continuation_normalize_wire_text(msg) != expected:
+        if not secrets.compare_digest(cont_id, incoming):
+            # Mismatch: keep the record for the browser's real dispatch.
             return False
         _drop_pending_goal_continuation(session_id)
         return True
@@ -838,20 +879,24 @@ def clear_pending_goal_continuation(session_id: str) -> None:
 
 
 def sweep_expired_goal_continuations() -> int:
-    """Remove every expired (or orphaned) continuation record; return count.
+    """Remove every orphaned continuation record; return count.
 
     An orphan is a marker in the set whose record is missing — the reverse
     (record without marker) is cleared here too, so the two halves cannot
     drift apart. Safe to call from any thread; called from the /goal command
     handler so the sweep runs on live traffic without a background timer.
+
+    There is no wall-clock sweep (#7855): the browser deliberately keeps a
+    queued continuation (it survives a refresh and is restored into the
+    composer for a later send), so a TTL retired continuations that were
+    still usable. Records end when they are consumed or the goal/session
+    explicitly retires them.
     """
-    now = time.time()
     swept = 0
     with _cfg.PENDING_GOAL_CONTINUATION_LOCK:
         for session_id in list(_cfg.PENDING_GOAL_CONTINUATION_PROMPTS.keys()):
             record = _cfg.PENDING_GOAL_CONTINUATION_PROMPTS.get(session_id)
-            expires_at = float(record.get("expires_at") or 0.0) if isinstance(record, dict) else 0.0
-            if not isinstance(record, dict) or (expires_at and now >= expires_at):
+            if not isinstance(record, dict) or not str(record.get("continuation_id") or "").strip():
                 _drop_pending_goal_continuation(session_id)
                 swept += 1
         for session_id in list(_cfg.PENDING_GOAL_CONTINUATION):

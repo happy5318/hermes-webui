@@ -70,14 +70,15 @@ def test_routes_consumer_discards_atomically_on_read():
     """
     src = _read_routes()
 
-    # 1. The admission block routes through the helper with (session_id, msg).
+    # 1. The admission block routes through the helper.
+    # #7855: admission is by continuation ID, not message text.
     m = re.search(
-        r"if not goal_related and _consume_pending_goal_continuation\(\s*s\.session_id,\s*msg\s*\):",
+        r"if not goal_related and goal_continuation_id and _consume_pending_goal_continuation\(",
         src,
     )
     assert m is not None, (
         "routes.py must consume PENDING_GOAL_CONTINUATION via "
-        "_consume_pending_goal_continuation(s.session_id, msg)"
+        "_consume_pending_goal_continuation(gated on goal_continuation_id)"
     )
 
     # 2. routes.py delegates to api.goals (single record owner).
@@ -182,7 +183,12 @@ def test_goal_continue_set_marker_before_emitting_event():
         "goal_continue SSE emission"
     )
     # The SSE event fires only when the registration succeeded.
-    assert "if not register_pending_goal_continuation(" in src, (
+    # #7855: registration returns the continuation ID (not a bool), so the
+    # gate is now ``if not continuation_id``.
+    assert "if not register_pending_goal_continuation(" in src or (
+        "continuation_id = register_pending_goal_continuation(" in src
+        and "if not continuation_id:" in src
+    ), (
         "the goal_continue SSE event must be gated on the record "
         "registration return value"
     )
