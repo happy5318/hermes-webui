@@ -15,16 +15,21 @@ Chromium page, run a genuine send() from the composer, and assert that
 ``request body: None`` tell the CI ``live-to-final`` job reported if the send
 path throws before the fetch.
 
-Covered end-to-end (maintainer's round-3 checklist):
-  1. ordinary send posts a chat/start body (the BRICK regression itself);
-  2. a queued continuation entry carries its ID through the drain into the
-     posted body, and the drain clears it (one-shot);
-  3. refresh-restore keeps the restored entry's ID on the one-shot slot so the
-     user's manual send of the restored text still admits the continuation;
+Covered end-to-end (maintainer's round-5 checklist):
+  1. ordinary send posts a chat/start body (the round-3 BRICK regression itself);
+  2. a genuine user turn posts NO continuation ID while a continuation is queued;
+  3. the queued-continuation drain hands its ID to that send and it is posted;
   4. the requeue path (send while a drain is in flight) carries the ID on the
      re-queued entry instead of dropping it;
-  5. the ID is cleared at hard session boundaries (new session / switch) so a
-     leftover cannot attach to a later unrelated send.
+  5. a refresh-restored continuation is a text-bound, one-shot draft: sending the
+     restored text unchanged keeps the goal, REPLACING it fails closed, and a
+     consumed draft leaves nothing behind;
+  6. a session boundary drops an unconsumed restored draft.
+
+The round-5 CORE race (a genuine turn parked mid-await while the drain publishes
+the ID) is not reproducible through page timing, so it lives in
+tests/test_7855_goal_continuation_binding.py, which replays that exact sequence
+against the real send() in a Node VM.
 """
 
 from __future__ import annotations
@@ -174,41 +179,42 @@ def main() -> int:
             else:
                 print("OK  case1 ordinary send posts a chat/start body, no continuation ID")
 
-        # ── Case 2: one-shot semantics — drain clears the ID ──
-        # Simulate the drain having handed an ID to the slot, then send a
-        # genuine message: the ID must be consumed exactly once (absent on
-        # the next turn).
+        # ── Case 2: a genuine turn carries no continuation ID ──
+        # The end-to-end invariant on the real page. The RACE itself — a genuine
+        # turn parked mid-await while a drain publishes the ID — is owned by
+        # tests/test_7855_goal_continuation_binding.py, which replays that exact
+        # sequence against the real send() in a Node VM where the timing is
+        # deterministic. Here we only assert the shipped invariant.
         page.evaluate(
             """() => {
-              if (typeof _setDrainingGoalContinuationId === 'function') {
-                _setDrainingGoalContinuationId('cont-case2');
-              } else {
-                window.__case2SetterMissing = true;
-              }
+              window.__case2Id = 'cont-case2-pending';
+              if (typeof queueSessionMessage === 'function') {
+                queueSessionMessage(S.session.session_id, {
+                  text: 'pending continuation body',
+                  files: [],
+                  model: S.session.model,
+                  model_provider: S.session.model_provider,
+                  profile: S.activeProfile || 'default',
+                  goal_continuation_id: window.__case2Id,
+                });
+              } else { window.__case2QueueMissing = true; }
             }"""
         )
-        setter_missing = page.evaluate("() => !!window.__case2SetterMissing")
-        if setter_missing:
-            failures.append(
-                "case2 drain-slot: _setDrainingGoalContinuationId is not reachable "
-                "at module scope (setter still nested / dead typeof guard)"
-            )
+        if page.evaluate("() => !!window.__case2QueueMissing"):
+            failures.append("case2 genuine-turn: queueSessionMessage is not reachable at module scope")
         else:
-            page.locator("#msg").fill("genuine user turn after a drain")
+            page.locator("#msg").fill("genuine user turn while a continuation is pending")
             page.locator("#btnSend").click()
             second = _wait_for_recorded(timeout=20, index=1)
             if second is None:
-                failures.append("case2 drain-slot: second send never reached /api/chat/start")
-            elif second.get("goal_continuation_id") == "":
-                # The drain slot is cleared after posting; a message sent
-                # after the consuming turn carries nothing.
-                print("OK  case2 drain slot is one-shot (second turn carries no ID)")
-            else:
-                print(
-                    "OK  case2 drain slot observed "
-                    f"(value={second.get('goal_continuation_id')!r}) — "
-                    "cleared after the consuming turn"
+                failures.append("case2 genuine-turn: the genuine send never reached /api/chat/start")
+            elif second.get("goal_continuation_id"):
+                failures.append(
+                    "case2 genuine-turn: a genuine user turn carried a continuation ID "
+                    f"({second.get('goal_continuation_id')!r})"
                 )
+            else:
+                print("OK  case2 genuine turn posts no ID while a continuation is pending")
 
         # ── Case 3: the queued-continuation drain hands the ID to send() ──
         # Drive the real queue: push an entry that carries a continuation
@@ -268,16 +274,14 @@ def main() -> int:
         page.evaluate(
             """() => {
               window.__case4Result = null;
-              if (typeof _setDrainingGoalContinuationId !== 'function') {
-                window.__case4Result = 'setter-missing';
-                return;
-              }
-              _setDrainingGoalContinuationId('cont-case4-requeue');
               const sid = S.session.session_id;
               // Force the concurrent-send branch: pretend a send is in flight
-              // for this session, so send() takes the requeue exit.
+              // for this session, so send() takes the requeue exit. The in-flight
+              // send owns the continuation (round 5 replaced the shared slot with
+              // a value held by the lock holder itself).
               _sendInProgress = true;
               _sendInProgressSid = sid;
+              _sendInProgressGoalContinuationId = 'cont-case4-requeue';
               const before = (typeof _readPersistedSessionQueue === 'function')
                 ? _readPersistedSessionQueue(sid) : [];
               const beforeCount = Array.isArray(before) ? before.length : 0;
@@ -300,9 +304,7 @@ def main() -> int:
             if case4:
                 break
             page.wait_for_timeout(200)
-        if case4 == "setter-missing":
-            failures.append("case4 requeue: drain setter not reachable at module scope")
-        elif isinstance(case4, str):
+        if isinstance(case4, str):
             failures.append(f"case4 requeue: send() raised {case4}")
         elif isinstance(case4, dict):
             if not case4.get("carriedId"):
@@ -314,27 +316,75 @@ def main() -> int:
                 print("OK  case4 requeued entry carries the continuation ID")
         else:
             failures.append(f"case4 requeue: unexpected probe result {case4!r}")
-        page.evaluate("() => { _sendInProgress = false; _sendInProgressSid = null; }")
+        page.evaluate("() => { _sendInProgress = false; _sendInProgressSid = null; _sendInProgressGoalContinuationId = ''; }")
 
-        # ── Case 5: session boundary clears the one-shot slot ──
-        boundary = page.evaluate(
+        # ── Case 5: the restored-continuation draft (reviewer's probe #3) ──
+        # A refresh-restore used to publish its ID to a global slot, so a user
+        # who replaced the restored text had their OWN message post the stale
+        # ID. The draft is now bound to the exact restored text: send the text
+        # unchanged and the continuation survives; replace it and the token dies.
+        draft = page.evaluate(
             """() => {
-              if (typeof _setDrainingGoalContinuationId !== 'function') return 'setter-missing';
-              if (typeof _readDrainingGoalContinuationId !== 'function') return 'reader-missing';
-              _setDrainingGoalContinuationId('cont-case5-boundary');
-              const held = _readDrainingGoalContinuationId();
-              return {held, hasReader: true, hasSetter: true};
+              if (typeof _setRestoredGoalContinuationDraft !== 'function') return 'setter-missing';
+              if (typeof _takeRestoredDraftGoalContinuationId !== 'function') return 'reader-missing';
+              const _msg = document.getElementById('msg');
+              _setRestoredGoalContinuationDraft('cont-case5-draft', 'restored continuation text');
+              const marked = !!( _msg.dataset.goalContinuationId === 'cont-case5-draft' );
+              // (a) user REPLACED the text -> fail closed, no token
+              const replaced = _takeRestoredDraftGoalContinuationId('my own totally different message');
+              const afterReplaced = _msg.dataset.goalContinuationId || null;
+              // (b) user left the text alone -> token survives, one-shot
+              _setRestoredGoalContinuationDraft('cont-case5-draft', 'restored continuation text');
+              const unchanged = _takeRestoredDraftGoalContinuationId('restored continuation text');
+              const afterUnchanged = _msg.dataset.goalContinuationId || null;
+              return {marked, replaced, afterReplaced, unchanged, afterUnchanged};
             }"""
         )
-        if boundary in ("setter-missing", "reader-missing"):
+        if draft in ("setter-missing", "reader-missing"):
+            failures.append(f"case5 restored-draft: draft accessors not reachable at module scope ({draft})")
+        elif not isinstance(draft, dict):
+            failures.append(f"case5 restored-draft: unexpected probe result {draft!r}")
+        else:
+            if not draft.get("marked"):
+                failures.append("case5 restored-draft: the draft ID was not recorded on the composer")
+            if draft.get("replaced"):
+                failures.append(
+                    "case5 restored-draft: a REPLACED draft still handed out the stale ID "
+                    f"({draft.get('replaced')!r}) — it must fail closed"
+                )
+            if draft.get("afterReplaced"):
+                failures.append("case5 restored-draft: a consumed draft left its ID on the composer")
+            if draft.get("unchanged") != "cont-case5-draft":
+                failures.append(
+                    "case5 restored-draft: sending the restored text unchanged lost the "
+                    f"continuation ({draft.get('unchanged')!r})"
+                )
+            if draft.get("afterUnchanged"):
+                failures.append("case5 restored-draft: the unchanged draft was not consumed (not one-shot)")
+            if not failures:
+                print("OK  case5 restored draft is text-bound, one-shot, and fails closed when replaced")
+
+        # ── Case 6: session boundary drops an unconsumed draft ──
+        boundary = page.evaluate(
+            """() => {
+              if (typeof _setRestoredGoalContinuationDraft !== 'function') return 'setter-missing';
+              if (typeof _clearRestoredGoalContinuationDraft !== 'function') return 'clear-missing';
+              _setRestoredGoalContinuationDraft('cont-case6-boundary', 'stale draft text');
+              _clearRestoredGoalContinuationDraft();
+              const _msg = document.getElementById('msg');
+              return {leftover: _msg.dataset.goalContinuationId || null};
+            }"""
+        )
+        if boundary in ("setter-missing", "clear-missing"):
+            failures.append(f"case6 boundary: draft accessors not reachable at module scope ({boundary})")
+        elif not isinstance(boundary, dict):
+            failures.append(f"case6 boundary: unexpected probe result {boundary!r}")
+        elif boundary.get("leftover"):
             failures.append(
-                f"case5 boundary: drain slot accessors not reachable at module scope ({boundary})"
+                f"case6 boundary: a session boundary left the stale draft ID behind ({boundary['leftover']!r})"
             )
         else:
-            print(
-                "OK  case5 drain slot readable/writable at module scope "
-                f"(held={boundary['held']!r}); boundary clears verified by code path"
-            )
+            print("OK  case6 session boundary drops an unconsumed restored draft")
 
         # ── The tell-tale check: NO ReferenceError may have hit the page ──
         ref_errors = [

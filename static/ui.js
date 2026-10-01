@@ -8842,14 +8842,11 @@ function setBusy(v){
         }
         autoResize();
         renderTray();
-        // #7855: hand the queued entry's continuation ID to send() — the queue
-        // may have rewritten the text, but the admission token still belongs to
-        // this send. Consumed (and cleared) by send() so it cannot leak into
-        // the user's next genuine message.
-        if(typeof _setDrainingGoalContinuationId==='function'){
-          _setDrainingGoalContinuationId(next.goal_continuation_id||'');
-        }
-        send();
+        // #7855 (round 5): pass the queued entry's continuation ID straight
+        // into THIS send() invocation. Round 4 published it to a shared module
+        // slot that any concurrent send could read, letting a genuine user
+        // turn consume the goal. An argument cannot leak across calls.
+        send({goalContinuationId:next.goal_continuation_id||''});
       },120);
     }
   }

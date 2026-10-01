@@ -407,6 +407,9 @@ class TestFrontendWiring:
     def _messages(self) -> str:
         return Path(__file__).parents[1].joinpath("static", "messages.js").read_text(encoding="utf-8")
 
+    def _sessions(self) -> str:
+        return Path(__file__).parents[1].joinpath("static", "sessions.js").read_text(encoding="utf-8")
+
     def test_sse_handler_captures_the_id(self):
         src = self._messages()
         assert "goal_continuation_id:String(d.continuation_id||'').trim()" in src, (
@@ -419,19 +422,55 @@ class TestFrontendWiring:
             "the queued entry must carry the continuation ID"
         )
 
-    def test_drain_bridges_the_id_to_send(self):
-        assert "_setDrainingGoalContinuationId(next.goal_continuation_id||'')" in self._ui(), (
-            "the queue drain must hand the entry's continuation ID to send()"
+    def test_drain_hands_the_id_to_that_send_invocation(self):
+        # Round 5 (CORE): the ID must reach send() as an ARGUMENT. Publishing it
+        # to a module slot let any concurrent send read it, which is how a
+        # genuine user turn consumed the pending goal.
+        assert "send({goalContinuationId:next.goal_continuation_id||''})" in self._ui(), (
+            "the queue drain must pass the entry's continuation ID into send()"
         )
 
-    def test_send_posts_the_id_and_clears_it(self):
+    def test_send_binds_the_id_from_its_argument(self):
         src = self._messages()
-        assert "goal_continuation_id:_drainingGoalContinuationId||undefined" in src, (
-            "send() must include the continuation ID in the /api/chat/start body"
+        assert "let _goalContinuationId=_normalizeGoalContinuationId(_sendOptions.goalContinuationId)" in src, (
+            "send() must bind the continuation ID from its own argument"
         )
-        assert "_drainingGoalContinuationId='';" in src, (
-            "send() must clear the ID after posting (one-shot, never leaks "
-            "into a later genuine message)"
+        assert "goal_continuation_id:_goalContinuationId||undefined" in src, (
+            "send() must post the invocation-bound ID in the /api/chat/start body"
+        )
+
+    def test_no_shared_drain_slot_remains(self):
+        for name, read in (("static/ui.js", self._ui()), ("static/messages.js", self._messages())):
+            for symbol in (
+                "_drainingGoalContinuationId",
+                "_setDrainingGoalContinuationId",
+                "_readDrainingGoalContinuationId",
+            ):
+                assert symbol not in read, (
+                    f"{name} still references the shared drain slot {symbol!r} — "
+                    "the round-5 CORE defect"
+                )
+
+    def test_rejected_continuation_requeue_keeps_the_id(self):
+        # Round 5 item 2: a continuation rejected with "session already has an
+        # active stream" used to be re-queued WITHOUT its ID, so the retry became
+        # an ordinary turn and the goal loop ended silently.
+        src = self._messages()
+        assert "if(_retryContId) _retryEntry.goal_continuation_id=_retryContId;" in src, (
+            "the active-stream requeue must carry the continuation ID onto the entry"
+        )
+
+    def test_restored_continuation_is_a_text_bound_draft(self):
+        src = self._messages()
+        restore = self._sessions()
+        assert "_setRestoredGoalContinuationDraft" in restore, (
+            "a refresh-restored continuation must be recorded as a draft"
+        )
+        assert "String(text).trim()!==_draftText" in src, (
+            "a restored draft must be dropped when the user replaces the text"
+        )
+        assert "delete _msg.dataset.goalContinuationId" in src, (
+            "a restored draft must be one-shot and leave nothing behind"
         )
 
     def test_edit_path_preserves_the_id(self):
