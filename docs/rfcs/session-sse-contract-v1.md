@@ -234,25 +234,40 @@ Relay close set (stop draining the live queue): `stream_end`, `cancel`,
 #### `goal_continue` admission semantics
 
 `goal_continue` tells the client the standing goal wants another turn and
-carries the continuation prompt (`continuation_prompt` / `text`). The client
-queues that prompt as a normal next user message, so the queued turn and a
-genuine user message race on the same session.
+carries the continuation prompt (`continuation_prompt` / `text`) plus a
+server-issued `continuation_id`. The client queues that prompt as a normal
+next user message, so the queued turn and a genuine user message race on the
+same session.
 
 Server-side admission (`api.goals.register/consume_pending_goal_continuation`,
 wired into `/api/chat/start` by `routes.py`):
 
-- When the turn fires, the server records **one** entry — marker, prompt and
-  expiry — per session. The event is emitted only when the record lands.
-- The **next** `/chat/start` is treated as goal-related only when its text
-  matches the recorded prompt after normalizing the browser's transport
-  decorations (a `/use` forced-skill directive + `[FORCED SKILL CONTEXT]`
-  envelope prepended by `static/messages.js` `send()`, and an
-  `[Attached files: …]` suffix appended for uploads). Any other text keeps
-  normal user priority and the record waits for the real dispatch.
-- The record is single-use on a match, and bounded: it expires
-  (`GOAL_CONTINUATION_TTL_SECONDS`), and `goal clear/pause`, session deletion,
-  and the sweep inside the `/goal` command handler retire it — an abandoned
-  browser dispatch cannot leak the marker + prompt pair.
+- When the turn fires, the server records **one** entry per session — marker,
+  prompt, and a `uuid4().hex` `continuation_id`. The `goal_continue` SSE event
+  is emitted only after the record lands, so the browser queue and the server
+  record cannot disagree.
+- The **next** `/chat/start` is treated as goal-related only when it carries
+  the matching `continuation_id` (`goal_continuation_id` field, normalized to
+  a compact 32-char hex token by `routes.py`, compared with
+  `secrets.compare_digest`). Any turn without it — a genuine user message, or
+  a queued turn whose entry lost its ID — keeps normal user priority and the
+  record stays for the browser's real dispatch.
+- Admission is by ID rather than prompt text: the browser queue lets the user
+  edit or combine a queued continuation, and an exact-text comparison silently
+  turned those into ordinary turns, ending the goal loop.
+- The ID travels with the browser's queued entry through inline edits and
+  combines (`static/ui.js`), through refresh-restore into the composer
+  (`static/sessions.js`), and through the requeue path when a user send
+  interrupts an in-flight drain (`static/messages.js`). It is sent on
+  `/api/chat/start` by `send()` and cleared immediately after.
+- The record is single-use on a match. There is no wall-clock expiry: the
+  browser deliberately keeps a queued continuation — it survives a refresh
+  and is restored for the user to send later — so a TTL retired continuations
+  that were still perfectly usable. A record ends when it is consumed
+  (admitted-and-consumed by its ID) or explicitly retired: `goal clear/pause`,
+  session retirement, and the orphan sweep inside the `/goal` command handler,
+  which also collapses a marker without a record (or vice versa) so the two
+  halves cannot drift apart.
 
 The semantic taxonomy table remains a draft for the proposed per-session
 endpoint vocabulary and must be confirmed during maintainer review before that
