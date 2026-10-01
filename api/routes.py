@@ -6677,6 +6677,65 @@ def _forwarded_client_ip_from_trusted_proxy(handler, consult_real_ip: bool = Tru
     return _request_client_ip(handler)
 
 
+_FORWARDED_HEADER_IGNORED_WARNED = False
+
+
+def _has_forwarded_header(handler) -> bool:
+    """True when the request carries a non-blank forwarded-client header.
+
+    Presence check only — the value is never read, returned or logged here:
+    it is attacker-controlled text and this module must stay a
+    non-log-writing consumer of it.
+    """
+    for name in ("X-Forwarded-For", "X-Real-IP"):
+        try:
+            value = handler.headers.get(name, "") or ""
+        except AttributeError:
+            return False
+        if str(value).strip():
+            return True
+    return False
+
+
+def _warn_forwarded_header_ignored(handler) -> None:
+    """Emit ONE process-wide warning when an ``X-Forwarded-For`` is ignored.
+
+    #7864 round 3 (nesquena-hermes review): ignoring the untrusted header is
+    the correct security behaviour, but on the default deployment a reverse
+    proxy on a Docker bridge or a LAN address is NOT an allowlisted trusted
+    proxy — so ``forwarded_for`` silently disappears from the request log and a
+    fail2ban jail keyed on it stops matching with nothing in the log saying
+    why. The behaviour change is right; the silence is the bug.
+
+    So warn — but only once per process (rate-limited by construction) and
+    never echo the untrusted header value itself: it is attacker-controlled
+    text, and writing it to the log would be an unbounded log-write vector.
+    Name the peer address and the fix (``HERMES_WEBUI_TRUSTED_PROXY_CIDRS``,
+    plus ``HERMES_WEBUI_TRUST_FORWARDED_FOR`` when unset) instead.
+    """
+    global _FORWARDED_HEADER_IGNORED_WARNED
+    if _FORWARDED_HEADER_IGNORED_WARNED:
+        return
+    _FORWARDED_HEADER_IGNORED_WARNED = True
+    peer = _request_client_ip(handler) or "unknown"
+    trust_forwarded = _truthy_env("HERMES_WEBUI_TRUST_FORWARDED_FOR")
+    cure = "HERMES_WEBUI_TRUSTED_PROXY_CIDRS"
+    if not trust_forwarded:
+        cure = (
+            "HERMES_WEBUI_TRUST_FORWARDED_FOR=1 and "
+            "HERMES_WEBUI_TRUSTED_PROXY_CIDRS"
+        )
+    logger.warning(
+        "[webui] request-log: an X-Forwarded-For header from peer %s was "
+        "ignored (the header is not recorded). The peer is not a trusted "
+        "proxy, so the request log records no forwarded_for field for it. If "
+        "a proxy on this path should supply the client IP, add the peer "
+        "address to %s.",
+        peer,
+        cure,
+    )
+
+
 def trusted_forwarded_client_ip(handler) -> str | None:
     """Resolved, validated client IP for the request log, or None.
 
@@ -6708,6 +6767,13 @@ def trusted_forwarded_client_ip(handler) -> str | None:
     """
     remote = _request_client_ip(handler)
     if not _raw_peer_is_trusted_proxy(handler):
+        # #7864 round 3: an untrusted peer's forwarded header is ignored — the
+        # correct fail-closed outcome, but on the default deployment (a proxy
+        # on a Docker bridge / LAN address) it silently drops the log's
+        # forwarded_for field. Warn once per process so an operator whose
+        # fail2ban jail stops matching can see why.
+        if _has_forwarded_header(handler):
+            _warn_forwarded_header_ignored(handler)
         return None
     resolved = _forwarded_client_ip_from_trusted_proxy(handler, consult_real_ip=False)
     if resolved and resolved != remote:
