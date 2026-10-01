@@ -72,19 +72,34 @@ def test_routes_consumer_discards_atomically_on_read():
 
     # 1. The admission block routes through the helper.
     # #7855: admission is by continuation ID, not message text.
+    # #7855 rebase compat (#7249): admission runs INSIDE the session lock, in
+    # consume_continuation_markers() — never up front — so a rejected start
+    # rolls back the whole admission (see the receipt guards below).
     m = re.search(
-        r"if not goal_related and goal_continuation_id and _consume_pending_goal_continuation\(",
+        r"def consume_continuation_markers\(\).*?"
+        r"if not goal_related and goal_continuation_id:\s*\n\s*"
+        r"receipt = _consume_pending_goal_continuation\(",
         src,
+        re.S,
     )
     assert m is not None, (
         "routes.py must consume PENDING_GOAL_CONTINUATION via "
-        "_consume_pending_goal_continuation(gated on goal_continuation_id)"
+        "_consume_pending_goal_continuation(gated on goal_continuation_id), "
+        "inside consume_continuation_markers()"
     )
 
     # 2. routes.py delegates to api.goals (single record owner).
     assert "from api.goals import consume_pending_goal_continuation" in src, (
         "routes.py helper must delegate to api.goals."
         "consume_pending_goal_continuation"
+    )
+    # 2b. #7855 rollback receipt: admission pops the record as well as the
+    #     marker, so a rejected start must restore both halves through
+    #     api.goals — re-adding the marker alone left the retry unmatchable.
+    assert "from api.goals import restore_pending_goal_continuation" in src, (
+        "restore_consumed_continuation_markers() must delegate to "
+        "api.goals.restore_pending_goal_continuation so the record half "
+        "is restored too (marker-only rollback is stale after #7855)"
     )
 
     # 3. No stray direct discard anywhere in routes.py: the drop is owned

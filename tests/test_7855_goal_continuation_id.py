@@ -38,6 +38,7 @@ from api.goals import (
     consume_pending_goal_continuation,
     peek_pending_goal_continuation_id,
     register_pending_goal_continuation,
+    restore_pending_goal_continuation,
     sweep_expired_goal_continuations,
 )
 from api.routes import _consume_pending_goal_continuation, _normalize_goal_continuation_id
@@ -64,13 +65,19 @@ class TestRecordAdmission:
         """The browser dispatch carrying the issued ID consumes the record
         and the turn becomes goal-related."""
         cont_id = _register("s1", "continue step 2")
-        assert consume_pending_goal_continuation("s1", cont_id) is True
+        receipt = consume_pending_goal_continuation("s1", cont_id)
+        # #7855: a successful admission returns the popped record as the
+        # rollback receipt, not a bare True.
+        assert receipt and receipt.get("continuation_id") == cont_id
         assert "s1" not in PENDING_GOAL_CONTINUATION
         assert "s1" not in PENDING_GOAL_CONTINUATION_PROMPTS
 
     def test_record_is_single_use(self):
         cont_id = _register("s1", "continue step 2")
-        assert consume_pending_goal_continuation("s1", cont_id) is True
+        receipt = consume_pending_goal_continuation("s1", cont_id)
+        # #7855: a successful admission returns the popped record as the
+        # rollback receipt, not a bare True.
+        assert receipt and receipt.get("continuation_id") == cont_id
         assert consume_pending_goal_continuation("s1", cont_id) is False
 
     def test_prompt_text_does_not_admit(self):
@@ -147,7 +154,10 @@ class TestLateSendIsStillAdmitted:
         cont_id = _register("s1", "continue step 2")
         # Any amount of simulated wall-clock time later — the record has no
         # expires_at to compare against.
-        assert consume_pending_goal_continuation("s1", cont_id) is True
+        receipt = consume_pending_goal_continuation("s1", cont_id)
+        # #7855: a successful admission returns the popped record as the
+        # rollback receipt, not a bare True.
+        assert receipt and receipt.get("continuation_id") == cont_id
 
     def test_record_has_no_expiry_field(self):
         _register("s1", "continue step 2")
@@ -159,7 +169,10 @@ class TestLateSendIsStillAdmitted:
         cont_id = _register("s1", "continue step 2")
         # Simulate the browser restoring the queue from storage after a
         # refresh: same text, same ID.
-        assert consume_pending_goal_continuation("s1", cont_id) is True
+        receipt = consume_pending_goal_continuation("s1", cont_id)
+        # #7855: a successful admission returns the popped record as the
+        # rollback receipt, not a bare True.
+        assert receipt and receipt.get("continuation_id") == cont_id
 
 
 class TestEditedAndCombinedAreAdmitted:
@@ -172,14 +185,14 @@ class TestEditedAndCombinedAreAdmitted:
         turn still consumes the record."""
         cont_id = _register("s-edit", "original prompt")
         # The browser sends the EDITED text, but carries the ID.
-        assert consume_pending_goal_continuation("s-edit", cont_id) is True
+        assert consume_pending_goal_continuation("s-edit", cont_id)
         assert "s-edit" not in PENDING_GOAL_CONTINUATION
 
     def test_combined_continuation_is_admitted(self):
         """Combining a continuation with another entry keeps the first ID."""
         cont_id = _register("s-combine", "step 2")
         # The combined entry keeps the first continuation ID (ui.js _doMerge).
-        assert consume_pending_goal_continuation("s-combine", cont_id) is True
+        assert consume_pending_goal_continuation("s-combine", cont_id)
         assert "s-combine" not in PENDING_GOAL_CONTINUATION
 
     def test_combined_pure_user_messages_stay_ordinary(self):
@@ -315,14 +328,29 @@ class TestWriterWiring:
         """routes.py must admit via the helper using the continuation ID, not
         the message text."""
         src = Path(__file__).parents[1].joinpath("api", "routes.py").read_text(encoding="utf-8")
+        # #7855 rebase compat (#7249): admission moved INSIDE the session lock
+        # (consume_continuation_markers), replacing the bare marker check, and
+        # keeps the popped record as a rollback receipt.
         m = re.search(
-            r"if not goal_related and goal_continuation_id and _consume_pending_goal_continuation\(\s*\n?\s*s\.session_id,\s*goal_continuation_id,?\s*\n?\s*\):",
+            r"def consume_continuation_markers\(\).*?"
+            r"if not goal_related and goal_continuation_id:\s*\n\s*"
+            r"receipt = _consume_pending_goal_continuation\(",
             src,
+            re.S,
         )
         assert m is not None, (
-            "routes.py admission must use the continuation ID: "
-            "if not goal_related and goal_continuation_id and "
-            "_consume_pending_goal_continuation(s.session_id, goal_continuation_id)"
+            "routes.py admission must use the continuation ID inside "
+            "consume_continuation_markers(): "
+            "if not goal_related and goal_continuation_id: "
+            "receipt = _consume_pending_goal_continuation(...)"
+        )
+        assert "consumed_goal_continuation_receipt = receipt" in src, (
+            "consume_continuation_markers() must keep the popped record as a "
+            "rollback receipt so a rejected start can restore both halves"
+        )
+        assert "restore_pending_goal_continuation(s.session_id," in src, (
+            "restore_consumed_continuation_markers() must restore the record "
+            "as well as the marker (#7862: marker-only rollback breaks the retry)"
         )
         direct = re.findall(r"PENDING_GOAL_CONTINUATION\.discard", src)
         # master's consume_continuation_markers() closure still consumes the
@@ -424,7 +452,7 @@ class TestFrontendWiring:
 class TestRoutesHelperDelegation:
     def test_helper_delegates_to_goals_module(self):
         cont_id = _register("s1", "continue step 2")
-        assert _consume_pending_goal_continuation("s1", cont_id) is True
+        assert _consume_pending_goal_continuation("s1", cont_id)
         assert "s1" not in PENDING_GOAL_CONTINUATION
 
     def test_helper_returns_false_for_genuine_user_message(self):
@@ -449,7 +477,7 @@ class TestProductionShapedDispatch:
 
     def test_plain_dispatch_is_admitted_once(self):
         payload = self._goal_continue_payload("s1", "Continue refining the parser module.")
-        assert _consume_pending_goal_continuation("s1", payload["continuation_id"]) is True
+        assert _consume_pending_goal_continuation("s1", payload["continuation_id"])
         assert "s1" not in PENDING_GOAL_CONTINUATION
         # a second identical dispatch does not re-consume (single-use record)
         assert _consume_pending_goal_continuation("s1", payload["continuation_id"]) is False
@@ -461,20 +489,94 @@ class TestProductionShapedDispatch:
         assert _consume_pending_goal_continuation("s1", "what is the status?") is False
         assert "s1" in PENDING_GOAL_CONTINUATION
         # the record is still there for the browser's real dispatch
-        assert _consume_pending_goal_continuation("s1", payload["continuation_id"]) is True
+        assert _consume_pending_goal_continuation("s1", payload["continuation_id"])
 
     def test_edited_queue_entry_still_admitted(self):
         payload = self._goal_continue_payload("s1", "Continue step 2")
         edited_text = "Continue step 2, and also fix the typos I noticed"
         # The queue rewrites the text; the ID is untouched.
-        assert _consume_pending_goal_continuation("s1", payload["continuation_id"]) is True
+        assert _consume_pending_goal_continuation("s1", payload["continuation_id"])
         assert edited_text  # text is irrelevant to admission now
 
     def test_combined_queue_entry_still_admitted(self):
         payload = self._goal_continue_payload("s1", "Continue step 2")
-        assert _consume_pending_goal_continuation("s1", payload["continuation_id"]) is True
+        assert _consume_pending_goal_continuation("s1", payload["continuation_id"])
 
     def test_late_dispatch_after_refresh_still_admitted(self):
         payload = self._goal_continue_payload("s1", "Continue step 2")
         # A refresh-restored queue entry re-drains with the same ID.
-        assert _consume_pending_goal_continuation("s1", payload["continuation_id"]) is True
+        assert _consume_pending_goal_continuation("s1", payload["continuation_id"])
+
+
+class TestRollbackReceipt:
+    """#7855 rebase compat (#7249): a rejected chat start rolls back the whole
+    admission.
+
+    Master's #7249 consumes the continuation marker inside the session lock
+    and restores it when a start is rejected. Admission under #7855 pops the
+    *record* as well as the marker, so restoring only the marker — the
+    pre-#7855 shape — left the retry unmatchable: consume -> rollback -> retry
+    consume returned False and the continuation was gone (the failure the
+    maintainer reproduced on #7862 with the real store). The popped record
+    therefore travels as a rollback receipt and both halves are restored
+    together, unless a newer continuation was armed meanwhile.
+    """
+
+    def test_rollback_keeps_the_retry_matchable(self):
+        cont_id = _register("s1", "continue step 2")
+        receipt = consume_pending_goal_continuation("s1", cont_id)
+        assert receipt, "admission must return a rollback receipt"
+        # the start is rejected; #7249's rollback runs
+        assert restore_pending_goal_continuation("s1", receipt) is True
+        assert "s1" in PENDING_GOAL_CONTINUATION
+        assert PENDING_GOAL_CONTINUATION_PROMPTS["s1"]["continuation_id"] == cont_id
+        # the retry must still admit by the same ID (this returned False before
+        # the receipt existed)
+        retry = consume_pending_goal_continuation("s1", cont_id)
+        assert retry and retry.get("continuation_id") == cont_id
+        assert "s1" not in PENDING_GOAL_CONTINUATION
+        assert "s1" not in PENDING_GOAL_CONTINUATION_PROMPTS
+
+    def test_marker_only_rollback_would_break_the_retry(self):
+        """Documents the pre-#7855 failure mode so the regression is pinned:
+        re-adding the marker alone must NOT make the retry matchable."""
+        cont_id = _register("s1", "continue step 2")
+        receipt = consume_pending_goal_continuation("s1", cont_id)
+        assert receipt
+        # marker-only rollback (the shape #7249 had before the receipt)
+        PENDING_GOAL_CONTINUATION.add("s1")
+        assert "s1" not in PENDING_GOAL_CONTINUATION_PROMPTS
+        # admission now fails closed and clears the broken half
+        assert consume_pending_goal_continuation("s1", cont_id) is False
+
+    def test_rollback_does_not_clobber_a_newer_continuation(self):
+        cont_id = _register("s1", "continue step 2")
+        receipt = consume_pending_goal_continuation("s1", cont_id)
+        assert receipt
+        # while the start was in flight, the goal advanced and armed a new
+        # continuation for the same session
+        newer_id = _register("s1", "continue step 3")
+        assert newer_id != cont_id
+        assert restore_pending_goal_continuation("s1", receipt) is False
+        assert PENDING_GOAL_CONTINUATION_PROMPTS["s1"]["continuation_id"] == newer_id
+        # the newer continuation still works; the stale receipt did not burn it
+        assert consume_pending_goal_continuation("s1", newer_id)
+
+    def test_rollback_without_receipt_is_a_noop(self):
+        cont_id = _register("s1", "continue step 2")
+        receipt = consume_pending_goal_continuation("s1", cont_id)
+        assert receipt
+        assert restore_pending_goal_continuation("s1", None) is False
+        assert restore_pending_goal_continuation("s1", False) is False
+        assert "s1" not in PENDING_GOAL_CONTINUATION
+        assert "s1" not in PENDING_GOAL_CONTINUATION_PROMPTS
+        _ = cont_id
+
+    def test_rollback_is_idempotent_for_one_session(self):
+        cont_id = _register("s1", "continue step 2")
+        receipt = consume_pending_goal_continuation("s1", cont_id)
+        assert receipt
+        assert restore_pending_goal_continuation("s1", receipt) is True
+        # a second rollback of the same receipt finds the record already armed
+        assert restore_pending_goal_continuation("s1", receipt) is False
+        assert PENDING_GOAL_CONTINUATION_PROMPTS["s1"]["continuation_id"] == cont_id

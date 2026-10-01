@@ -24625,7 +24625,7 @@ def _normalize_goal_continuation_id(raw) -> str:
     return token
 
 
-def _consume_pending_goal_continuation(session_id: str, msg: str) -> bool:
+def _consume_pending_goal_continuation(session_id: str, msg: str) -> str | dict | bool | None:
     """#7855 admission: consume the goal-continuation record only when the
     incoming turn carries the matching continuation ID.
 
@@ -24642,6 +24642,12 @@ def _consume_pending_goal_continuation(session_id: str, msg: str) -> bool:
     edited continuation is still admitted. Marker, prompt and ID are one
     record in api.goals; the admission check delegates there so check + drop
     stay atomic.
+
+    On a match the return value is the **rollback receipt**: the popped
+    record itself (marker + prompt + ID together). A rejected chat start must
+    restore both halves (#7249 rolls back rejected starts), so callers keep
+    the receipt rather than re-deriving what was consumed — restoring the
+    marker alone left the retry unmatchable (maintainer's #7862 repro).
     """
     from api.goals import consume_pending_goal_continuation
 
@@ -24713,32 +24719,43 @@ def _start_chat_stream_for_session(
 
     consumed_goal_continuation = False
     consumed_bg_task_completion = False
-    # #1932: check if this session has a pending goal continuation flag.
-    # The streaming hook sets PENDING_GOAL_CONTINUATION when goal_continue fires,
-    # so the next chat/start for this session is automatically treated as
-    # goal-related. #6885 + #7855: the marker is consumed ONLY when the request
-    # carries the continuation ID the server issued at goal_continue time — a
-    # genuine user/queued turn (no ID) keeps priority and leaves the marker for
-    # the browser's auto-dispatch, while an edited / combined / late-sent
+    # #1932: this session may have a pending goal continuation. The streaming
+    # hook sets PENDING_GOAL_CONTINUATION when goal_continue fires, so the next
+    # chat/start for this session is automatically treated as goal-related.
+    # #6885 + #7855: the marker is consumed ONLY when the request carries the
+    # continuation ID the server issued at goal_continue time — a genuine
+    # user/queued turn (no ID) keeps priority and leaves the marker for the
+    # browser's auto-dispatch, while an edited / combined / late-sent
     # continuation still carries its ID and keeps the goal.
-    if not goal_related and goal_continuation_id and _consume_pending_goal_continuation(
-        s.session_id, goal_continuation_id,
-    ):
-        goal_related = True
+    #
+    # #7855 rebase compat (#7249): the admission runs INSIDE the session lock
+    # via consume_continuation_markers(), not up front. Admission pops BOTH
+    # halves (marker + prompt record, api/goals.py), so a rejected start must
+    # restore both; rolling back the marker alone left the retry unmatchable
+    # (maintainer's #7862 repro: consume -> rollback -> retry consume False).
+    # The popped record therefore travels as a rollback receipt and
+    # restore_consumed_continuation_markers() re-arms the pair — unless a
+    # newer continuation was armed for this session meanwhile.
+    consumed_goal_continuation_receipt = None
 
     def consume_continuation_markers() -> None:
         nonlocal goal_related, consumed_goal_continuation, consumed_bg_task_completion
-        if not goal_related and s.session_id in PENDING_GOAL_CONTINUATION:
-            goal_related = True
-            PENDING_GOAL_CONTINUATION.discard(s.session_id)
-            consumed_goal_continuation = True
+        nonlocal consumed_goal_continuation_receipt
+        if not goal_related and goal_continuation_id:
+            receipt = _consume_pending_goal_continuation(s.session_id, goal_continuation_id)
+            if receipt:
+                goal_related = True
+                consumed_goal_continuation = True
+                consumed_goal_continuation_receipt = receipt
         if s.session_id in PENDING_BG_TASK_COMPLETIONS:
             PENDING_BG_TASK_COMPLETIONS.discard(s.session_id)
             consumed_bg_task_completion = True
 
     def restore_consumed_continuation_markers() -> None:
         if consumed_goal_continuation:
-            PENDING_GOAL_CONTINUATION.add(s.session_id)
+            from api.goals import restore_pending_goal_continuation
+
+            restore_pending_goal_continuation(s.session_id, consumed_goal_continuation_receipt)
         if consumed_bg_task_completion:
             PENDING_BG_TASK_COMPLETIONS.add(s.session_id)
 
@@ -25931,32 +25948,38 @@ def _handle_goal_command(handler, body):
             status = 409 if payload.get("error") == "agent_running" else 400
         return j(handler, payload, status=status)
 
+    # #6885 round 2 lifecycle: the /goal command is the natural traffic hook
+    # for record upkeep. A cleared/paused goal has no continuation coming, so
+    # any pending record for this session must not outlive it (an abandoned
+    # browser dispatch would otherwise keep the pair resident until expiry);
+    # sweeping expired/orphaned records here bounds the rest without a
+    # background timer.
+    # #7855 rebase compat (#7249): this hook must not fire for runner-owned
+    # goals. The runner does not drive the browser's queued continuation, so
+    # there is no record to clear, and the sweep below runs on the runner's
+    # traffic for goals it owns locally.
+    if not runner_goal_owned:
+        if goal_adapter_action in ("clear", "pause"):
+            from api.goals import clear_pending_goal_continuation
+
+            try:
+                clear_pending_goal_continuation(s.session_id)
+            except Exception:
+                logger.debug(
+                    "Failed to clear pending goal continuation for %s", s.session_id, exc_info=True
+                )
+        from api.goals import sweep_expired_goal_continuations
+
+        try:
+            sweep_expired_goal_continuations()
+        except Exception:
+            logger.debug("Failed to sweep expired goal continuations", exc_info=True)
+
     def _rollback_goal_after_failed_kickoff() -> None:
         restore_goal_state(s.session_id, previous_goal_state, profile_home=profile_home)
 
     if runner_goal_owned:
         return j(handler, payload)
-
-    # #6885 round 2 lifecycle: the /goal command is the natural traffic hook
-    # for record upkeep. A cleared/paused goal has no continuation coming, so
-    # any pending record for this session must not outlive it (an abandoned
-    # browser dispatch would otherwise keep the pair resident); sweeping
-    # orphaned records here bounds the rest without a background timer.
-    if goal_adapter_action in ("clear", "pause"):
-        try:
-            from api.goals import clear_pending_goal_continuation
-
-            clear_pending_goal_continuation(s.session_id)
-        except Exception:
-            logger.debug(
-                "Failed to clear pending goal continuation for %s", s.session_id, exc_info=True
-            )
-    try:
-        from api.goals import sweep_expired_goal_continuations
-
-        sweep_expired_goal_continuations()
-    except Exception:
-        logger.debug("Failed to sweep expired goal continuations", exc_info=True)
 
     kickoff_prompt = str(payload.get("kickoff_prompt") or "").strip()
     if kickoff_prompt:

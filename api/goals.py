@@ -812,15 +812,17 @@ def peek_pending_goal_continuation_id(session_id: str) -> str | None:
         return cont_id or None
 
 
-def consume_pending_goal_continuation(session_id: str, msg: str) -> bool:
+def consume_pending_goal_continuation(session_id: str, msg: str) -> str | dict | bool | None:
     """Admit the pending continuation record for *session_id* by its ID.
 
     *msg* is the continuation ID issued by
-    :func:`register_pending_goal_continuation`. True only when it matches the
-    record: the record is removed and the turn becomes goal-related. Any
-    other value (a genuine user turn, or a queued turn whose entry lost its
-    ID) keeps user priority and the record stays for the browser's real
-    dispatch. Fails closed when no record is present.
+    :func:`register_pending_goal_continuation`. On a match the record is
+    removed, the turn becomes goal-related, and the consumed record is
+    returned as a **rollback receipt** (a dict, or the session id when only
+    the in-memory marker had no record half). Any other value (a genuine user
+    turn, or a queued turn whose entry lost its ID) keeps user priority and
+    the record stays for the browser's real dispatch; ``None`` or ``False``
+    is returned. Fails closed when no record is present.
 
     Matching on the ID rather than the prompt text is the #7855 fix: the
     browser's queue lets the user edit or combine a queued continuation, and
@@ -828,6 +830,13 @@ def consume_pending_goal_continuation(session_id: str, msg: str) -> bool:
     There is no wall-clock expiry — a late send (after any amount of time,
     including across a refresh) is still admitted, because the browser
     deliberately keeps queued continuations alive.
+
+    The receipt exists because a chat start can be rejected *after*
+    admission (#7249 rolls back rejected starts). Re-adding only the marker
+    on rollback — the pre-#7855 shape — left the retry unmatchable, because
+    admission also pops the record half. Returning both halves lets
+    :func:`restore_pending_goal_continuation` put the pair back together (see
+    its "newer continuation armed" guard).
     """
     session_id = str(session_id or "").strip()
     if not session_id:
@@ -859,6 +868,45 @@ def consume_pending_goal_continuation(session_id: str, msg: str) -> bool:
             # Mismatch: keep the record for the browser's real dispatch.
             return False
         _drop_pending_goal_continuation(session_id)
+        return dict(record)
+
+
+def restore_pending_goal_continuation(session_id: str, receipt) -> bool:
+    """Re-arm an admitted continuation from *receipt* (rollback path).
+
+    Called when a chat start that admitted a continuation is rejected
+    (#7249's transactional rollback). Restoring the marker without the
+    record — the pre-#7855 shape — left the retry unable to match, because
+    admission pops both halves.
+
+    The *newer continuation* guard is what keeps rollback honest: if another
+    ``register_pending_goal_continuation`` armed this session while the start
+    was in flight, this receipt is stale and must NOT overwrite the newer
+    record (that would burn a continuation the browser has not sent yet).
+    Restoring an older ID would also resurrect a consumed one.
+
+    ``receipt`` is what
+    :func:`consume_pending_goal_continuation` returned: the record dict, or
+    the session id when only the marker was present.
+    """
+    session_id = str(session_id or "").strip()
+    if not session_id or receipt is None or receipt is False:
+        return False
+    with _cfg.PENDING_GOAL_CONTINUATION_LOCK:
+        if session_id in _cfg.PENDING_GOAL_CONTINUATION_PROMPTS:
+            # A newer continuation is armed; keep it and drop the stale receipt.
+            return False
+        if isinstance(receipt, dict):
+            record = dict(receipt)
+            if not str(record.get("continuation_id") or "").strip():
+                return False
+        else:
+            # Marker-only admission (no popped record): re-arm the marker
+            # alone, matching #7249's rollback for the legacy half-pair.
+            record = None
+        _cfg.PENDING_GOAL_CONTINUATION.add(session_id)
+        if record is not None:
+            _cfg.PENDING_GOAL_CONTINUATION_PROMPTS[session_id] = record
         return True
 
 
