@@ -371,10 +371,11 @@ class Handler(BaseHTTPRequestHandler):
         }
         try:
             from api.routes import _request_log_client_fields as _fields
-            client_ip, chain = _fields(self, remote)
+            client_ip, chain, forwarded_for = _fields(self, remote)
         except Exception:
-            client_ip, chain = remote, None
+            client_ip, chain, forwarded_for = remote, None, None
         record_data['client_ip'] = client_ip
+        if forwarded_for: record_data['forwarded_for'] = forwarded_for  # CHANGELOG compat alias
         if chain: record_data['forwarded_for_chain'] = chain
         record = _json.dumps(record_data)
         self._safe_webui_print(f'[webui] {record}')

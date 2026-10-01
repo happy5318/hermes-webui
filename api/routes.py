@@ -6690,22 +6690,49 @@ def _bounded_trusted_chain(xff_values, *, max_entries: int = 32, max_chars: int 
     does NOT make the inbound chain bounded: a proxy may append to a
     client-supplied chain rather than replace it, so an unbounded XFF could
     otherwise write unbounded volume into the structured record even from a
-    trusted peer. Bound by entry count and serialized characters, keeping the
+    trusted peer. Bound by entry count AND serialized characters, keeping the
     most recent (right-most) hops — the ones closest to the trusted peer, which
     are the ones the peer itself vouched for.
+
+    Both budgets are enforced on the RESULT, not just the input: entry count
+    alone does not bound volume (a single client-supplied entry can carry tens
+    of KB). An entry longer than the whole budget is replaced by a short
+    marker, and any remaining overflow sheds the OLDEST hops until the rest
+    fits. The chain is diagnostic-only — ``client_ip`` resolution never reads
+    it — so losing hops to the budget costs no security property.
     """
     entries = [str(v) for v in xff_values if v]
-    if len(entries) <= max_entries and sum(len(e) for e in entries) <= max_chars:
+    entries = entries[-max_entries:]
+    if sum(len(e) for e in entries) + 2 * len(entries) <= max_chars:
         return entries
-    return entries[-max_entries:]
+    # Over budget: elide single oversized hops, then shed the oldest hops.
+    bounded = ["<hop elided>" if len(e) > max_chars else e for e in entries]
+    while bounded and sum(len(e) + 2 for e in bounded) > max_chars - 2:
+        bounded.pop(0)
+    note = f"…(chain truncated at {max_chars} chars)"
+    if sum(len(e) + 2 for e in bounded) + len(note) + 2 > max_chars:
+        bounded = []
+    bounded.insert(0, note)
+    return bounded
 
 
 def _request_log_client_fields(handler, remote):
     """Shaping helper for the request log's client fields.
 
-    Returns ``(client_ip, forwarded_for_chain)`` where ``client_ip`` is
-    authoritative — the resolved client hop when the raw socket peer is a
-    trusted proxy, otherwise the raw peer — and the chain is diagnostic-only.
+    Returns ``(client_ip, forwarded_for_chain, forwarded_for)`` where
+    ``client_ip`` is authoritative — the resolved client hop when the raw
+    socket peer is a trusted proxy, otherwise the raw peer — ``forwarded_for``
+    is the documented compatibility alias, and the chain is diagnostic-only.
+
+    The alias exists because CHANGELOG (the entry that introduced
+    ``forwarded_for``) documents the field for downstream security tooling:
+    deleting it silently breaks filters keyed on the name. Following the
+    reviewed contract it is emitted ONLY when a trusted proxy's X-Forwarded-For
+    actually resolved — then it mirrors the resolved, validated ``client_ip``.
+    It never carries raw header text, and it is absent entirely for an
+    untrusted peer, a missing header or a malformed chain, so an attacker can
+    influence neither its value nor its presence: the #7863 spoofing vector
+    stays closed while the documented contract stays readable.
 
     The chain is returned ONLY for a trusted proxy, and then BOUNDED (see
     ``_bounded_trusted_chain``): a proxy may append to rather than replace a
@@ -6727,13 +6754,15 @@ def _request_log_client_fields(handler, remote):
         xff_values = []
     try:
         if not (isinstance(remote, str) and remote and remote != "-"):
-            return "-", None
+            return "-", None, None
         if not _raw_peer_is_trusted_proxy(handler):
-            return remote, None
+            return remote, None, None
         resolved = _forwarded_client_ip_from_trusted_proxy(handler, consult_real_ip=False)
-        return (resolved or remote), _bounded_trusted_chain(xff_values)
+        if not resolved:
+            return remote, _bounded_trusted_chain(xff_values), None
+        return resolved, _bounded_trusted_chain(xff_values), resolved
     except Exception:
-        return remote, None
+        return remote, None, None
 
 
 def _onboarding_request_is_local(handler) -> bool:

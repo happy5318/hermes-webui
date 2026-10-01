@@ -14,9 +14,15 @@ malformed chain). ``log_request`` now uses it and publishes the trustworthy
 value under an explicitly-named field:
 
 * trusted proxy peer  -> the resolved client hop
-* untrusted peer      -> the raw socket peer (the header stays as debugging
-  data under ``forwarded_for_chain``, clearly not authoritative)
+* untrusted peer      -> the raw socket peer (the attacker-chosen header is
+  dropped from the structured record entirely, not even kept as debugging
+  data — see the untrusted-peer test below)
 * resolution failure  -> fail closed to the raw peer, never to a header hop
+
+The CHANGELOG-documented ``forwarded_for`` field keeps its name and can never
+hold raw header text: it mirrors the safe ``client_ip`` in every case, so
+downstream fail2ban filters keyed on the documented name keep matching while
+the #7863 spoofing vector stays closed.
 """
 
 from __future__ import annotations
@@ -258,3 +264,78 @@ def test_trusted_chain_truncation_keeps_the_resolution_semantics(log_output):
     record = _record(log_output)
     assert record["client_ip"] == "203.0.113.99"
     assert len(record["forwarded_for_chain"]) <= 32
+
+
+def test_trusted_peer_single_oversized_entry_stays_char_bounded(log_output):
+    """ONE oversized hop must be elided — entry count alone is not a bound.
+
+    ``_bounded_trusted_chain`` caps entries at 32, but a chain of TWO hops can
+    still carry tens of KB when one hop is client-written. A proxy may append
+    to a client-supplied chain, so from a *trusted* peer the budget has to be
+    enforced on serialized characters: the oversized value is replaced by a
+    marker and the neighbouring real hops survive for diagnosis.
+    """
+    handler = _handler("127.0.0.1", _Headers(forwarded=["A" * 40000]))
+
+    Handler.log_request(handler, "200")
+
+    record = _record(log_output)
+    chain = record["forwarded_for_chain"]
+    serialized = len(json.dumps(chain))
+    assert serialized <= 512, f"chain serializes to {serialized} chars"
+    assert all("A" * 40000 not in entry for entry in chain), chain
+
+
+def test_trusted_peer_real_hops_survive_an_oversized_neighbour(log_output):
+    """A hostile mega-hop must not evict the real IP hops around it.
+
+    Truncating by entry count would keep the mega-hop; truncating by budget
+    must keep the diagnostic value: the short hops stay and only the oversized
+    entry is elided, with a marker naming the dropped entry.
+    """
+    hops = ["203.0.113.7", "198.51.100.9"] + ["B" * 3000] + ["192.0.2.10"]
+    handler = _handler("127.0.0.1", _Headers(forwarded=hops))
+
+    Handler.log_request(handler, "200")
+
+    record = _record(log_output)
+    chain = record["forwarded_for_chain"]
+    assert len(json.dumps(chain)) <= 512
+    assert "203.0.113.7" in chain or "192.0.2.10" in chain, f"real hops lost: {chain}"
+    assert "B" * 3000 not in json.dumps(chain)
+    # Resolution is untouched by the diagnostic elision.
+    assert record["client_ip"] == "192.0.2.10"
+
+
+def test_forwarded_for_alias_mirrors_the_resolved_client_ip(log_output):
+    """CHANGELOG documents ``forwarded_for`` for fail2ban — keep the name.
+
+    The field's *name* is a contract; its old *value* (raw left-most header
+    hop) was the #7863 bug. The alias therefore stays present and mirrors the
+    validated ``client_ip``: a fail2ban filter keyed on the documented name
+    keeps matching and can never read attacker-chosen text.
+    """
+    handler = _handler("127.0.0.1", _Headers(forwarded=["203.0.113.7"]))
+
+    Handler.log_request(handler, "200")
+
+    record = _record(log_output)
+    assert record["forwarded_for"] == record["client_ip"] == "203.0.113.7"
+
+
+def test_forwarded_for_alias_never_carries_raw_header_text(log_output):
+    """For an untrusted peer the documented alias is absent, not header text.
+
+    The alias is emitted only for a trusted proxy's resolved chain, so a
+    direct client can influence neither its value nor its presence.
+    """
+    handler = _handler("192.0.2.10", _Headers(forwarded=["203.0.113.7", "198.51.100.9"]))
+
+    Handler.log_request(handler, "401")
+
+    record = _record(log_output)
+    assert record["client_ip"] == "192.0.2.10"
+    assert "forwarded_for" not in record
+    for value in record.values():
+        assert "203.0.113.7" not in str(value)
+        assert "198.51.100.9" not in str(value)
