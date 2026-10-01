@@ -2537,14 +2537,14 @@ async function loadSession(sid){
   S.session=data.session;
   if(typeof _adoptRegenerationRevision==='function') _adoptRegenerationRevision(data.session);
   if(typeof _clearEmptyComposerModelOverride==='function') _clearEmptyComposerModelOverride();
+  // Loading a real existing session abandons any pre-session toolset override
+  // staged on the empty composer before any deferred refresh work runs.
+  S._pendingSessionToolsets=null;
   // #7855: a session switch is a hard context boundary — drop any one-shot
   // goal-continuation drain ID left over from the previous session's queue
   // (restored-but-never-sent, or a drain abandoned mid-settle) so it cannot
   // attach to the next send in this session.
   if(typeof _setDrainingGoalContinuationId==='function') _setDrainingGoalContinuationId('');
-  // Loading a real existing session abandons any pre-session toolset override
-  // staged on the empty composer before any deferred refresh work runs.
-  S._pendingSessionToolsets=null;
   if(typeof populateModelDropdown==='function'){
     const modelRefreshSid=sid;
     const isActiveModelRefreshSession=()=>!!(S.session&&S.session.session_id===modelRefreshSid);
