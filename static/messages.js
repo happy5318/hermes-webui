@@ -1411,7 +1411,7 @@ async function send(){
       // re-queue happens while that drain's ID is still held. Carry it on the
       // entry so the continuation survives the requeue — otherwise the entry
       // goes back as a pure user message and the goal continuation is lost.
-      // send() clears the ID when the requeued entry finally drains, so it
+      // send() clears the ID when the requeued entry eventually drains, so it
       // still applies to exactly one turn.
       const _drainContId=(typeof _readDrainingGoalContinuationId==='function')
         ? _readDrainingGoalContinuationId()
