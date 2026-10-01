@@ -88,11 +88,16 @@ def test_routes_consumer_discards_atomically_on_read():
     )
 
     # 3. No stray direct discard anywhere in routes.py: the drop is owned
-    #    by api.goals (lock-held, check + drop in one block).
+    #    by api.goals (lock-held, check + drop in one block). The one allowed
+    #    exception is master's `consume_continuation_markers()` closure, which
+    #    consumes the legacy #1932 SET marker (a different object from the
+    #    id-keyed record api.goals owns) for the plain no-id path.
     direct = re.findall(r"PENDING_GOAL_CONTINUATION\.discard", src)
-    assert len(direct) == 0, (
+    allowed = re.findall(r"def consume_continuation_markers\(\)[^}]*?PENDING_GOAL_CONTINUATION\.discard", src, re.S)
+    assert len(direct) == len(allowed), (
         f"PENDING_GOAL_CONTINUATION.discard must not appear in routes.py "
-        f"(api.goals owns the record drop), found {len(direct)}"
+        f"(api/goals owns the record drop); found {len(direct)}, of which "
+        f"{len(allowed)} sit inside the legacy consume_continuation_markers() closure"
     )
 
 

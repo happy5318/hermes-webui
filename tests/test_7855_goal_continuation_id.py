@@ -325,9 +325,18 @@ class TestWriterWiring:
             "_consume_pending_goal_continuation(s.session_id, goal_continuation_id)"
         )
         direct = re.findall(r"PENDING_GOAL_CONTINUATION\.discard", src)
-        assert len(direct) == 0, (
+        # master's consume_continuation_markers() closure still consumes the
+        # legacy #1932 SET marker for the plain no-id path; that is a different
+        # object from the id-keyed record api.goals owns. Everything else must
+        # delegate to the helper.
+        allowed = re.findall(
+            r"def consume_continuation_markers\(\)[^}]*?PENDING_GOAL_CONTINUATION\.discard", src, re.S
+        )
+        assert len(direct) == len(allowed), (
             f"PENDING_GOAL_CONTINUATION.discard must not appear in routes.py "
-            f"(record removal is owned by api.goals), found {len(direct)}"
+            f"(record removal is owned by api.goals); found {len(direct)}, of "
+            f"which {len(allowed)} sit inside the legacy "
+            f"consume_continuation_markers() closure"
         )
 
     def test_routes_normalizes_the_client_id(self):
