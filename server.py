@@ -108,7 +108,7 @@ activate_managed_agent()
 logger = logging.getLogger(__name__)
 
 from api.request_logging import emit_request_log
-from api.routes import trusted_forwarded_client_ip  # #7863
+from api.routes import request_log_forwarded_fields  # #7863
 from api.auth import check_auth_or_close, reset_trusted_auth_request_state
 from api.config import HOST, PORT, STATE_DIR, SESSION_DIR, DEFAULT_WORKSPACE
 from api.helpers import (
@@ -362,10 +362,6 @@ class Handler(BaseHTTPRequestHandler):
                 remote = str(self.client_address[0])
         except Exception:
             remote = '-'
-        try:
-            forwarded_for = trusted_forwarded_client_ip(self)
-        except Exception:
-            forwarded_for = None
         record_data = {
             'ts': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
             'remote': remote,
@@ -374,8 +370,12 @@ class Handler(BaseHTTPRequestHandler):
             'status': int(code) if str(code).isdigit() else code,
             'ms': duration_ms,
         }
-        if forwarded_for:
-            record_data['forwarded_for'] = forwarded_for
+        try:
+            # #7863/#7864: trusted-proxy resolution + a per-record flag when a
+            # forwarded header was dropped, so the loss is visible per request.
+            record_data.update(request_log_forwarded_fields(self))
+        except Exception:
+            pass
         record = _json.dumps(record_data)
         self._safe_webui_print(f'[webui] {record}')
 

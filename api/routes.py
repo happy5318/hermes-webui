@@ -6757,8 +6757,59 @@ def _warn_forwarded_header_ignored(handler) -> None:
     )
 
 
+def request_log_forwarded_fields(handler) -> dict:
+    """Per-request log fields describing what the log did with X-Forwarded-For.
+
+    #7864 round 5 (nesquena-hermes review): the one-shot operator warning is
+    PROCESS-WIDE, so it can only ever explain ONE peer. On an exposed instance
+    any internet client can send its own ``X-Forwarded-For`` and spend it on
+    the first random request; the operator's unallowlisted proxy — the request
+    whose ``forwarded_for`` field actually disappeared — is then never named.
+    One warning line structurally cannot carry that.
+
+    So the warning stays, AND every structured record that dropped an XFF
+    carries ``forwarded_for_ignored: true``. A fail2ban jail or log query can
+    then see exactly which requests lost the field, per request.
+
+    CONTRACT:
+    * the value is a BOOLEAN signal only — the untrusted header text is never
+      read, returned or logged (attacker-controlled, and echoing it would be an
+      unbounded log-write vector). There is deliberately no way to recover the
+      dropped value from this module.
+    * ``forwarded_for`` is present (a validated client address) only when the
+      raw peer is a trusted proxy and the chain resolved; ``forwarded_for_ignored``
+      is present only when a non-blank XFF was seen and NOT recorded. They are
+      mutually exclusive: a resolved field is never also flagged as ignored.
+    * a direct client with no forwarded header gets NEITHER key, so the common
+      case stays byte-identical to master's log line.
+
+    Lives here (not inline in server.py) to keep the entrypoint under its
+    760-line guard — see tests/test_sprint10.py.
+    """
+    remote = _request_client_ip(handler)
+    if not _raw_peer_is_trusted_proxy(handler):
+        # #7864 round 3: an untrusted peer's forwarded header is ignored — the
+        # correct fail-closed outcome, but on the default deployment (a proxy
+        # on a Docker bridge / LAN address) it silently drops the log's
+        # forwarded_for field. Warn once per process so an operator whose
+        # fail2ban jail stops matching can see why; flag the record so the
+        # other peers that lose the field are still visible per request.
+        if not _has_forwarded_header(handler):
+            return {}
+        _warn_forwarded_header_ignored(handler)
+        return {"forwarded_for_ignored": True}
+    resolved = _forwarded_client_ip_from_trusted_proxy(handler, consult_real_ip=False)
+    if resolved and resolved != remote:
+        return {"forwarded_for": resolved}
+    return {}
+
+
 def trusted_forwarded_client_ip(handler) -> str | None:
     """Resolved, validated client IP for the request log, or None.
+
+    Thin wrapper over :func:`request_log_forwarded_fields` for callers that
+    only want the address. ``log_request`` uses the dict form so a dropped
+    XFF is visible per request (#7864 round 5).
 
     #7863: the structured request log must never record a spoofable client IP.
     The left-most X-Forwarded-For hop is attacker-controlled, so a forwarded IP
@@ -6784,22 +6835,9 @@ def trusted_forwarded_client_ip(handler) -> str | None:
     ``X-Real-IP`` fallback via the default ``consult_real_ip=True``.
 
     Kept here (not inline in server.py) so the process entrypoint stays under
-    its 750-line guard — see tests/test_sprint10.py.
+    its line guard — see tests/test_sprint10.py.
     """
-    remote = _request_client_ip(handler)
-    if not _raw_peer_is_trusted_proxy(handler):
-        # #7864 round 3: an untrusted peer's forwarded header is ignored — the
-        # correct fail-closed outcome, but on the default deployment (a proxy
-        # on a Docker bridge / LAN address) it silently drops the log's
-        # forwarded_for field. Warn once per process so an operator whose
-        # fail2ban jail stops matching can see why.
-        if _has_forwarded_header(handler):
-            _warn_forwarded_header_ignored(handler)
-        return None
-    resolved = _forwarded_client_ip_from_trusted_proxy(handler, consult_real_ip=False)
-    if resolved and resolved != remote:
-        return resolved
-    return None
+    return request_log_forwarded_fields(handler).get("forwarded_for")
 
 
 def _onboarding_request_is_local(handler) -> bool:
