@@ -3055,24 +3055,26 @@ def delete_profile_api(name: str) -> dict:
     # If deleting the active profile, switch to default first
     if _active_profile == name:
         try:
-            switch_profile('default')
-        except RuntimeError:
+            switch_profile("default")
+        except RuntimeError as exc:
             raise RuntimeError(
                 f"Cannot delete active profile '{name}' while an agent is running. "
                 "Cancel or wait for it to finish."
-            )
+            ) from exc
 
     try:
         from hermes_cli.profiles import delete_profile
+
         delete_profile(name, yes=True)
     except ImportError:
         # Manual fallback: just remove the directory
         import shutil
+
         profile_dir = _resolve_named_profile_home(name)
         if profile_dir.is_dir():
             shutil.rmtree(str(profile_dir))
         else:
-            raise ValueError(f"Profile '{name}' does not exist.")
+            raise ValueError(f"Profile '{name}' does not exist.") from None
 
     _drop_profile_models_cache(name)
     # Drop cached root-profile-name lookup — list_profiles_api() shape changed.

@@ -22,14 +22,12 @@ import socket
 import sys
 import threading
 import time
-import traceback
 import urllib.error
 import urllib.request
-import uuid
 import weakref
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import urlparse
 
 # ── Basic layout ──────────────────────────────────────────────────────────────
 import api.paths as _paths
@@ -11921,7 +11919,6 @@ def unregister_active_run(stream_id: str) -> None:
 # LRU cache with size limit to prevent memory bloat.
 # All cache operations (get, set, move_to_end, popitem) are protected by
 # SESSION_AGENT_CACHE_LOCK for thread safety in multi-threaded ASGI servers.
-import collections
 SESSION_AGENT_CACHE: collections.OrderedDict = collections.OrderedDict()  # LRU cache
 # Each cached agent pins a full conversation transcript in RAM, so this cap is
 # the dominant lever on WebUI resident memory (issue #3506). The default is kept

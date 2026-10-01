@@ -579,7 +579,16 @@ def test_thread_local_env_value_none_default_returns_empty_string(monkeypatch):
 
 
 def test_detached_worker_scope_binds_default_on_fresh_reused_executor_thread(monkeypatch):
-    """An explicit default scope overrides process state without leaking into reuse."""
+    """An explicit default scope overrides process state without leaking into reuse.
+
+    Under a NAMED process-level profile (``work``), a default/root detached
+    worker only binds explicitly: ``bind_root=True`` routes through
+    ``profile_scope_for_root_detached_worker`` and pins TLS + root home env, so
+    the no-op branch (plain default scope under a named process profile) never
+    resolves the named profile. Both the bound-inside value and the restored-
+    on-exit value are asserted, plus no leakage into the reused executor thread
+    (#7724).
+    """
     import concurrent.futures
     import threading
 
@@ -589,19 +598,32 @@ def test_detached_worker_scope_binds_default_on_fresh_reused_executor_thread(mon
     def scoped_default():
         thread_id = threading.get_ident()
         before = profiles.get_active_profile_name()
-        with profiles.profile_scope_for_detached_worker("default", "test"):
+        with profiles.profile_scope_for_detached_worker(
+            "default", "test", bind_root=True
+        ):
             inside = profiles.get_active_profile_name()
         after = profiles.get_active_profile_name()
         return thread_id, before, inside, after
+
+    # Without bind_root the default scope stays a no-op under a named process
+    # profile: the worker would resolve 'work' (#7724 root-binding contract).
+    def plain_default_is_noop():
+        with profiles.profile_scope_for_detached_worker("default", "test"):
+            return profiles.get_active_profile_name()
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
         first = executor.submit(scoped_default).result(timeout=5)
         reused = executor.submit(
             lambda: (threading.get_ident(), profiles.get_active_profile_name())
         ).result(timeout=5)
+        noop_inside = executor.submit(plain_default_is_noop).result(timeout=5)
 
     assert first == (reused[0], "work", "default", "work")
     assert reused[1] == "work"
+    assert noop_inside == "work", (
+        "a plain default scope under a NAMED process profile must stay a no-op "
+        "(only bind_root=True pins the root profile on the worker)"
+    )
 
 
 def test_detached_worker_scope_restores_outer_profile_after_nested_scope(monkeypatch):
