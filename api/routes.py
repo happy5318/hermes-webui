@@ -6681,18 +6681,39 @@ _FORWARDED_HEADER_IGNORED_WARNED = False
 
 
 def _has_forwarded_header(handler) -> bool:
-    """True when the request carries a non-blank forwarded-client header.
+    """True when the request carries a non-blank ``X-Forwarded-For``.
+
+    #7864 round 4 (nesquena-hermes review): the one-shot operator warning is
+    process-wide, so it must be spent on the case it exists to explain — an
+    ``X-Forwarded-For`` that the request log stopped recording. That is the
+    ONLY header the log ever recorded, so it is the only one whose loss needs
+    announcing. Counting ``X-Real-IP`` here let a stray client, scanner or
+    misconfigured LB carrying only that header burn the single warning (and
+    mislabel it: no X-Forwarded-For was ever sent) while the operator's real
+    proxy request stayed silent. This path resolves with
+    ``consult_real_ip=False`` and never consults ``X-Real-IP`` at all, so the
+    header is not a signal for anything on the log path.
+
+    Repeated ``X-Forwarded-For`` headers all count (``get_all``), matching the
+    consumption in ``_forwarded_client_ip_from_trusted_proxy``: a proxy that
+    splits the chain across two headers has still lost the field, and the
+    resolver reads every one of them.
 
     Presence check only — the value is never read, returned or logged here:
     it is attacker-controlled text and this module must stay a
     non-log-writing consumer of it.
     """
-    for name in ("X-Forwarded-For", "X-Real-IP"):
+    try:
+        values = handler.headers.get_all("X-Forwarded-For") or []
+    except AttributeError:
+        # Test/lightweight handlers expose a plain mapping without get_all.
         try:
-            value = handler.headers.get(name, "") or ""
+            single = handler.headers.get("X-Forwarded-For", "")
         except AttributeError:
             return False
-        if str(value).strip():
+        values = [single] if single else []
+    for value in values:
+        if str(value or "").strip():
             return True
     return False
 
