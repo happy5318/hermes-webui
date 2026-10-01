@@ -143,6 +143,23 @@ def test_stale_model_readers_collapse_to_single_reload_when_models_are_requested
             "stale model readers should route through reload_config_if_stale() instead of forced reload_config()"
         )
 
+    # The cold-cache path in get_available_models() only routes through
+    # profiles scopes to rebind TLS/env for the rebuild worker. This test
+    # covers the config-reload gate, not profile scoping, so neutralize the
+    # scopes: a *named* process-level profile left behind by an earlier test
+    # in the same shard would otherwise drive the root-binding branch
+    # (bind_root=True) and pull this thread into profile-env work that reads
+    # config through reload_config() (#7724 rebase fallout).
+    import api.profiles as profiles_mod
+    from contextlib import contextmanager as _cm
+
+    @_cm
+    def _noop_scope(*_a, **_k):
+        yield
+
+    monkeypatch.setattr(profiles_mod, "profile_scope_for_active_request", _noop_scope)
+    monkeypatch.setattr(profiles_mod, "profile_scope_for_detached_worker", _noop_scope)
+
     monkeypatch.setattr(config, "_refresh_config_cache", _counted_refresh)
     monkeypatch.setattr(config, "reload_config", _unexpected_reload)
 
