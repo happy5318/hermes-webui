@@ -62,8 +62,11 @@ def test_routes_consumer_discards_atomically_on_read():
     #6885: consumption is delegated to the module-level helper
     ``_consume_pending_goal_continuation`` (admission correction: only a
     turn whose text matches the pending continuation prompt consumes the
-    marker). The helper must keep check + discard in one tight atomic
-    block, and the caller must not discard anywhere else.
+    marker). Round 2 moved the record (marker + prompt + expiry) behind
+    ``api.goals`` so streaming/gateway/routes share one owner; the
+    stage-326 atomicity contract now lives there: check + drop happen
+    under one lock-held block, and routes.py must not discard anywhere
+    else.
     """
     src = _read_routes()
 
@@ -77,28 +80,48 @@ def test_routes_consumer_discards_atomically_on_read():
         "_consume_pending_goal_continuation(s.session_id, msg)"
     )
 
-    # 2. Inside the helper: marker check + discard must stay in one tight
-    #    atomic block (<= 10 lines), exactly the old stage-326 contract.
-    helper = re.search(
-        r"if session_id not in PENDING_GOAL_CONTINUATION:.*?PENDING_GOAL_CONTINUATION\.discard",
-        src,
-        re.DOTALL,
-    )
-    assert helper is not None, (
-        "helper must keep check + discard in the same atomic block"
-    )
-    block = helper.group(0)
-    line_count = block.count("\n")
-    assert line_count <= 10, (
-        f"PENDING_GOAL_CONTINUATION check + discard span {line_count} lines; "
-        "should be tight atomic block"
+    # 2. routes.py delegates to api.goals (single record owner).
+    assert "from api.goals import consume_pending_goal_continuation" in src, (
+        "routes.py helper must delegate to api.goals."
+        "consume_pending_goal_continuation"
     )
 
-    # 3. No stray direct discard anywhere else in routes.py.
+    # 3. No stray direct discard anywhere in routes.py: the drop is owned
+    #    by api.goals (lock-held, check + drop in one block).
     direct = re.findall(r"PENDING_GOAL_CONTINUATION\.discard", src)
-    assert len(direct) == 1, (
-        f"PENDING_GOAL_CONTINUATION.discard must appear exactly once in routes.py "
-        f"(inside the helper), found {len(direct)}"
+    assert len(direct) == 0, (
+        f"PENDING_GOAL_CONTINUATION.discard must not appear in routes.py "
+        f"(api.goals owns the record drop), found {len(direct)}"
+    )
+
+
+def test_goals_module_owns_atomic_check_and_drop():
+    """stage-326 atomicity, relocated: api.goals holds check + drop of the
+    record in ONE lock-held block (the two collections cannot drift, and a
+    reader can never observe a half-consumed record)."""
+    goals_src = Path(__file__).parents[1].joinpath("api", "goals.py").read_text(encoding="utf-8")
+    drop = re.search(
+        r"def _drop_pending_goal_continuation\([\s\S]*?"
+        r"_cfg\.PENDING_GOAL_CONTINUATION\.discard[\s\S]*?"
+        r"_cfg\.PENDING_GOAL_CONTINUATION_PROMPTS\.pop",
+        goals_src,
+    )
+    assert drop is not None, (
+        "api.goals must drop marker + prompt together in one helper "
+        "(single record, no drift)"
+    )
+    block = drop.group(0)
+    assert block.count("\n") <= 12, (
+        "the atomic drop helper should stay tight (single record removal)"
+    )
+    # The consumer runs check + drop under the shared lock.
+    consume = re.search(
+        r"def consume_pending_goal_continuation\(.*?\n(?:.*\n)*?.*with _cfg\.PENDING_GOAL_CONTINUATION_LOCK:",
+        goals_src,
+    )
+    assert consume is not None, (
+        "api.goals.consume_pending_goal_continuation must hold the shared "
+        "lock across check + drop"
     )
 
 
@@ -129,23 +152,37 @@ def test_stream_goal_related_pop_keyed_by_stream_id():
 
 
 def test_goal_continue_set_marker_before_emitting_event():
-    """Source-code ordering check: PENDING_GOAL_CONTINUATION.add must
-    happen BEFORE the goal_continue SSE event is put on the queue, so the
-    marker is observable by the time the frontend reacts."""
-    src = _read_streaming()
-    add_idx = src.find("PENDING_GOAL_CONTINUATION.add(session_id)")
-    if add_idx == -1:
-        # Tolerate slight phrasing variations.
-        m = re.search(r"PENDING_GOAL_CONTINUATION\.add\([^)]*\)", src)
-        assert m is not None, "PENDING_GOAL_CONTINUATION.add not found"
-        add_idx = m.start()
+    """Source-code ordering check: the continuation record must be
+    registered BEFORE the goal_continue SSE event is put on the queue, so
+    the marker is observable by the time the frontend reacts.
 
-    # Find the next goal_continue SSE event AFTER the add.
+    #6885 round 2: the add runs through
+    ``api.goals.register_pending_goal_continuation`` (marker + prompt +
+    expiry as one record), and the SSE emission is gated on its return so a
+    failed registration cannot leave the frontend queued without a server
+    record to consume."""
+    src = _read_streaming()
+    m = re.search(
+        r"register_pending_goal_continuation\(session_id, continuation_prompt\)",
+        src,
+    )
+    assert m is not None, (
+        "streaming.py must register the continuation record via "
+        "register_pending_goal_continuation(session_id, continuation_prompt)"
+    )
+    add_idx = m.start()
+
+    # Find the next goal_continue SSE event AFTER the registration.
     after_add = src[add_idx:]
-    event_idx = after_add.find("goal_continue")
-    assert event_idx != -1, "no goal_continue emission after marker add"
-    # Must be within ~500 chars (close to the add).
+    event_idx = after_add.find("put('goal_continue'")
+    assert event_idx != -1, "no goal_continue emission after record registration"
+    # Must be within ~500 chars (close to the registration).
     assert event_idx < 500, (
-        "PENDING_GOAL_CONTINUATION.add must immediately precede the "
+        "register_pending_goal_continuation must immediately precede the "
         "goal_continue SSE emission"
+    )
+    # The SSE event fires only when the registration succeeded.
+    assert "if not register_pending_goal_continuation(" in src, (
+        "the goal_continue SSE event must be gated on the record "
+        "registration return value"
     )

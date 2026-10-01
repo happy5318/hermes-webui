@@ -11393,13 +11393,25 @@ STREAM_LIVE_TOOL_CALLS: dict = {}  # stream_id -> live tool calls accumulated du
 STREAM_GOAL_RELATED: dict = {}  # stream_id -> bool: only evaluate goal for goal-related turns (#1932)
 STREAM_LAST_EVENT_ID: dict = {}  # stream_id -> latest journal event_id for `id:` field on live SSE frames (stage-364)
 PENDING_GOAL_CONTINUATION: set = set()  # session_ids awaiting a goal continuation turn (#1932)
-# #6885 admission correction: per-session continuation prompt text. The
-# routes.py consumer matches the incoming /chat/start text against this so
-# a genuine user/queued turn is not misclassified as goal-related — the
-# bare session-scoped marker is ambiguous. Written atomically next to the
-# set add in streaming/gateway goal_continue paths; consumed together with
-# the marker by _consume_pending_goal_continuation.
+# #6885 admission correction (round 2, maintainer review): marker and prompt
+# are ONE record so the two collections cannot drift apart. Value shape:
+#   {"prompt": str, "expires_at": float}
+# The routes.py consumer matches the incoming /chat/start text (after
+# client-envelope normalization) against "prompt" so a genuine user/queued
+# turn is not misclassified as goal-related — the bare session-scoped marker
+# is ambiguous. Written atomically next to the set add in streaming/gateway
+# goal_continue paths; consumed together with the marker by
+# _consume_pending_goal_continuation. "expires_at" bounds the lifecycle so an
+# abandoned browser dispatch (queued turn never fired) cannot leak a record
+# forever: past the expiry the pair is swept together by
+# sweep_expired_goal_continuations(), called from the goal-command handler.
 PENDING_GOAL_CONTINUATION_PROMPTS: dict = {}
+PENDING_GOAL_CONTINUATION_LOCK = threading.Lock()
+# A pending continuation outlives its turn by design: the browser needs one
+# full SSE-receive → queue → POST /api/chat/start round trip (plus queued
+# messages ahead of it). Half an hour is generous for that round trip while
+# still bounding a leaked record to a single idle window.
+GOAL_CONTINUATION_TTL_SECONDS: float = 1800.0
 
 
 def register_stream_owner(stream_id: str, session_id: str) -> None:

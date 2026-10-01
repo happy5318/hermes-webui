@@ -231,6 +231,29 @@ Relay close set (stop draining the live queue): `stream_end`, `cancel`,
 `apperror`, and legacy `error` — see `api.run_journal.SSE_RELAY_CLOSE_EVENTS`.
 `done` is **not** a relay-close event because `title` and `stream_end` follow it.
 
+#### `goal_continue` admission semantics
+
+`goal_continue` tells the client the standing goal wants another turn and
+carries the continuation prompt (`continuation_prompt` / `text`). The client
+queues that prompt as a normal next user message, so the queued turn and a
+genuine user message race on the same session.
+
+Server-side admission (`api.goals.register/consume_pending_goal_continuation`,
+wired into `/api/chat/start` by `routes.py`):
+
+- When the turn fires, the server records **one** entry — marker, prompt and
+  expiry — per session. The event is emitted only when the record lands.
+- The **next** `/chat/start` is treated as goal-related only when its text
+  matches the recorded prompt after normalizing the browser's transport
+  decorations (a `/use` forced-skill directive + `[FORCED SKILL CONTEXT]`
+  envelope prepended by `static/messages.js` `send()`, and an
+  `[Attached files: …]` suffix appended for uploads). Any other text keeps
+  normal user priority and the record waits for the real dispatch.
+- The record is single-use on a match, and bounded: it expires
+  (`GOAL_CONTINUATION_TTL_SECONDS`), and `goal clear/pause`, session deletion,
+  and the sweep inside the `/goal` command handler retire it — an abandoned
+  browser dispatch cannot leak the marker + prompt pair.
+
 The semantic taxonomy table remains a draft for the proposed per-session
 endpoint vocabulary and must be confirmed during maintainer review before that
 endpoint claims parity.

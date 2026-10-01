@@ -2961,7 +2961,6 @@ from api.config import (
     get_config_snapshot,
     STREAM_GOAL_RELATED,
     PENDING_GOAL_CONTINUATION,
-    PENDING_GOAL_CONTINUATION_PROMPTS,
     _get_config_path,
     _load_yaml_config_file,
     _save_yaml_config_file,
@@ -16976,6 +16975,15 @@ def handle_post(handler, parsed) -> bool:
             forget_bg_task_completion_dedup(sid)
         except Exception:
             logger.debug("Failed to prune bg-task dedup entry for deleted session %s", sid)
+        # #6885 round 2 lifecycle: session retirement is a terminal path — a
+        # deleted session's pending continuation record (marker + prompt +
+        # expiry) must not survive the session itself.
+        try:
+            from api.goals import clear_pending_goal_continuation
+
+            clear_pending_goal_continuation(sid)
+        except Exception:
+            logger.debug("Failed to clear pending goal continuation for deleted session %s", sid, exc_info=True)
         try:
             from api.terminal import close_terminal
             close_terminal(sid)
@@ -24600,26 +24608,26 @@ def _agent_runtime_barrier_response(
 
 
 def _consume_pending_goal_continuation(session_id: str, msg: str) -> bool:
-    """#6885 admission correction: consume the goal-continuation marker only
+    """#6885 admission correction: consume the goal-continuation record only
     when the incoming turn text matches the pending continuation prompt.
 
     The marker is session-scoped (#1932) and set when goal_continue fires;
     without the prompt match, a genuine user/queued turn arriving before the
     browser's auto-dispatch would be misclassified as goal-related and would
     inherit goal-continuation semantics. When the text differs, the user turn
-    keeps priority and the marker is left in place for the browser's actual
-    continuation dispatch (text == continuation_prompt verbatim).
+    keeps priority and the record is left in place for the browser's actual
+    continuation dispatch.
+
+    Round 2 (maintainer review): the comparison runs over the CANONICAL
+    SEMANTIC text, not the transport-decorated wire message — the browser
+    prepends the `/use` forced-skill directive + envelope (static/messages.js
+    ``send()``) before POSTing, so a raw exact compare fails legitimate
+    continuations. Marker, prompt and expiry are one record in api.goals; the
+    admission check delegates there so check + drop stay atomic.
     """
-    if session_id not in PENDING_GOAL_CONTINUATION:
-        return False
-    expected = PENDING_GOAL_CONTINUATION_PROMPTS.get(session_id)
-    if expected is not None and msg.strip() == expected.strip():
-        PENDING_GOAL_CONTINUATION.discard(session_id)
-        PENDING_GOAL_CONTINUATION_PROMPTS.pop(session_id, None)
-        return True
-    # Fail closed: marker without recorded prompt (legacy/abnormal state)
-    # or non-matching text must not be consumed.
-    return False
+    from api.goals import consume_pending_goal_continuation
+
+    return consume_pending_goal_continuation(session_id, msg)
 
 
 def _start_chat_stream_for_session(
@@ -25902,6 +25910,27 @@ def _handle_goal_command(handler, body):
 
     if runner_goal_owned:
         return j(handler, payload)
+
+    # #6885 round 2 lifecycle: the /goal command is the natural traffic hook
+    # for record upkeep. A cleared/paused goal has no continuation coming, so
+    # any pending record for this session must not outlive it (an abandoned
+    # browser dispatch would otherwise keep the pair resident); sweeping
+    # orphaned records here bounds the rest without a background timer.
+    if goal_adapter_action in ("clear", "pause"):
+        try:
+            from api.goals import clear_pending_goal_continuation
+
+            clear_pending_goal_continuation(s.session_id)
+        except Exception:
+            logger.debug(
+                "Failed to clear pending goal continuation for %s", s.session_id, exc_info=True
+            )
+    try:
+        from api.goals import sweep_expired_goal_continuations
+
+        sweep_expired_goal_continuations()
+    except Exception:
+        logger.debug("Failed to sweep expired goal continuations", exc_info=True)
 
     kickoff_prompt = str(payload.get("kickoff_prompt") or "").strip()
     if kickoff_prompt:

@@ -15,8 +15,6 @@ from typing import Any
 from api.config import (
     AGENT_INSTANCES,
     CANCEL_FLAGS,
-    PENDING_GOAL_CONTINUATION,
-    PENDING_GOAL_CONTINUATION_PROMPTS,
     STREAM_GOAL_RELATED,
     STREAMS,
     STREAMS_LOCK,
@@ -1716,7 +1714,11 @@ def _run_gateway_chat_streaming(
                 logger.debug("Failed to append completed turn journal event", exc_info=True)
             success_writeback_committed = True
         try:
-            from api.goals import evaluate_goal_after_turn, has_active_goal
+            from api.goals import (
+                evaluate_goal_after_turn,
+                has_active_goal,
+                register_pending_goal_continuation,
+            )
             from api.profiles import get_hermes_home_for_profile
 
             profile_home = get_hermes_home_for_profile(getattr(s, "profile", None))
@@ -1748,8 +1750,12 @@ def _run_gateway_chat_streaming(
                 if decision.get("should_continue"):
                     continuation_prompt = str(decision.get("continuation_prompt") or "").strip()
                     if continuation_prompt:
-                        PENDING_GOAL_CONTINUATION.add(session_id)
-                        PENDING_GOAL_CONTINUATION_PROMPTS[session_id] = continuation_prompt
+                        # #1932 + #6885: one record (marker + prompt + expiry);
+                        # the SSE event fires only when the record landed so the
+                        # frontend queue and the server record cannot disagree.
+                        if not register_pending_goal_continuation(session_id, continuation_prompt):
+                            continuation_prompt = ""
+                    if continuation_prompt:
                         put_gateway_event("goal_continue", {
                             "session_id": session_id,
                             "continuation_prompt": continuation_prompt,
