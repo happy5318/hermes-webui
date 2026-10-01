@@ -1657,6 +1657,33 @@ def profile_scope_for_active_request(
             _tls.profile = previous_tls
 
 
+def detached_worker_bind_root_for_profile(profile_name: str | None) -> bool:
+    """True when *profile_name* is a default/root key under a NAMED process profile.
+
+    ``profile_scope_for_detached_worker`` no-ops for a root/default scope, on
+    the assumption that the process defaults to root. That assumption fails
+    whenever the PROCESS-level active profile is a NAMED one (a per-client
+    request for ``default`` while the server runs on e.g. ``work``): the
+    scope would then let the thread resolve the named process profile. Call
+    sites that accept a session/profile name of ``default`` must pass this as
+    ``bind_root`` so the root profile is pinned explicitly (#7724).
+    """
+    try:
+        key = str(profile_name or "").strip()
+        if not key or _is_root_profile(key):
+            try:
+                process_profile = str(
+                    getattr(sys.modules[__name__], "_active_profile", "default")
+                    or "default"
+                ).strip()
+                return bool(process_profile) and not _is_root_profile(process_profile)
+            except Exception:
+                return False
+    except Exception:
+        return False
+    return False
+
+
 @contextmanager
 def profile_scope_for_detached_worker(
     profile_name,
