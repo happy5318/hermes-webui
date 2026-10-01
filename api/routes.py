@@ -664,7 +664,17 @@ def _session_id_visible_to_request_profile(handler, sid, *, emit_error: bool = T
     except KeyError:
         return True
     session_profile = getattr(session, "profile", None) or None
-    if not _session_visible_to_active_profile(session_profile, handler, profile=profile):
+    # #7826: pass the request-scoped benchmark ONLY when the caller supplied
+    # one. Forwarding ``profile=None`` on every call would hand a keyword
+    # argument to every existing stand-in for this helper across the test
+    # suite, and a ``lambda *args: True`` mock rejects unexpected keywords.
+    # The absent case is exactly the pre-#7826 call shape.
+    _visible = (
+        _session_visible_to_active_profile(session_profile, handler, profile=profile)
+        if profile
+        else _session_visible_to_active_profile(session_profile, handler)
+    )
+    if not _visible:
         if emit_error:
             if session_profile:
                 j(handler, {
