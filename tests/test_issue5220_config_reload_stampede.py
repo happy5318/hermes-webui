@@ -126,6 +126,21 @@ def test_stale_model_readers_collapse_to_single_reload_when_models_are_requested
     config._cfg_mtime = old_mtime - 1.0
     config.invalidate_models_cache()
 
+    # Hermeticity guard (#7724 shard flake). ``_cfg_has_in_memory_overrides()``
+    # returns True whenever the module-level ``cfg`` no longer aliases
+    # ``_cfg_cache`` — the exact residue a sibling test in the same shard leaves
+    # behind if its monkeypatch teardown ordering goes wrong, or an unrelated
+    # test reloads api.config while ``cfg`` is rebound. When that happens the
+    # cold-path mtime gate at the top of get_available_models() short-circuits
+    # `reload_config_if_stale()` (override wins over the stale mtime), leaving
+    # `_cfg_mtime` stale, so the in-lock `_cfg_changed` branch calls the mocked
+    # `reload_config()` and this test fails for a reason that has nothing to do
+    # with the behaviour under test. Re-alias ``cfg`` on ``_cfg_cache`` (and
+    # re-stamp the fingerprint to the current cache) so the gate sees a clean
+    # module state and only a genuine re-entrant refresh can trip the sentinel.
+    config.cfg = config._cfg_cache
+    config._cfg_fingerprint = config._fingerprint_config(config._cfg_cache)
+
     calls = {"n": 0}
     calls_lock = threading.Lock()
     real_refresh = config._refresh_config_cache
