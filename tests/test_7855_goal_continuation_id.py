@@ -185,7 +185,7 @@ class TestEditedAndCombinedAreAdmitted:
     def test_combined_pure_user_messages_stay_ordinary(self):
         """A combine of entries that carry no continuation ID must NOT be
         admitted: the #6885 distinction survives the queue path."""
-        cont_id = _register("s-combine2", "step 2")
+        _register("s-combine2", "step 2")
         # The user combines two entries that are not the continuation — the
         # merged entry has no ID (ui.js keeps the FIRST id, which is absent).
         assert consume_pending_goal_continuation("s-combine2", "hello\n\nworld") is False

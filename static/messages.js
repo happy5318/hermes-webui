@@ -2275,7 +2275,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   let _latestGoalStatus=null;
   let _pendingGoalContinuation=null;
   // #7855: the continuation ID of the queue entry currently being drained by
-  // setBusy()'s drain path. send() consumes it into the /api/chat/start body
+  // the setBusy() drain path. send() consumes it into the /api/chat/start body
   // and clears it immediately, so it applies to exactly one turn and cannot
   // leak into a later genuine user message.
   let _drainingGoalContinuationId='';
@@ -6236,7 +6236,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         if(!continuation_prompt||sid!==activeSid)return;
         _applyToAnchor('goal_continue',d,e);
         const _modelState=_chatPayloadModelState();
-        // #7855: the server's continuation ID — not the prompt text — is what
+        // #7855: the server continuation ID — not the prompt text — is what
         // admits this turn later, so carry it on the queued entry through
         // inline edits and combines. An edited/combined/late continuation
         // keeps its ID and keeps the goal; a genuine user message has none.
