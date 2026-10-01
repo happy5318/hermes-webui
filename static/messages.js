@@ -1503,8 +1503,8 @@ async function send(){
   if(typeof shouldInterceptCompressionRecoveryContinuation==='function'&&shouldInterceptCompressionRecoveryContinuation(text,S.pendingFiles)){
     if(typeof showCompressionRecoveryContinuationHint==='function') showCompressionRecoveryContinuationHint();
     // Release the lock AND its continuation token together — this early return
-    // bypasses the finally block, so a leftover token would be carried into the
-    // NEXT send's requeue.
+    // skips the block that clears them, so a leftover token would be carried
+    // into the NEXT send's requeue.
     _sendInProgress=false;_sendInProgressSid=null;_sendInProgressGoalContinuationId='';
     return;
   }
