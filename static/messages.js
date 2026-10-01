@@ -32,6 +32,18 @@ const _BG_TASK_COMPLETE_TTL_MS = 60000;
 const _BG_TASK_COMPLETE_CAP = 256;
 const _bgTaskCompleteSeenIds = new Map();
 
+// #7855: module-scope record of the goal continuation currently being drained
+// from the queue. The drain path (static/ui.js) hands the ID to send(), which
+// posts it with /api/chat/start and clears it immediately, so it applies to
+// exactly one turn and cannot leak into a later genuine user message.
+// Module scope is REQUIRED: send() and the drain live in sibling top-level
+// scopes — a nested `let` throws ReferenceError on every ordinary send (#7855
+// round 3: BRICK), and a nested setter stays behind a permanently-false
+// `typeof` guard on the writer side.
+let _drainingGoalContinuationId='';
+function _setDrainingGoalContinuationId(id){_drainingGoalContinuationId=String(id||'').trim();}
+function _readDrainingGoalContinuationId(){return _drainingGoalContinuationId;}
+
 function _bgTaskCompleteRingBufferAdd(sid, evt_id) {
   // Missing key → treat as "seen/skip" (return true). The sole caller already
   // guards with `if (!evt_id) return;` before invoking this, so this branch is
@@ -1395,7 +1407,18 @@ async function send(){
     const _targetSid=_sendInProgressSid||(S.session&&S.session.session_id);
     if(_text && _targetSid){
       const _modelState=_chatPayloadModelState();
-      queueSessionMessage(_targetSid,{text:_text,files:[...S.pendingFiles],model:_modelState.model,model_provider:_modelState.model_provider,profile:S.activeProfile||'default'});
+      // #7855: if the in-flight send is a goal-continuation drain, this
+      // re-queue happens while that drain's ID is still held. Carry it on the
+      // entry so the continuation survives the requeue — otherwise the entry
+      // goes back as a pure user message and the goal continuation is lost.
+      // send() clears the ID when the requeued entry finally drains, so it
+      // still applies to exactly one turn.
+      const _drainContId=(typeof _readDrainingGoalContinuationId==='function')
+        ? _readDrainingGoalContinuationId()
+        : '';
+      const _requeueEntry={text:_text,files:[...S.pendingFiles],model:_modelState.model,model_provider:_modelState.model_provider,profile:S.activeProfile||'default'};
+      if(_drainContId) _requeueEntry.goal_continuation_id=_drainContId;
+      queueSessionMessage(_targetSid,_requeueEntry);
       _clearComposerAfterQueuedSelectionSend();
       if(_targetSid&&typeof _clearComposerDraft==='function'&&_targetSid!==(S.session&&S.session.session_id)) _clearComposerDraft(_targetSid,_text,S.pendingFiles?[...S.pendingFiles]:[]);
       S.pendingFiles=[];renderTray();
@@ -2274,12 +2297,6 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   let visibleInterimSnippets=[];
   let _latestGoalStatus=null;
   let _pendingGoalContinuation=null;
-  // #7855: the continuation ID of the queue entry currently being drained by
-  // the setBusy() drain path. send() consumes it into the /api/chat/start body
-  // and clears it immediately, so it applies to exactly one turn and cannot
-  // leak into a later genuine user message.
-  let _drainingGoalContinuationId='';
-  function _setDrainingGoalContinuationId(id){_drainingGoalContinuationId=String(id||'').trim();}
   let assistantRow=null;
   let assistantBody=null;
   // On reconnect with recorded burst anchors, the rendered DOM has multiple

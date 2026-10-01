@@ -2055,6 +2055,8 @@ async function newSession(flash, options={}){
       _clearEmptyComposerModelOverride();
     }
     S.session=data.session;if(typeof _adoptRegenerationRevision==='function') _adoptRegenerationRevision(data.session);S.messages=data.session.messages||[];
+    // #7855: a brand-new session starts with a clean one-shot drain slot.
+    if(typeof _setDrainingGoalContinuationId==='function') _setDrainingGoalContinuationId('');
     S._pendingSessionToolsets=null;
     if(_sessionSourceFilter==='cli') _sessionSourceFilter='webui';
     if(typeof _hydrateTodosFromSession==='function') _hydrateTodosFromSession(S.session);
@@ -2535,6 +2537,11 @@ async function loadSession(sid){
   S.session=data.session;
   if(typeof _adoptRegenerationRevision==='function') _adoptRegenerationRevision(data.session);
   if(typeof _clearEmptyComposerModelOverride==='function') _clearEmptyComposerModelOverride();
+  // #7855: a session switch is a hard context boundary — drop any one-shot
+  // goal-continuation drain ID left over from the previous session's queue
+  // (restored-but-never-sent, or a drain abandoned mid-settle) so it cannot
+  // attach to the next send in this session.
+  if(typeof _setDrainingGoalContinuationId==='function') _setDrainingGoalContinuationId('');
   // Loading a real existing session abandons any pre-session toolset override
   // staged on the empty composer before any deferred refresh work runs.
   S._pendingSessionToolsets=null;
@@ -2834,6 +2841,16 @@ async function loadSession(sid){
             const _msg=$&&$('msg');
             if(_msg&&_first.text&&!_msg.value){
               _msg.value=_first.text||'';
+              // #7855: the restored entry keeps its continuation ID across the
+              // refresh — the server admits a goal continuation ONLY by id, so
+              // dropping it here silently converts the restored continuation
+              // into an ordinary user message and the goal is lost. Hand the ID
+              // to the one-shot drain slot so the user's manual send of the
+              // restored text carries it (send() clears it after posting, so a
+              // later genuine message is unaffected).
+              if(typeof _setDrainingGoalContinuationId==='function'){
+                _setDrainingGoalContinuationId(_first.goal_continuation_id||'');
+              }
               if(typeof autoResize==='function') autoResize();
               if(typeof showToast==='function') showToast((_fresh.length>1?`${_fresh.length} queued messages restored (showing first)`:'Queued message restored')+' — review and send when ready');
             }
