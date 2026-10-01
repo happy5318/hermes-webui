@@ -330,3 +330,29 @@ class TestProductionShapedDispatch:
         register_pending_goal_continuation("s1", "Continue step 2")
         assert consume_pending_goal_continuation("s1", "Continue step 2") is True
         assert "s1" not in PENDING_GOAL_CONTINUATION
+
+class TestQueueEditAndCombineRejection:
+    """排队编辑/合并必须被拒绝."""
+
+    def test_edited_continuation_is_rejected(self):
+        """排队中的 continuation 被编辑后发送，文本变，应被拒绝."""
+        assert register_pending_goal_continuation("s-edit", "original prompt") is True
+        edited_text = "user significantly changed this prompt"
+        assert consume_pending_goal_continuation("s-edit", edited_text) is False
+        # 原始记录保留，等待浏览器真实 dispatch
+        assert "s-edit" in PENDING_GOAL_CONTINUATION
+        assert PENDING_GOAL_CONTINUATION_PROMPTS["s-edit"]["prompt"] == "original prompt"
+
+    def test_combined_continuation_is_rejected(self):
+        """排队中的多个条目被合并后发送，文本变长，应被拒绝."""
+        assert register_pending_goal_continuation("s-combine", "step 2") is True
+        combined_text = "step 2 and then step 3 - merged by user"
+        assert consume_pending_goal_continuation("s-combine", combined_text) is False
+        assert "s-combine" in PENDING_GOAL_CONTINUATION
+        assert PENDING_GOAL_CONTINUATION_PROMPTS["s-combine"]["prompt"] == "step 2"
+
+    def test_continuation_text_must_exact_match_case_sensitive(self):
+        """Consume 是大小写敏感的：大小写不同应失败."""
+        assert register_pending_goal_continuation("s-case", "Continue the task") is True
+        assert consume_pending_goal_continuation("s-case", "continue the task") is False
+        assert "s-case" in PENDING_GOAL_CONTINUATION
