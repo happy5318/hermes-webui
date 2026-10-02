@@ -6568,7 +6568,17 @@ def _main_model_request_overrides(
     if not gate_provider:
         gate_provider = str(model_cfg.get("provider") or "").strip().lower()
         if not gate_provider:
-            _, gate_provider, _ = resolve_model_provider(gate_model)
+            # #7170 round-7+1: the caller handed us a profile-scoped snapshot
+            # (``config_data`` — the gateway/native streaming workers pass the
+            # session-owning profile's config here). A bare
+            # ``resolve_model_provider(gate_model)`` reads the module-global
+            # AMBIENT ``cfg``, so on a multi-profile instance a session whose
+            # snapshot carries no ``model.provider`` would gate its service
+            # tier against ANOTHER profile's routing. Scope the lookup to the
+            # snapshot we were given.
+            _, gate_provider, _ = resolve_model_provider(
+                gate_model, config_obj=config_data
+            )
     if _main_model_supports_service_tier(gate_model, gate_provider):
         service_tier = str(model_cfg.get("service_tier") or "").strip().lower()
         if service_tier == "priority":

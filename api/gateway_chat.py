@@ -423,9 +423,12 @@ def _gateway_session_base_url(session) -> str:
 
     Returns the resolved URL (the default ``http://127.0.0.1:8642`` counts
     as resolved) or ``""`` only when the helper could not determine the
-    session profile's home at all (a defensive failure mode the worker
-    treats identically to "no capture" and falls back to the historical
-    ``_gateway_base_url(cfg)`` path).
+    session profile's home at all. The worker treats that defensive ``""``
+    as a FAILED URL capture: the key and URL are one atomic pair, so the
+    URL falls back inside the session config snapshot (ambient
+    ``os.environ`` excluded) rather than pairing the session's key with
+    the ambient profile's gateway (round-7+1 P1, "Gateway key crosses
+    endpoints").
     """
     try:
         from api import profiles as _profiles
@@ -1354,9 +1357,12 @@ def _run_gateway_chat_streaming(
     process-active profile's key, not the session owner's — pairing the
     session's gateway URL with the ambient profile's credential either
     fails auth or sends the wrong credential to the wrong endpoint). The
-    worker prefers this captured value and only falls back to
-    ``_gateway_api_key()`` for legacy direct callers that pre-date the
-    capture.
+    worker uses the captured value verbatim — an intentionally EMPTY
+    captured key stays empty (the session profile's anonymous
+    "no Authorization header" result, issue #7074) and is NEVER replaced
+    by the ambient process key (round-7+1 P1: "empty key leaks another
+    profile credential"). Only legacy direct callers that capture NO key
+    (``None``) fall back to ``_gateway_api_key()``.
 
     ``session_base_url`` is the corresponding Gateway base URL the dispatch
     captured for the session-owning profile (greptile 2026-09-26 P1,
@@ -1365,10 +1371,13 @@ def _run_gateway_chat_streaming(
     multi-profile instance holds the AMBIENT process-active profile's
     ``HERMES_WEBUI_GATEWAY_BASE_URL`` — pairing that with the session's
     captured API key either fails auth or sends the session profile's
-    bearer token to the wrong gateway). The worker prefers the captured
-    value and only falls back to ``_gateway_base_url(cfg)`` for legacy
-    direct callers that pre-date the capture (or when the helper returned
-    the empty string on a defensive failure).
+    bearer token to the wrong gateway). The captured key and URL are one
+    atomic pair: once either half is captured both halves come from the
+    session-owned profile, so a defensive empty URL capture falls back to
+    the SESSION config snapshot's own URL (``_gateway_base_url(cfg,
+    environ={})``, ambient env excluded), never the ambient env URL. Only
+    legacy direct callers that capture NO pair keep the historical
+    ``_gateway_base_url(cfg)`` path.
     """
     q = peek_stream(stream_id)
     if q is None:
@@ -1478,24 +1487,32 @@ def _run_gateway_chat_streaming(
         # either fails auth or sends the wrong credential to the wrong
         # endpoint. Legacy direct callers that pre-date the dispatch capture
         # pass ``session_api_key=None`` and fall through to the env read.
-        if isinstance(session_api_key, str) and session_api_key:
-            _api_key = session_api_key
+        #
+        # The captured key and URL are ONE atomic pair (round-7+1 greptile
+        # P1, 2026-09-27): the dispatch always captures both halves together,
+        # and each half may legitimately be empty — an empty ``session_api_key``
+        # is the session profile's intentional "no Authorization header"
+        # result (issue #7074 anonymous gateways), NOT a licence to fall back
+        # to the ambient process-env key, and a failed URL capture must never
+        # pair the captured key with the ambient env URL. So once EITHER half
+        # was captured (is a str), BOTH halves must come from the session-owned
+        # profile: the key verbatim (empty stays empty) and the URL from the
+        # capture or, failing that, from the SESSION config snapshot with the
+        # ambient ``os.environ`` explicitly excluded. Only when NEITHER half
+        # was captured (``None`` from a legacy direct caller with no profile
+        # scope) do we keep the historical ambient-env pair.
+        if isinstance(session_api_key, str) or isinstance(session_base_url, str):
+            _api_key = session_api_key if isinstance(session_api_key, str) else ""
+            if isinstance(session_base_url, str) and session_base_url:
+                _base_url = session_base_url
+            else:
+                # Same-profile fallback: the session snapshot's own configured
+                # gateway URL (or its default) — ambient ``os.environ`` is
+                # explicitly excluded so the session profile's key can never
+                # be sent to the ambient profile's gateway.
+                _base_url = _gateway_base_url(cfg, environ={})
         else:
             _api_key = _gateway_api_key()
-        # #7170 round-7 follow-up (greptile 2026-09-26 P1 "Gateway key crosses
-        # endpoints"): prefer the dispatch-captured session base URL (read on
-        # the request thread from the session-owning profile's env, with the
-        # loaded profile env stripped) over ``_gateway_base_url(cfg)``, which
-        # reads ``os.environ`` first and on a multi-profile instance holds the
-        # AMBIENT process-active profile's URL — pairing that with the
-        # session's captured api key either fails auth or sends the session
-        # profile's bearer token to the wrong gateway. Legacy direct callers
-        # that pre-date the capture pass ``session_base_url=None`` (or the
-        # helper returned "" on a defensive failure) and fall through to the
-        # historical ``_gateway_base_url(cfg)`` path.
-        if isinstance(session_base_url, str) and session_base_url:
-            _base_url = session_base_url
-        else:
             _base_url = _gateway_base_url(cfg)
         base_url, api_key = reattach_endpoint or (_base_url, _api_key)
         with _STREAM_RUN_STARTING_CONDITION:
