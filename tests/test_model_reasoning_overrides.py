@@ -227,3 +227,135 @@ def test_fallback_reasoning_override_bidirectional_dot_dash_matching(monkeypatch
     ) == "high"
 
 
+
+
+def test_fallback_slash_qualified_model_matches_bare_override(monkeypatch):
+    """Fix #1: a slash-qualified model id must match a BARE override key when
+    the companion core resolver is unavailable.
+
+    Reviewer repro (r3): model ``openai/gpt-5.4-mini`` with bare override
+    ``gpt-5.4-mini: low`` and global ``high`` resolved ``high`` on all three
+    paths — the fallback built ``@prov:model`` bare-tail candidates but never
+    slash-suffix candidates, so the override was silently dropped.
+    """
+    import sys
+    monkeypatch.setitem(sys.modules, "hermes_constants", None)
+
+    config_data = {
+        "agent": {
+            "reasoning_effort": "high",
+            "reasoning_overrides": {"gpt-5.4-mini": "low"},
+        },
+    }
+
+    # Native / shared config resolver
+    assert cfg.configured_reasoning_effort_for_model(
+        config_data, model_id="openai/gpt-5.4-mini",
+    ) == "low"
+
+    # Gateway path
+    assert gateway_chat._gateway_reasoning_effort_for_request(
+        config_data, model="openai/gpt-5.4-mini", model_provider="openai",
+    ) == "low"
+
+    # Status path (same chokepoint, provider hint supplied)
+    assert cfg.configured_reasoning_effort_for_model(
+        config_data, model_id="openai/gpt-5.4-mini", provider_id="openai",
+    ) == "low"
+
+    # Aggregator-qualified ids (3+ segments) must resolve too.
+    assert cfg.configured_reasoning_effort_for_model(
+        config_data, model_id="openrouter/openai/gpt-5.4-mini",
+    ) == "low"
+
+    # A full-id override must still outrank a bare-tail one.
+    config_full_wins = {
+        "agent": {
+            "reasoning_effort": "high",
+            "reasoning_overrides": {
+                "openai/gpt-5.4-mini": "minimal",
+                "gpt-5.4-mini": "low",
+            },
+        },
+    }
+    assert cfg.configured_reasoning_effort_for_model(
+        config_full_wins, model_id="openai/gpt-5.4-mini",
+    ) == "minimal"
+
+    # An unmatched slash-qualified model still retains the global effort.
+    assert cfg.configured_reasoning_effort_for_model(
+        config_data, model_id="openai/some-other-model",
+    ) == "high"
+
+
+def test_fallback_boolean_false_override_disables_reasoning(monkeypatch):
+    """Fix #2: the fallback must treat a YAML boolean ``false`` (and the
+    ``"false"``/``"disabled"`` spellings) as *reasoning disabled*, matching core.
+
+    Reviewer repro (r3): a matching override value of boolean ``False`` produced
+    native ``{"enabled": True, "effort": "high"}`` and Gateway/status ``high``
+    — the explicit disable was ignored because this module's
+    ``parse_reasoning_effort()`` returns ``None`` for a bool.
+    """
+    import sys
+    monkeypatch.setitem(sys.modules, "hermes_constants", None)
+
+    # Boolean False — YAML ``reasoning_overrides: {some-model: false}``
+    cfg_bool = {
+        "agent": {
+            "reasoning_effort": "high",
+            "reasoning_overrides": {"some-model": False},
+        },
+    }
+    assert cfg.configured_reasoning_effort_for_model(
+        cfg_bool, model_id="some-model",
+    ) == "none"
+    assert gateway_chat._gateway_reasoning_effort_for_request(
+        cfg_bool, model="some-model", model_provider="openai",
+    ) == "none"
+
+    # String spellings core also treats as disabled.
+    for spelling in ("false", "disabled", "none", "FALSE", " Disabled "):
+        cfg_str = {
+            "agent": {
+                "reasoning_effort": "high",
+                "reasoning_overrides": {"some-model": spelling},
+            },
+        }
+        assert cfg.configured_reasoning_effort_for_model(
+            cfg_str, model_id="some-model",
+        ) == "none", f"spelling {spelling!r} must disable reasoning"
+
+    # Boolean True is NOT a disable and must not be parsed as an effort; the
+    # global effort is retained (core returns None for True).
+    cfg_true = {
+        "agent": {
+            "reasoning_effort": "high",
+            "reasoning_overrides": {"some-model": True},
+        },
+    }
+    assert cfg.configured_reasoning_effort_for_model(
+        cfg_true, model_id="some-model",
+    ) == "high"
+
+    # The disable must also resolve through the dot→dash canonical branch.
+    cfg_canon = {
+        "agent": {
+            "reasoning_effort": "high",
+            "reasoning_overrides": {"claude-opus-4.5": False},
+        },
+    }
+    assert cfg.configured_reasoning_effort_for_model(
+        cfg_canon, model_id="claude-opus-4-5",
+    ) == "none"
+
+    # And for a slash-qualified model matching a bare boolean-false override.
+    cfg_slash = {
+        "agent": {
+            "reasoning_effort": "high",
+            "reasoning_overrides": {"gpt-5.4-mini": False},
+        },
+    }
+    assert cfg.configured_reasoning_effort_for_model(
+        cfg_slash, model_id="openai/gpt-5.4-mini",
+    ) == "none"
