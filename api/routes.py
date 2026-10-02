@@ -24860,6 +24860,7 @@ def _start_chat_stream_for_session(
                         # profile instead.
                         from api.gateway_chat import (
                             _gateway_session_api_key,
+                            _gateway_session_base_url,
                             _gateway_session_owner_cfg,
                         )
 
@@ -24875,6 +24876,19 @@ def _start_chat_stream_for_session(
                         # the surrounding launch try/except, which already runs the
                         # same cleanup contract as a thread-start failure.
                         worker_kwargs["session_api_key"] = _gateway_session_api_key(s)
+                        # #7170 round-7 follow-up (greptile 2026-09-26 P1
+                        # "Gateway key crosses endpoints"): capture the
+                        # session-owning profile's Gateway base URL on this same
+                        # request thread. ``_gateway_base_url`` reads
+                        # ``os.environ`` first, which holds the AMBIENT
+                        # process-active profile's
+                        # ``HERMES_WEBUI_GATEWAY_BASE_URL`` — pairing that with the
+                        # session's captured API key either fails auth or sends the
+                        # session profile's bearer token to the wrong gateway. The
+                        # worker prefers the captured ``session_base_url`` and only
+                        # falls back to ``_gateway_base_url(cfg)`` for legacy
+                        # direct callers.
+                        worker_kwargs["session_base_url"] = _gateway_session_base_url(s)
                     thr = threading.Thread(
                         target=worker_target,
                         args=(s.session_id, msg, model, workspace, stream_id, attachments),
