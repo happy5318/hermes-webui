@@ -141,6 +141,51 @@ def test_stale_model_readers_collapse_to_single_reload_when_models_are_requested
     config.cfg = config._cfg_cache
     config._cfg_fingerprint = config._fingerprint_config(config._cfg_cache)
 
+    # ── CI diagnostics (#7724 shard flake) ──────────────────────────────────
+    # The sentinel below only fires when get_available_models() reaches
+    # `if _cfg_changed: reload_config()` in its cold path. `_cfg_changed` is
+    # computed from the *disk* mtime of _get_config_path(), which this test
+    # never touches — so _cfg_changed is only avoidable when the entry
+    # reload_config_if_stale() re-stamps _cfg_mtime. When it does not, the
+    # reason must be visible in the gate condition itself, so record it.
+    _diag_state = {
+        "threads": [],
+        "samples": 0,
+        "gate": None,
+        "real_mtime_at_setup": None,
+    }
+    try:
+        _diag_state["real_mtime_at_setup"] = config_path.stat().st_mtime
+    except OSError:
+        _diag_state["real_mtime_at_setup"] = 0.0
+
+    def _record_gate() -> None:
+        """Capture the cold-path gate inputs before arming the sentinel."""
+        try:
+            _p = config._get_config_path()
+            _disk = _p.stat().st_mtime
+        except OSError:
+            try:
+                _p = config._get_config_path()
+            except Exception:
+                _p = None
+            _disk = 0.0
+        _diag_state["gate"] = {
+            "path": str(_p),
+            "disk_mtime": _disk,
+            "cfg_mtime": config._cfg_mtime,
+            "cfg_path": str(config._cfg_path),
+            "same_path": _p == config._cfg_path,
+            "overrides": config._cfg_has_in_memory_overrides(),
+            "cache_alias_ok": config.cfg is config._cfg_cache,
+            "cfg_fingerprint_matches": (
+                config._cfg_fingerprint is not None
+                and config._fingerprint_config(config._cfg_cache) == config._cfg_fingerprint
+            ),
+        }
+
+    _record_gate()
+
     calls = {"n": 0}
     calls_lock = threading.Lock()
     real_refresh = config._refresh_config_cache
@@ -154,6 +199,12 @@ def test_stale_model_readers_collapse_to_single_reload_when_models_are_requested
         return real_refresh(path)
 
     def _unexpected_reload():
+        print(
+            "[5220-DIAG] reload_config() reached! gate=%r real_mtime_at_setup=%r"
+            % (_diag_state.get("gate"), _diag_state.get("real_mtime_at_setup")),
+            file=sys.stderr,
+            flush=True,
+        )
         raise AssertionError(
             "stale model readers should route through reload_config_if_stale() instead of forced reload_config()"
         )
