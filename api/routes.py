@@ -24858,8 +24858,23 @@ def _start_chat_stream_for_session(
                         # config itself — a detached thread has no per-request
                         # profile context and would read the process-global
                         # profile instead.
-                        from api.gateway_chat import _gateway_session_owner_cfg
+                        from api.gateway_chat import (
+                            _gateway_session_api_key,
+                            _gateway_session_owner_cfg,
+                        )
+
                         worker_kwargs["session_cfg"] = _gateway_session_owner_cfg(s)
+                        # #7170 round-7 P1: capture the session-owning profile's
+                        # Gateway API key on this same request thread.
+                        # ``_gateway_api_key()`` reads ``os.environ``, which holds
+                        # the AMBIENT process-active profile's key — pairing that
+                        # with the session's gateway URL either fails auth or sends
+                        # the wrong credential to the wrong endpoint. The worker
+                        # prefers the captured value and only falls back to the env
+                        # read for legacy direct callers. A failure here lands in
+                        # the surrounding launch try/except, which already runs the
+                        # same cleanup contract as a thread-start failure.
+                        worker_kwargs["session_api_key"] = _gateway_session_api_key(s)
                     thr = threading.Thread(
                         target=worker_target,
                         args=(s.session_id, msg, model, workspace, stream_id, attachments),
