@@ -95,19 +95,25 @@ def test_gateway_reasoning_effort_probes_provider_endpoint_not_gateway(monkeypat
     capability endpoint made ``resolve_model_reasoning_efforts()`` probe the
     Gateway as though it were LM Studio, coercing the configured override
     against the wrong capability set.
+
+    The endpoint is now read from the DISPATCHED snapshot the gateway worker
+    is handed (``config_data``), not from the ambient module-global ``cfg`` —
+    the two must be the same dict here so the probe target is unambiguous.
+    (#7170 round-6: coercion threads the profile config end-to-end.)
     """
     gateway_url = "http://127.0.0.1:8642"
     lmstudio_url = "http://192.168.1.50:1234/v1"
 
-    # Configured LM Studio endpoint, distinct from the Gateway transport.
-    monkeypatch.setitem(cfg.cfg, "providers", {"lmstudio": {"base_url": lmstudio_url}})
     # LM Studio advertises a ladder that tops out below the configured "max".
     seen = _install_lmstudio_probe_recorder(
         monkeypatch, options=["low", "medium", "high"]
     )
 
+    # The dispatched session-profile snapshot carries the configured LM Studio
+    # endpoint, distinct from the Gateway transport address.
     config_data = {
         "webui_gateway_base_url": gateway_url,
+        "providers": {"lmstudio": {"base_url": lmstudio_url}},
         "agent": {
             "reasoning_effort": "low",
             "reasoning_overrides": {"local-thinker": "max"},
@@ -127,6 +133,57 @@ def test_gateway_reasoning_effort_probes_provider_endpoint_not_gateway(monkeypat
     )
     assert normalized == [cfg._normalize_base_url_for_match(lmstudio_url)]
     # The per-model "max" override must clamp down to the probed ceiling.
+    assert effort == "high"
+
+
+def test_gateway_reasoning_effort_probe_uses_dispatched_snapshot_not_ambient(
+    monkeypatch,
+):
+    """The LM Studio probe target comes from the dispatched snapshot only.
+
+    Two profiles, both with a ``local-thinker`` override, but different LM
+    Studio endpoints and ladders. The dispatched snapshot must decide which
+    ladder the configured effort is clamped against — the ambient process
+    profile must not get a vote. (#7170 round-6)
+    """
+    ambient_url = "http://profile-a-host:1234/v1"
+    dispatched_url = "http://profile-b-host:1234/v1"
+    ambient_key = "key-profile-a"
+    dispatched_key = "key-profile-b"
+
+    # Ambient cfg: a ladder that tops out at "low" (would clamp "high"->"low").
+    monkeypatch.setattr(
+        cfg,
+        "cfg",
+        {
+            "model": {"provider": "lmstudio", "base_url": ambient_url, "api_key": ambient_key},
+            "providers": {"lmstudio": {"base_url": ambient_url, "api_key": ambient_key}},
+        },
+        raising=True,
+    )
+    seen = _install_lmstudio_probe_recorder(monkeypatch, options=["low", "high"])
+
+    dispatched = {
+        "model": {
+            "provider": "lmstudio",
+            "base_url": dispatched_url,
+            "api_key": dispatched_key,
+        },
+        "providers": {"lmstudio": {"base_url": dispatched_url, "api_key": dispatched_key}},
+        "agent": {"reasoning_effort": "low", "reasoning_overrides": {"local-thinker": "high"}},
+    }
+
+    effort = gateway_chat._gateway_reasoning_effort_for_request(
+        dispatched, model="local-thinker", model_provider="lmstudio"
+    )
+
+    assert seen, "LM Studio capability probe was never invoked"
+    last = seen[-1]
+    assert cfg._normalize_base_url_for_match(last) == cfg._normalize_base_url_for_match(
+        dispatched_url
+    ), f"probe hit the ambient profile's endpoint instead: {seen}"
+    # Dispatched ladder allows "high"; the ambient ["low"] ladder would have
+    # clamped it down to "low".
     assert effort == "high"
 
 
