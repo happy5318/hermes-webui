@@ -220,3 +220,105 @@ def test_scripts_list_endpoint_handles_missing_name_query():
     # Both endpoints must be guarded.
     assert "name query parameter is required" in routes_src
     assert "script not found" in routes_src
+
+
+# ── #7685 review: containment boundaries ───────────────────────────────
+
+
+def test_list_skips_symlink_pointing_outside_the_directory(scripts_module, tmp_path):
+    """Finding 1: discovery must contain BEFORE reading preview metadata.
+
+    A ``.py`` symlink inside ``scripts/`` whose target lives outside the
+    directory used to be listed with the TARGET's description — an
+    information leak across the containment boundary.
+    """
+    mod, scripts_dir = scripts_module
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.py").write_text(
+        '"""OUTSIDE-SECRET-DESCRIPTION."""\n', encoding="utf-8"
+    )
+    (scripts_dir / "escape.py").symlink_to(outside / "secret.py")
+    (scripts_dir / "legit.py").write_text('"""legit."""\n', encoding="utf-8")
+
+    result = mod.list_scripts()
+    names = [e["name"] for e in result["scripts"]]
+    assert "legit.py" in names
+    assert "escape.py" not in names, (
+        "a symlink escaping the scripts directory must not be listed"
+    )
+    assert "OUTSIDE-SECRET-DESCRIPTION" not in str(result)
+
+
+def test_read_script_refuses_a_symlink_escape(scripts_module, tmp_path):
+    """The read path must refuse the same escape rather than inline it."""
+    mod, scripts_dir = scripts_module
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.py").write_text("OUTSIDE-CONTENT\n", encoding="utf-8")
+    (scripts_dir / "escape.py").symlink_to(outside / "secret.py")
+
+    assert mod.read_script("escape.py") is None
+    assert "OUTSIDE-CONTENT" not in str(mod.read_script("escape.py"))
+
+
+def test_read_script_refuses_an_absolute_or_traversal_name(scripts_module):
+    mod, scripts_dir = scripts_module
+    (scripts_dir / "ok.py").write_text("x = 1\n", encoding="utf-8")
+    for bad in ("../outside.py", "/etc/passwd", "..", ".", "sub/dir.py", "a\\b"):
+        assert mod.read_script(bad) is None, bad
+
+
+def test_read_script_keeps_the_size_cap_when_the_file_grows(scripts_module):
+    """Finding 2: the cap must hold at physical I/O.
+
+    The old code stat'ed the size and then read by name, so a file that
+    grew between the two returned over-cap content flagged
+    ``too_large: false``. The descriptor-based read is bounded, so the
+    response is either capped content or an honest oversize refusal.
+    """
+    mod, scripts_dir = scripts_module
+    target = scripts_dir / "big.py"
+    target.write_text("a = 1\n", encoding="utf-8")
+    result = mod.read_script("big.py")
+    assert result is not None and result["too_large"] is False
+    assert result["size"] == len("a = 1\n")
+
+    # Grow past the cap: the reader must not hand back more than the cap.
+    target.write_text("x" * (mod._MAX_SCRIPT_BYTES + 4096), encoding="utf-8")
+    grown = mod.read_script("big.py")
+    assert grown is not None
+    assert grown["size"] == mod._MAX_SCRIPT_BYTES + 4096
+    if grown.get("too_large"):
+        assert "content" not in grown
+    else:
+        assert len(grown["content"]) <= mod._MAX_SCRIPT_BYTES, (
+            "a grown file must never return more than the cap as content"
+        )
+
+
+def test_read_script_oversize_is_refused_without_content(scripts_module):
+    mod, scripts_dir = scripts_module
+    (scripts_dir / "huge.py").write_text(
+        "y" * (mod._MAX_SCRIPT_BYTES + 1), encoding="utf-8"
+    )
+    result = mod.read_script("huge.py")
+    assert result == {
+        "name": "huge.py",
+        "too_large": True,
+        "size": mod._MAX_SCRIPT_BYTES + 1,
+    }
+
+
+def test_list_and_read_do_not_leak_descriptors(scripts_module):
+    """Every acquisition path closes its fd (the reviewer asked for this)."""
+    mod, scripts_dir = scripts_module
+    for i in range(20):
+        (scripts_dir / f"s{i}.py").write_text(f'"""{i}."""\n', encoding="utf-8")
+    mod.list_scripts()
+    for i in range(20):
+        assert mod.read_script(f"s{i}.py") is not None
+    # A missing name and an invalid name must also not leave an fd behind;
+    # both return cleanly.
+    assert mod.read_script("nope.py") is None
+    assert mod.read_script("../x.py") is None
