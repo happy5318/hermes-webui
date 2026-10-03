@@ -891,6 +891,7 @@ def test_a_profile_dotenv_cannot_repoint_installation_configuration(tmp_path, mo
     # Drive the real loader: a profile .env carrying the key must leave the
     # process env untouched, and must not be recorded as a loaded key (so a
     # later restore cannot drop the operator's value either — greptile P2).
+    prev_loaded = prof._loaded_profile_env_keys
     monkeypatch.setenv("HERMES_CONFIG_PATH", str(tmp_path / "installation.yaml"))
     profile_home = tmp_path / "profiles" / "sneaky"
     profile_home.mkdir(parents=True)
@@ -900,21 +901,167 @@ def test_a_profile_dotenv_cannot_repoint_installation_configuration(tmp_path, mo
         f"HERMES_CONFIG_PATH={sneaky_cfg}\nSOME_OTHER_KEY=x\n", encoding="utf-8"
     )
 
-    prof._reload_dotenv(profile_home)
+    prev_overridden = getattr(prof, "_profile_overridden_env", {})
+    preexisting = {
+        k: os.environ.get(k)
+        for k in ("HERMES_CONFIG_PATH", "SOME_OTHER_KEY")
+    }
 
-    assert os.environ.get("HERMES_CONFIG_PATH") == str(tmp_path / "installation.yaml"), (
-        "a profile .env overwrote the installation config path"
-    )
-    assert "HERMES_CONFIG_PATH" not in (prof._loaded_profile_env_keys or set()), (
-        "the protected key was recorded as loader state, so a later profile "
-        "reload could remove the operator's value"
-    )
-    # The unrelated key is still projected, so protection is scoped to the
-    # installation-level key and does not freeze the profile's whole env.
-    assert os.environ.get("SOME_OTHER_KEY") == "x"
+    def _restore_profile_env_state():
+        prof._loaded_profile_env_keys = prev_loaded
+        prof._profile_overridden_env = prev_overridden
+        for k, v in preexisting.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    try:
+        prof._reload_dotenv(profile_home)
+
+        assert os.environ.get("HERMES_CONFIG_PATH") == str(tmp_path / "installation.yaml"), (
+            "a profile .env overwrote the installation config path"
+        )
+        assert "HERMES_CONFIG_PATH" not in (prof._loaded_profile_env_keys or set()), (
+            "the protected key was recorded as loader state, so a later profile "
+            "reload could remove the operator's value"
+        )
+        # The unrelated key is still projected, so protection is scoped to the
+        # installation-level key and does not freeze the profile's whole env.
+        assert os.environ.get("SOME_OTHER_KEY") == "x"
+    finally:
+        _restore_profile_env_state()
 
     # And the label resolver therefore cannot be steered by the profile.
     routes = _load_routes()
     installer = tmp_path / "installation.yaml"
     installer.write_text("instance_name: real-deployment\n", encoding="utf-8")
     assert routes._read_instance_label() == "real-deployment"
+
+
+# ── #7655: base-config placeholders resolve against operator env only ───────
+
+
+def test_base_config_placeholder_cannot_be_claimed_by_profile_dotenv(tmp_path, monkeypatch):
+    """#7655: an installation-scoped ``${VAR}`` placeholder must not resolve
+    against a profile's ``.env``.
+
+    ``_read_installation_config()`` expands ``${VAR}`` the way every other
+    config read does — but the ambient expander (``api.config._expand_env_vars``)
+    consults the request thread's profile env FIRST and then process env, and
+    ``api.profiles._reload_dotenv`` projects a named profile's ``.env`` into
+    process env. With base config ``instance_name: ${SLOT_NAME}`` and Alice's
+    profile ``.env`` carrying ``SLOT_NAME=AliceProfile``, the advertised
+    installation label became profile-owned — and the next process-wide
+    profile switch could change it again.
+
+    The fix resolves placeholders exclusively against operator-owned env
+    (the process env minus whatever ``_reload_dotenv`` projected), and fails
+    closed to the literal ``${VAR}`` when nothing owns the name.
+    """
+    import api.profiles as prof
+    import api.routes as routes
+
+    # Snapshot/restore the loader's globals and the keys it touches, so this
+    # test cannot influence any other test through the process env.
+    prev_loaded = prof._loaded_profile_env_keys
+    preexisting = {k: os.environ.get(k) for k in ("SLOT_NAME", "OPERATOR_SLOT")}
+
+    base = tmp_path / "hermes-home"
+    alice = base / "profiles" / "alice"
+    alice.mkdir(parents=True)
+    (base / "config.yaml").write_text(
+        yaml.safe_dump({"instance_name": "${SLOT_NAME}"}), encoding="utf-8"
+    )
+    # Alice's profile .env claims the label variable for herself.
+    (alice / ".env").write_text(
+        "SLOT_NAME=AliceProfile\nUNRELATED_PROFILE_KEY=x\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(prof, "_DEFAULT_HERMES_HOME", base)
+    monkeypatch.setenv("HERMES_CONFIG_PATH", str(base / "config.yaml"))
+    monkeypatch.delenv("HERMES_WEBUI_INSTANCE_NAME", raising=False)
+
+    try:
+        prof._reload_dotenv(alice)
+        # The profile's value IS in process env — that is the leak under test.
+        assert os.environ.get("SLOT_NAME") == "AliceProfile"
+
+        label = routes._read_instance_label()
+        assert label != "AliceProfile", (
+            "a profile .env claimed the installation-scoped label placeholder"
+        )
+        assert label == "${SLOT_NAME}", (
+            "an unowned placeholder must fail closed to its literal form, "
+            f"got {label!r}"
+        )
+
+        # ── An operator value present at launch still honours ──────────
+        os.environ["OPERATOR_SLOT"] = "prod-slot-01"
+        (base / "config.yaml").write_text(
+            yaml.safe_dump({"instance_name": "${OPERATOR_SLOT}"}), encoding="utf-8"
+        )
+        assert routes._read_instance_label() == "prod-slot-01", (
+            "an operator-owned value must still resolve, not be mistaken for "
+            "profile injection"
+        )
+
+        # ── A later profile switch must not change the operator label ───
+        bob = base / "profiles" / "bob"
+        bob.mkdir(parents=True)
+        (bob / ".env").write_text("OPERATOR_SLOT=BobProfile\n", encoding="utf-8")
+        prof._reload_dotenv(bob)
+        assert routes._read_instance_label() == "prod-slot-01", (
+            "a process-wide profile switch changed the installation label"
+        )
+    finally:
+        # Restore the loader's globals and the env values it overwrote.
+        prof._loaded_profile_env_keys = prev_loaded
+        for k, v in preexisting.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def test_base_config_placeholder_operator_value_survives_profile_key_tracking(tmp_path, monkeypatch):
+    """#7655 companion: the loader must keep tracking the profile key it
+    projected (so a later restore can drop it) WITHOUT that bookkeeping
+    becoming a denial-of-service on the operator's own value.
+
+    ``_reload_dotenv`` records every non-protected key it projected in
+    ``_loaded_profile_env_keys``; the next call pops those keys. When the
+    operator's value lives in process env from launch, a profile switch must
+    not be able to erase it — the loader only pops keys a profile .env
+    actually set.
+    """
+    import api.profiles as prof
+
+    prev_loaded = prof._loaded_profile_env_keys
+    preexisting = {k: os.environ.get(k) for k in ("OPERATOR_SLOT", "SOME_OTHER_KEY")}
+
+    base = tmp_path / "hermes-home"
+    alice = base / "profiles" / "alice"
+    alice.mkdir(parents=True)
+    (alice / ".env").write_text("SOME_OTHER_KEY=from-alice\n", encoding="utf-8")
+    monkeypatch.setattr(prof, "_DEFAULT_HERMES_HOME", base)
+    monkeypatch.setenv("OPERATOR_SLOT", "operator-value")
+
+    try:
+        prof._reload_dotenv(alice)
+        # The profile key is tracked; the operator key is not.
+        assert "SOME_OTHER_KEY" in (prof._loaded_profile_env_keys or set())
+        assert os.environ.get("SOME_OTHER_KEY") == "from-alice"
+        # Switching to a profile with no matching key pops Alice's key but
+        # leaves the operator's value intact.
+        bob = base / "profiles" / "bob"
+        bob.mkdir(parents=True)
+        prof._reload_dotenv(bob)
+        assert os.environ.get("OPERATOR_SLOT") == "operator-value"
+        assert "SOME_OTHER_KEY" not in os.environ
+    finally:
+        prof._loaded_profile_env_keys = prev_loaded
+        for k, v in preexisting.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v

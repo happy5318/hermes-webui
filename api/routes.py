@@ -13997,6 +13997,18 @@ def _read_installation_config() -> dict:
     (write-temp + rename) can never yield a torn document — the worst case
     is a parse failure that degrades to ``{}``, never a 500 on
     ``/api/settings``.
+
+    #7655: ``${VAR}`` placeholders are resolved against an
+    installation/operator-owned environment snapshot captured BEFORE any
+    profile injection. The ambient ``api.config._expand_env_vars`` resolves
+    through the thread-local profile env first and then process env, and
+    ``api.profiles._reload_dotenv`` projects a named profile's ``.env`` into
+    process env — so base-config ``instance_name: ${SLOT_NAME}`` would
+    otherwise become profile-owned (and could change again on the next
+    process-wide profile switch). An operator value that is present at
+    launch is still honoured, because the snapshot is taken before profile
+    injection. A miss fails CLOSED to the literal placeholder rather than
+    silently picking up whatever a profile left in the process env.
     """
     path = _installation_config_path()
     if path is None:
@@ -14015,19 +14027,76 @@ def _read_installation_config() -> dict:
     if not isinstance(loaded, dict):
         return {}
     # Expand ${VAR} references the way every other config read does
-    # (api.config._expand_env_vars). A raw YAML read would surface the
-    # literal placeholder: an operator deploying with
-    # ``instance_name: ${DEPLOYMENT_NAME}`` would see "${DEPLOYMENT_NAME}"
-    # in the tab title instead of the deployment name.
-    try:
-        from api.config import _expand_env_vars
-
-        loaded = _expand_env_vars(loaded)
-    except Exception:
-        # Expansion is best-effort: a lookup miss keeps the literal
-        # reference, which is still better than a 500 on /api/settings.
-        pass
+    # (api.config._expand_env_vars), but against the installation-owned env
+    # snapshot so a profile .env cannot claim the label (#7655).
+    loaded = _expand_installation_env_vars(loaded)
     return loaded if isinstance(loaded, dict) else {}
+
+
+def _expand_env_var_tree(obj, lookup):
+    """Recursively expand ``${VAR}`` in a parsed config tree.
+
+    ``lookup(name, default)`` returns the replacement for ``${name}`` or the
+    default (the literal reference) when the variable is unavailable.
+    Mirrors ``api.config._expand_env_vars`` structurally — same regex, same
+    str/dict/list recursion — so the only difference between this helper and
+    the ambient expander is WHERE the value comes from (the injected lookup),
+    which is the whole point of #7655: installation-scoped config must not
+    read the request thread's profile env.
+    """
+    if isinstance(obj, str):
+        return re.sub(
+            r"\${([^}]+)}",
+            lambda m: lookup(m.group(1), m.group(0)),
+            obj,
+        )
+    if isinstance(obj, dict):
+        return {k: _expand_env_var_tree(v, lookup) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_expand_env_var_tree(item, lookup) for item in obj]
+    return obj
+
+
+def _expand_installation_env_vars(obj):
+    """Resolve ``${VAR}`` in installation config against operator-owned env.
+
+    The snapshot is captured once, from the process env as it stood before
+    profile injection. ``api.profiles._reload_dotenv`` tracks the exact key
+    set it projected (``_loaded_profile_env_keys``) and pops those keys
+    before applying a new profile, so filtering them out leaves the
+    operator/launcher values — including keys set after startup by an
+    operator tool — and drops anything a profile contributed.
+
+    Fails closed: an unknown variable keeps its literal ``${VAR}`` form,
+    which is what an operator would see in their config file. That is
+    strictly better than adopting a profile's value and advertising another
+    profile's deployment name in the tab title.
+    """
+    profile_owned = set()
+    overridden: dict[str, str] = {}
+    try:
+        from api.profiles import _loaded_profile_env_keys, _profile_overridden_env
+
+        profile_owned = set(_loaded_profile_env_keys or set())
+        overridden = dict(_profile_overridden_env or {})
+    except Exception:
+        # Profile state unavailable (import failure, unusual boot order):
+        # fall back to the raw process env rather than refusing to expand.
+        profile_owned = set()
+        overridden = {}
+
+    def _lookup(name: str, default: str) -> str:
+        if name in profile_owned:
+            # A profile .env projected this key, so the process env value is
+            # profile-owned and must NOT reach installation-scoped config
+            # (#7655). If the profile displaced an operator value, that value
+            # is the installation-owned answer; otherwise fail closed.
+            prior = overridden.get(name)
+            return default if prior is None else prior
+        value = os.environ.get(name)
+        return default if value is None else value
+
+    return _expand_env_var_tree(obj, _lookup)
 
 
 def _read_instance_label() -> str:
