@@ -80,9 +80,18 @@ def _natural_model_id_key(_m, _provider_id: str = ""):
     ``model-2`` sorts before ``model-10`` while plain lexical sort would emit
     ``model-10`` first. The returned key is a comparable wrapper, so callers
     keep using ``sort(key=_natural_model_id_key)`` unchanged.
+
+    The key is ONLY the routing-stripped id. A bare id and its routed twin
+    (``a-model`` vs ``@custom:abc:a-model``) strip to the same value and
+    therefore compare EQUAL here, so Python's stable sort preserves input
+    order. That is deliberate: the picker's provider-aware tie-break sorts
+    routed-first, and matching it here WOULD flip the API order — the two
+    boundaries disagree only for this pair, which the final picker dedups
+    away, so there is no visible row either way. See
+    ``test_provider_aware_tie_is_left_equal_by_design``.
     """
     return _NaturalModelKey(
-        _natural_model_routing_stripped((_m or {}).get("id") or "", _provider_id)
+        _natural_model_routing_stripped(str((_m or {}).get("id") or ""), _provider_id)
     )
 
 
@@ -132,9 +141,28 @@ class _NaturalModelKey:
         self._runs = _natural_model_key_runs(value)
 
     @staticmethod
+    def _is_digit_run(run: str) -> bool:
+        """True when the run is ASCII digits ONLY.
+
+        ``str.isdigit()`` is Unicode-aware and returns True for non-ASCII
+        decimal digits (Arabic-Indic U+0662, Devanagari, fullwidth), which is
+        exactly where the shared contract says text. The JS side classifies
+        with ``/^\\d+$/`` (ASCII), so a run of ``٢`` was numeric here but text
+        there — and two distinct ids like ``model-1٢`` / ``model-1a`` came out
+        in OPPOSITE order in the picker and the api (#7528 re-gate).
+
+        The tokenizer already emits ASCII-only digit runs
+        (``_natural_model_key_runs`` uses ``[0-9]+|[^0-9]+``), so this is
+        belt-and-braces: any digit-looking run reaching here is ASCII by
+        construction, and the classification no longer depends on a Unicode
+        predicate that the JS side cannot replicate.
+        """
+        return bool(run) and all("0" <= ch <= "9" for ch in run)
+
+    @staticmethod
     def _cmp_runs(a: str, b: str) -> int:
-        a_digit = a.isdigit()
-        b_digit = b.isdigit()
+        a_digit = _NaturalModelKey._is_digit_run(a)
+        b_digit = _NaturalModelKey._is_digit_run(b)
         if a_digit and b_digit:
             a_core = a.lstrip("0") or "0"
             b_core = b.lstrip("0") or "0"
