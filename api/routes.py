@@ -14060,41 +14060,48 @@ def _expand_env_var_tree(obj, lookup):
 def _expand_installation_env_vars(obj):
     """Resolve ``${VAR}`` in installation config against operator-owned env.
 
-    The snapshot is captured once, from the process env as it stood before
-    profile injection. ``api.profiles._reload_dotenv`` tracks the exact key
-    set it projected (``_loaded_profile_env_keys``) and pops those keys
-    before applying a new profile, so filtering them out leaves the
-    operator/launcher values — including keys set after startup by an
-    operator tool — and drops anything a profile contributed.
+    #7655 round 6: the authority is the SNAPSHOT captured once at the startup
+    boundary, before any profile .env, background-worker scope or streaming
+    turn could have projected a value into ``os.environ``
+    (``api.profiles.capture_installation_env_snapshot``).
 
-    Fails closed: an unknown variable keeps its literal ``${VAR}`` form,
-    which is what an operator would see in their config file. That is
-    strictly better than adopting a profile's value and advertising another
-    profile's deployment name in the tab title.
+    The previous design inferred "operator-owned" by subtracting the profile's
+    tracked key set from the live env. It could not work, because two writers
+    install profile env into ``os.environ`` without touching that bookkeeping
+    (``profile_env_for_background_worker`` and the streaming turn's
+    ``_safe_profile_runtime_env``), so a live read returned a profile's value:
+    a root settings read while an Alice-profile background scope was active
+    resolved ``$SLOT_NAME`` to AliceProfile instead of Production.
+
+    Fails closed, in both directions:
+
+    - an unknown variable keeps its literal ``${VAR}`` form, which is what an
+      operator sees in their config file — strictly better than adopting a
+      profile's value and advertising another profile's deployment name;
+    - there is NO raw-process-env fallback. When the snapshot is unavailable
+      (``init_profile_state`` never ran, e.g. an unusual import or test order)
+      only ``_PROTECTED_ENV_KEYS`` are readable, and those are read from the
+      snapshot too — which fail-closed erases an un-booted process's ability to
+      expand anything profile-adjacent at all. That is the intended trade: an
+      installation placeholders staying literal is a visible defect, while an
+      adopted profile value is a silent one.
     """
-    profile_owned = set()
-    overridden: dict[str, str] = {}
+    snapshot = {}
     try:
-        from api.profiles import _loaded_profile_env_keys, _profile_overridden_env
+        from api.profiles import get_installation_env_snapshot
 
-        profile_owned = set(_loaded_profile_env_keys or set())
-        overridden = dict(_profile_overridden_env or {})
+        snapshot = get_installation_env_snapshot()
     except Exception:
-        # Profile state unavailable (import failure, unusual boot order):
-        # fall back to the raw process env rather than refusing to expand.
-        profile_owned = set()
-        overridden = {}
+        # Profile state unavailable (import failure, unusual boot order). Stay
+        # closed: no raw-env fallback, so nothing profile-owned can leak.
+        snapshot = {}
 
     def _lookup(name: str, default: str) -> str:
-        if name in profile_owned:
-            # A profile .env projected this key, so the process env value is
-            # profile-owned and must NOT reach installation-scoped config
-            # (#7655). If the profile displaced an operator value, that value
-            # is the installation-owned answer; otherwise fail closed.
-            prior = overridden.get(name)
-            return default if prior is None else prior
-        value = os.environ.get(name)
-        return default if value is None else value
+        # The snapshot or nothing. ``_PROTECTED_ENV_KEYS`` names are held to
+        # the same rule -- "protected" already means a profile .env cannot
+        # overwrite them, which is exactly what the snapshot records -- so
+        # there is deliberately no special case here.
+        return snapshot.get(name, default)
 
     return _expand_env_var_tree(obj, _lookup)
 

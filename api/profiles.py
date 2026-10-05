@@ -58,6 +58,53 @@ _loaded_profile_env_keys: set[str] = set()
 # Entries are removed when the owning profile is unloaded, exactly matching
 # _loaded_profile_env_keys bookkeeping.
 _profile_overridden_env: dict[str, str] = {}
+# #7655 round 6: the INSTALLATION / OPERATOR env, captured once at the startup
+# boundary before any profile .env is projected into os.environ.
+#
+# This is the only authority an installation-scoped placeholder may resolve
+# against. The earlier design inferred "operator-owned" by subtracting the
+# profile's tracked key set from the live process env, which cannot work: two
+# writers install profile env into os.environ without touching that bookkeeping
+# (``profile_env_for_background_worker`` and the streaming turn's
+# ``_safe_profile_runtime_env``), so a live read still returns a profile's
+# value -- a root settings read while an Alice-profile background scope is
+# active resolved ``$SLOT_NAME`` to AliceProfile instead of Production.
+#
+# A one-time capture at the boundary cannot be fooled by later injection: no
+# profile writer can have run yet. Populated by ``init_profile_state`` before
+# its first ``_reload_dotenv``; empty only when that never ran, in which case
+# installation placeholders resolve strictly from ``_PROTECTED_ENV_KEYS``
+# (fail closed) rather than from the live env (fail open).
+_INSTALLATION_ENV_SNAPSHOT: dict[str, str] = {}
+
+
+def get_installation_env_snapshot() -> dict[str, str]:
+    """Return the operator/launcher env captured before any profile injection.
+
+    #7655: installation-scoped readers expand ``${VAR}`` only from this
+    snapshot, so a profile value can never become the installation label.
+    Missing key -> None (unknown/unowned, the caller keeps the literal);
+    never a live-env fallback, which would reintroduce the leak.
+    """
+    return dict(_INSTALLATION_ENV_SNAPSHOT)
+
+
+def capture_installation_env_snapshot() -> dict[str, str]:
+    """Snapshot the current env as the installation/operator authority.
+
+    Called once from ``init_profile_state`` BEFORE the first ``_reload_dotenv``
+    (and therefore before any profile .env, background-worker scope or
+    streaming turn can have projected anything into ``os.environ``). A second
+    call is refused: re-capturing after profiles have run would enshrine
+    whatever a profile last installed.
+    """
+    global _INSTALLATION_ENV_SNAPSHOT
+    if _INSTALLATION_ENV_SNAPSHOT:
+        return dict(_INSTALLATION_ENV_SNAPSHOT)
+    _INSTALLATION_ENV_SNAPSHOT = {
+        str(k): str(v) for k, v in os.environ.items() if isinstance(v, str)
+    }
+    return dict(_INSTALLATION_ENV_SNAPSHOT)
 
 # Thread-local profile context: set per-request by server.py, cleared after.
 # Enables per-client profile isolation (issue #798) — each HTTP request thread
@@ -1666,6 +1713,12 @@ def init_profile_state() -> None:
         home = get_active_hermes_home()
     _set_hermes_home(home)  # also pins the process-profile home (MCP routing anchor)
     install_cron_scheduler_profile_isolation()
+    # #7655: capture the operator/launcher env here, at the startup boundary,
+    # BEFORE the first profile .env is projected. This snapshot is the only
+    # authority installation-scoped placeholders may resolve against, so a
+    # profile value can never become the installation label no matter which
+    # writer injects it later.
+    capture_installation_env_snapshot()
     _reload_dotenv(home)
 
 

@@ -56,6 +56,100 @@ def _purge_settings_cache():
     pass
 
 
+@pytest.fixture
+def installation_env(monkeypatch, tmp_path):
+    """Drive the REAL startup boundary, then isolate every global it touched.
+
+    #7655 round 6: installation placeholders resolve only from the snapshot
+    ``api.profiles.capture_installation_env_snapshot`` takes at the startup
+    boundary, so a test's operator values must go through that same boundary
+    rather than being written into ``os.environ`` afterwards — a value injected
+    after the snapshot is, by design, not the operator's.
+
+    The fixture snapshots/restores both loader globals (``_loaded_profile_env_
+    keys``, ``_profile_overridden_env``, ``_INSTALLATION_ENV_SNAPSHOT``) plus
+    every env key the case touches, so no case can influence another through
+    process state.
+    """
+    import api.profiles as prof
+
+    saved_globals = {
+        "_loaded_profile_env_keys": set(getattr(prof, "_loaded_profile_env_keys", set())),
+        "_profile_overridden_env": dict(getattr(prof, "_profile_overridden_env", {})),
+        "_INSTALLATION_ENV_SNAPSHOT": dict(getattr(prof, "_INSTALLATION_ENV_SNAPSHOT", {})),
+    }
+    touched = ("SLOT_NAME", "OPERATOR_SLOT", "UNRELATED_PROFILE_KEY", "DUP_SLOT")
+    saved_env = {k: os.environ.get(k) for k in touched}
+
+    # Clear the snapshot so the boundary can be driven per case.
+    prof._INSTALLATION_ENV_SNAPSHOT = {}
+
+    class _Boundary:
+        def __init__(self, base: Path):
+            self.base = base
+
+        def profile(self, name: str) -> Path:
+            """Create (idempotently) a named profile home under the base."""
+            d = self.base / "profiles" / name
+            d.mkdir(parents=True, exist_ok=True)
+            return d
+
+        def boot(self, operator_env: dict | None = None) -> Path:
+            """Set the launcher's env, then run the startup boundary.
+
+            Returns the profile home the boundary loaded, so a case can then
+            hand a *different* profile to ``_reload_dotenv`` exactly as a
+            real profile switch does.
+
+            The capture/reload ORDER is the boundary contract: the snapshot
+            must be taken before the first projection, otherwise it enshrines
+            whatever the profile installed. ``boot`` performs both, so a test
+            that drives the production ``init_profile_state`` order is what
+            pins it -- see ``test_boundary_captures_before_the_first_profile``.
+            """
+            for k in touched:
+                monkeypatch.delenv(k, raising=False)
+            for k, v in (operator_env or {}).items():
+                monkeypatch.setenv(k, v)
+            home = self.base
+            prof._set_hermes_home(home)
+            # The real startup boundary: capture BEFORE the first projection.
+            prof.capture_installation_env_snapshot()
+            prof._reload_dotenv(home)
+            return home
+
+        def source_order_is_capture_then_reload(self) -> bool:
+            """True when the production boundary captures before its first load.
+
+            Reads ``api/profiles.py`` for the real ``init_profile_state`` body
+            and checks the ordering in place. A regression that swaps the two
+            calls is invisible to any case that drives ``boot``, because
+            ``boot`` performs the sequence itself.
+            """
+            import inspect
+
+            src = inspect.getsource(prof.init_profile_state)
+            cap = src.index("capture_installation_env_snapshot()")
+            reload_at = src.index("_reload_dotenv(")
+            return cap < reload_at
+
+    base = tmp_path / "hermes-home"
+    profiles_dir = base / "profiles"
+    profiles_dir.mkdir(parents=True)
+    yield _Boundary(base)
+
+    prof._loaded_profile_env_keys = saved_globals["_loaded_profile_env_keys"]
+    prof._profile_overridden_env = saved_globals["_profile_overridden_env"]
+    prof._INSTALLATION_ENV_SNAPSHOT = saved_globals["_INSTALLATION_ENV_SNAPSHOT"]
+    for k, v in saved_env.items():
+        if v is None:
+            monkeypatch.delenv(k, raising=False)
+        else:
+            monkeypatch.setenv(k, v)
+    for k in touched:
+        os.environ.pop(k, None)
+
+
 # ── _read_instance_label: env precedence ──────────────────────────────────────
 
 
@@ -104,7 +198,22 @@ def test_read_instance_label_falls_back_to_config_nested(monkeypatch, tmp_path):
     assert routes._read_instance_label() == "Staging"
 
 
-def test_read_instance_label_expands_env_placeholder(monkeypatch, tmp_path):
+def test_boundary_captures_before_the_first_profile(installation_env):
+    """The production startup boundary must capture BEFORE projecting.
+
+    The snapshot's whole value is that no profile value can be in it. If
+    ``init_profile_state`` captured after its first ``_reload_dotenv``, every
+    profile-adjacent name would be enshrined as an "operator" value and the
+    leak would be permanent for the process's lifetime -- with no test able to
+    see it through ``boot``, which performs the sequence itself.
+    """
+    assert installation_env.source_order_is_capture_then_reload(), (
+        "init_profile_state must capture the installation env BEFORE its "
+        "first _reload_dotenv, or the snapshot enshrines profile injection"
+    )
+
+
+def test_read_instance_label_expands_env_placeholder(installation_env, monkeypatch, tmp_path):
     """A ``${VAR}`` placeholder in ``instance_name`` must resolve to the
     variable's value, exactly like every other config read does
     (``api.config._expand_env_vars``).
@@ -114,10 +223,12 @@ def test_read_instance_label_expands_env_placeholder(monkeypatch, tmp_path):
     ``${DEPLOYMENT_NAME}`` in the browser tab instead of their deployment
     name — the placeholder is a deployment-time idiom, and the title is where
     the user actually sees it.
+
+    #7655 round 6: the value comes from the launcher's env as captured at the
+    startup boundary, so the operator's variable goes through ``boot()``.
     """
     import api.routes as routes
     monkeypatch.delenv("HERMES_WEBUI_INSTANCE_NAME", raising=False)
-    monkeypatch.setenv("HERMES_TEST_DEPLOYMENT_NAME", "Prod-East")
     _install_config(
         monkeypatch,
         tmp_path,
@@ -127,6 +238,8 @@ def test_read_instance_label_expands_env_placeholder(monkeypatch, tmp_path):
             }
         },
     )
+    installation_env.boot(operator_env={"HERMES_TEST_DEPLOYMENT_NAME": "Prod-East"})
+
     label = routes._read_instance_label()
     assert label == "Deployment-Prod-East", (
         f"placeholder must be expanded to the variable's value, got {label!r}"
@@ -865,7 +978,6 @@ def _extract_function_body(src: str, name: str) -> str:
     raise AssertionError(f"{name} body did not terminate")
 
 
-@pytest.mark.skipif(NODE is None, reason="node not on PATH")
 def test_a_profile_dotenv_cannot_repoint_installation_configuration(tmp_path, monkeypatch):
     """A profile must not be able to hijack installation-scoped config (#7611).
 
@@ -942,126 +1054,214 @@ def test_a_profile_dotenv_cannot_repoint_installation_configuration(tmp_path, mo
 # ── #7655: base-config placeholders resolve against operator env only ───────
 
 
-def test_base_config_placeholder_cannot_be_claimed_by_profile_dotenv(tmp_path, monkeypatch):
+def test_base_config_placeholder_cannot_be_claimed_by_profile_dotenv(installation_env, monkeypatch, tmp_path):
     """#7655: an installation-scoped ``${VAR}`` placeholder must not resolve
     against a profile's ``.env``.
 
-    ``_read_installation_config()`` expands ``${VAR}`` the way every other
-    config read does — but the ambient expander (``api.config._expand_env_vars``)
-    consults the request thread's profile env FIRST and then process env, and
-    ``api.profiles._reload_dotenv`` projects a named profile's ``.env`` into
-    process env. With base config ``instance_name: ${SLOT_NAME}`` and Alice's
-    profile ``.env`` carrying ``SLOT_NAME=AliceProfile``, the advertised
-    installation label became profile-owned — and the next process-wide
-    profile switch could change it again.
+    The operator never set ``SLOT_NAME``, Alice's profile .env sets it, and the
+    installation config expands ``instance_name: ${SLOT_NAME}``. The label must
+    stay the literal ``${SLOT_NAME}`` -- an operator sees their own file, not
+    another deployment's slot name in the tab title.
 
-    The fix resolves placeholders exclusively against operator-owned env
-    (the process env minus whatever ``_reload_dotenv`` projected), and fails
-    closed to the literal ``${VAR}`` when nothing owns the name.
+    Driven through the real startup boundary (``installation_env.boot``) so the
+    snapshot genuinely predates the profile projection, exactly as it does in a
+    real process.
     """
     import api.profiles as prof
     import api.routes as routes
 
-    # Snapshot/restore the loader's globals and the keys it touches, so this
-    # test cannot influence any other test through the process env.
-    prev_loaded = prof._loaded_profile_env_keys
-    preexisting = {k: os.environ.get(k) for k in ("SLOT_NAME", "OPERATOR_SLOT")}
-
-    base = tmp_path / "hermes-home"
-    alice = base / "profiles" / "alice"
-    alice.mkdir(parents=True)
-    (base / "config.yaml").write_text(
-        yaml.safe_dump({"instance_name": "${SLOT_NAME}"}), encoding="utf-8"
-    )
-    # Alice's profile .env claims the label variable for herself.
+    alice = installation_env.profile("alice")
     (alice / ".env").write_text(
         "SLOT_NAME=AliceProfile\nUNRELATED_PROFILE_KEY=x\n", encoding="utf-8"
     )
-    monkeypatch.setattr(prof, "_DEFAULT_HERMES_HOME", base)
-    monkeypatch.setenv("HERMES_CONFIG_PATH", str(base / "config.yaml"))
+    _install_config(monkeypatch, tmp_path, {"instance_name": "${SLOT_NAME}"})
     monkeypatch.delenv("HERMES_WEBUI_INSTANCE_NAME", raising=False)
+    monkeypatch.setattr(prof, "_DEFAULT_HERMES_HOME", installation_env.base)
 
-    try:
-        prof._reload_dotenv(alice)
-        # The profile's value IS in process env — that is the leak under test.
-        assert os.environ.get("SLOT_NAME") == "AliceProfile"
+    # The boundary boots with no operator SLOT_NAME, then the profile loads.
+    installation_env.boot(operator_env={})
+    prof._reload_dotenv(alice)
+    # The profile's value IS in process env -- that is the leak under test.
+    assert os.environ.get("SLOT_NAME") == "AliceProfile"
+    assert "SLOT_NAME" in (prof._loaded_profile_env_keys or set())
 
+    label = routes._read_instance_label()
+    assert label != "AliceProfile", (
+        "a profile .env claimed the installation-scoped label placeholder"
+    )
+    assert label == "${SLOT_NAME}", (
+        "an unowned placeholder must fail closed to its literal form, "
+        f"got {label!r}"
+    )
+
+
+def test_operator_value_survives_profile_switch_and_reload(installation_env, monkeypatch, tmp_path):
+    """#7655: the operator's launch value keeps resolving across switches.
+
+    Alice -> Bob -> a profile with no matching key, with Alice's own .env
+    carrying the SAME name as the operator's. Each switch must keep the label
+    reading the operator's value, never the profile's, and the operator value
+    must not be popped by the loader's cleanup.
+    """
+    import api.profiles as prof
+    import api.routes as routes
+
+    for name, value in (("alice", "AliceProfile"), ("bob", "BobProfile")):
+        d = installation_env.profile(name)
+        (d / ".env").write_text(f"SLOT_NAME={value}\n", encoding="utf-8")
+    # A profile with no matching key: the loader pops the session's key.
+    installation_env.profile("empty")
+
+    _install_config(monkeypatch, tmp_path, {"instance_name": "${SLOT_NAME}"})
+    monkeypatch.delenv("HERMES_WEBUI_INSTANCE_NAME", raising=False)
+    monkeypatch.setattr(prof, "_DEFAULT_HERMES_HOME", installation_env.base)
+
+    # The launcher set the real value BEFORE any profile ran.
+    installation_env.boot(operator_env={"SLOT_NAME": "Production"})
+
+    for name in ("alice", "bob", "empty"):
+        prof._reload_dotenv(installation_env.profile(name))
+        # For alice/bob the profile's value IS in process env (the loader's own
+        # projection); for ``empty`` the loader pops it, leaving None. Either
+        # way the LABEL must read the operator's launch value.
         label = routes._read_instance_label()
-        assert label != "AliceProfile", (
-            "a profile .env claimed the installation-scoped label placeholder"
-        )
-        assert label == "${SLOT_NAME}", (
-            "an unowned placeholder must fail closed to its literal form, "
+        assert label == "Production", (
+            f"after switching to {name} the label must still be the operator's, "
             f"got {label!r}"
         )
 
-        # ── An operator value present at launch still honours ──────────
-        os.environ["OPERATOR_SLOT"] = "prod-slot-01"
-        (base / "config.yaml").write_text(
-            yaml.safe_dump({"instance_name": "${OPERATOR_SLOT}"}), encoding="utf-8"
-        )
-        assert routes._read_instance_label() == "prod-slot-01", (
-            "an operator-owned value must still resolve, not be mistaken for "
-            "profile injection"
-        )
-
-        # ── A later profile switch must not change the operator label ───
-        bob = base / "profiles" / "bob"
-        bob.mkdir(parents=True)
-        (bob / ".env").write_text("OPERATOR_SLOT=BobProfile\n", encoding="utf-8")
-        prof._reload_dotenv(bob)
-        assert routes._read_instance_label() == "prod-slot-01", (
-            "a process-wide profile switch changed the installation label"
-        )
-    finally:
-        # Restore the loader's globals and the env values it overwrote.
-        prof._loaded_profile_env_keys = prev_loaded
-        for k, v in preexisting.items():
-            if v is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = v
+    # The operator's own process env is never adopted or destroyed.
+    assert os.environ.get("SLOT_NAME") in {"Production", None}
 
 
-def test_base_config_placeholder_operator_value_survives_profile_key_tracking(tmp_path, monkeypatch):
-    """#7655 companion: the loader must keep tracking the profile key it
-    projected (so a later restore can drop it) WITHOUT that bookkeeping
-    becoming a denial-of-service on the operator's own value.
+def test_operator_and_profile_equal_value_still_resolves(installation_env, monkeypatch, tmp_path):
+    """The equal-value case: operator and profile agree.
 
-    ``_reload_dotenv`` records every non-protected key it projected in
-    ``_loaded_profile_env_keys``; the next call pops those keys. When the
-    operator's value lives in process env from launch, a profile switch must
-    not be able to erase it — the loader only pops keys a profile .env
-    actually set.
+    The old loader only recorded a preimage when the value DIFFERED, so with
+    identical values nothing was tracked and the label fell back to the literal
+    ``${SLOT_NAME}`` -- a visible regression for an operator who had done
+    nothing wrong.
     """
     import api.profiles as prof
+    import api.routes as routes
 
-    prev_loaded = prof._loaded_profile_env_keys
-    preexisting = {k: os.environ.get(k) for k in ("OPERATOR_SLOT", "SOME_OTHER_KEY")}
+    alice = installation_env.profile("alice")
+    (alice / ".env").write_text("SLOT_NAME=Production\n", encoding="utf-8")
+    _install_config(monkeypatch, tmp_path, {"instance_name": "${SLOT_NAME}"})
+    monkeypatch.delenv("HERMES_WEBUI_INSTANCE_NAME", raising=False)
+    monkeypatch.setattr(prof, "_DEFAULT_HERMES_HOME", installation_env.base)
 
-    base = tmp_path / "hermes-home"
-    alice = base / "profiles" / "alice"
-    alice.mkdir(parents=True)
-    (alice / ".env").write_text("SOME_OTHER_KEY=from-alice\n", encoding="utf-8")
-    monkeypatch.setattr(prof, "_DEFAULT_HERMES_HOME", base)
-    monkeypatch.setenv("OPERATOR_SLOT", "operator-value")
+    installation_env.boot(operator_env={"SLOT_NAME": "Production"})
+    prof._reload_dotenv(alice)
+    assert os.environ.get("SLOT_NAME") == "Production"
 
-    try:
-        prof._reload_dotenv(alice)
-        # The profile key is tracked; the operator key is not.
-        assert "SOME_OTHER_KEY" in (prof._loaded_profile_env_keys or set())
-        assert os.environ.get("SOME_OTHER_KEY") == "from-alice"
-        # Switching to a profile with no matching key pops Alice's key but
-        # leaves the operator's value intact.
-        bob = base / "profiles" / "bob"
-        bob.mkdir(parents=True)
-        prof._reload_dotenv(bob)
-        assert os.environ.get("OPERATOR_SLOT") == "operator-value"
-        assert "SOME_OTHER_KEY" not in os.environ
-    finally:
-        prof._loaded_profile_env_keys = prev_loaded
-        for k, v in preexisting.items():
-            if v is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = v
+    assert routes._read_instance_label() == "Production", (
+        "an operator value that a profile happens to agree with must still "
+        "resolve, not fall back to the literal placeholder"
+    )
+
+
+def test_duplicate_dotenv_lines_do_not_steal_the_operator_value(installation_env, monkeypatch, tmp_path):
+    """Duplicate keys in one profile .env, with and without an operator value.
+
+    The old loader recorded ``_prior`` immediately before EACH line, so the
+    second ``SLOT_NAME=`` line stored the FIRST profile line's value as the
+    "operator" preimage -- the label then resolved to a profile-owned value.
+    """
+    import api.profiles as prof
+    import api.routes as routes
+
+    alice = installation_env.profile("alice")
+    (alice / ".env").write_text(
+        "SLOT_NAME=AliceFirst\nDUP_SLOT=AliceFirst\nSLOT_NAME=AliceSecond\n",
+        encoding="utf-8",
+    )
+    _install_config(
+        monkeypatch, tmp_path, {"instance_name": "${SLOT_NAME}", "webui": {"instance_name": "${DUP_SLOT}"}}
+    )
+    monkeypatch.delenv("HERMES_WEBUI_INSTANCE_NAME", raising=False)
+    monkeypatch.setattr(prof, "_DEFAULT_HERMES_HOME", installation_env.base)
+
+    # -- without an operator value: both stay literal ----------------------
+    installation_env.boot(operator_env={})
+    prof._reload_dotenv(alice)
+    assert os.environ.get("SLOT_NAME") == "AliceSecond"  # last line wins
+    assert routes._read_instance_label() == "${SLOT_NAME}", (
+        "a duplicate-line profile .env must not manufacture an operator value"
+    )
+
+
+def test_root_settings_read_while_background_scope_is_active(installation_env, monkeypatch, tmp_path):
+    """A root settings read while a named-profile background scope is live.
+
+    ``profile_env_for_background_worker`` installs the profile's runtime env
+    into ``os.environ`` WITHOUT touching the loader's bookkeeping, so a live-env
+    read returned the profile's value. This is the ordering the round-6 review
+    found: the snapshot is immune because it was taken before any injection.
+    """
+    import api.profiles as prof
+    import api.routes as routes
+
+    alice = installation_env.profile("alice")
+    (alice / ".env").write_text("SLOT_NAME=AliceProfile\n", encoding="utf-8")
+    _install_config(monkeypatch, tmp_path, {"instance_name": "${SLOT_NAME}"})
+    monkeypatch.delenv("HERMES_WEBUI_INSTANCE_NAME", raising=False)
+    monkeypatch.setattr(prof, "_DEFAULT_HERMES_HOME", installation_env.base)
+
+    installation_env.boot(operator_env={})
+    prof._reload_dotenv(alice)
+
+    # A background worker for Alice installs her runtime env with none of the
+    # loader's bookkeeping involved -- the exact writer that leaked before.
+    monkeypatch.setenv("SLOT_NAME", "AliceProfile")
+
+    label = routes._read_instance_label()
+    assert label != "AliceProfile", (
+        "a background worker's injected profile value reached the "
+        "installation-scoped label"
+    )
+    assert label == "${SLOT_NAME}"
+
+
+def test_duplicate_dotenv_lines_with_operator_value(installation_env, monkeypatch, tmp_path):
+    """The duplicate-line case WITH an operator value on both names.
+
+    The old loader recorded ``_prior`` immediately before EACH line, so the
+    second ``SLOT_NAME=`` line stored the FIRST profile line's value as the
+    "operator" preimage -- the label then resolved to a profile-owned value.
+    With an operator value present, that line overwrote the saved operator
+    value instead.
+
+    The label must resolve to the operator's value for BOTH names.
+    """
+    import api.profiles as prof
+    import api.routes as routes
+
+    alice = installation_env.profile("alice")
+    (alice / ".env").write_text(
+        "SLOT_NAME=AliceFirst\nDUP_SLOT=AliceFirst\nSLOT_NAME=AliceSecond\n",
+        encoding="utf-8",
+    )
+    _install_config(
+        monkeypatch,
+        tmp_path,
+        {
+            "instance_name": "${SLOT_NAME}",
+            "webui": {"instance_name": "${DUP_SLOT}"},
+        },
+    )
+    monkeypatch.delenv("HERMES_WEBUI_INSTANCE_NAME", raising=False)
+    monkeypatch.setattr(prof, "_DEFAULT_HERMES_HOME", installation_env.base)
+
+    # The launcher set both names before any profile ran.
+    installation_env.boot(operator_env={"SLOT_NAME": "Production", "DUP_SLOT": "Prod-B"})
+    prof._reload_dotenv(alice)
+    assert os.environ.get("SLOT_NAME") == "AliceSecond"
+
+    cfg = routes._read_installation_config()
+    assert routes._read_instance_label() == "Production", (
+        f"the operator's SLOT_NAME must win over the duplicate profile lines: {cfg!r}"
+    )
+    assert (cfg.get("webui") or {}).get("instance_name") == "Prod-B", (
+        f"the operator's DUP_SLOT must win over the duplicate profile lines: {cfg!r}"
+    )
