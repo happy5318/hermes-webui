@@ -445,11 +445,57 @@ class TestFrontendWiring:
                 "_drainingGoalContinuationId",
                 "_setDrainingGoalContinuationId",
                 "_readDrainingGoalContinuationId",
+                "_sendInProgressGoalContinuationId",
             ):
                 assert symbol not in read, (
-                    f"{name} still references the shared drain slot {symbol!r} — "
-                    "the round-5 CORE defect"
+                    f"{name} still references the shared continuation slot {symbol!r} — "
+                    "the round-5 CORE defect (a genuine turn could read it as its own)"
                 )
+
+    def test_the_reentrant_guard_only_uses_its_own_token(self):
+        # Round 6 CORE: while a continuation is parked in uploadPendingFiles, a
+        # genuine re-entrant send queues FIRST. Reading the in-flight slot here is
+        # what made that turn consume the parked continuation's pending record.
+        src = self._messages()
+        guard = src[src.index("if (_sendInProgress) {"):src.index("_sendInProgress = true;")]
+        assert "_normalizeGoalContinuationId(_sendInProgressGoalContinuationId)" not in guard, (
+            "the re-entrant guard must not read a shared in-flight continuation ID"
+        )
+        assert "if(_goalContinuationId) _requeueEntry.goal_continuation_id=_goalContinuationId;" in guard, (
+            "a re-entrant send may only requeue with a continuation ID of its OWN"
+        )
+
+    def test_failed_start_restore_carries_the_id(self):
+        # Round 6 item 2: text and ID must be restored together on the
+        # non-admitted failure and compression-recovery paths.
+        src = self._messages()
+        assert (
+            "function _restoreComposerDraftAfterFailedSend(draftText, filesSnapshot, sid, clearPromise, goalContinuationId)"
+            in src
+        ), "the failed-send restore helper must accept the draft's continuation ID"
+        assert "_setRestoredGoalContinuationDraft(_restoreContId,restore)" in src, (
+            "a restored continuation draft must be re-marked so a retry still carries the ID"
+        )
+        assert (
+            "_restoreComposerDraftAfterFailedSend(_failedSendDraftText, _failedSendFilesSnapshot, activeSid, _composerDraftClearPromise, _goalContinuationId)"
+            in src
+        ), "the send-error path must pass the invocation-bound continuation ID to the restore"
+        # The compression-recovery path restores into a rotated session; it must
+        # carry the token the same way.
+        assert (
+            "_recoverCompressedSend(e,activeSid,_failedSendDraftText,_failedSendFilesSnapshot,_composerDraftClearPromise,_goalContinuationId)"
+            in src
+        ), "the compression-recovery path must pass the continuation ID through to the restore"
+
+    def test_busy_and_interrupt_queues_carry_the_id(self):
+        # Round 6 item 3: both busy modes queue the identified continuation text.
+        src = self._messages()
+        assert "if(_goalContinuationId) _interruptEntry.goal_continuation_id=_goalContinuationId;" in src, (
+            "the busy interrupt-mode queue must carry the continuation ID"
+        )
+        assert "if(_goalContinuationId) _busyEntry.goal_continuation_id=_goalContinuationId;" in src, (
+            "the busy queue-mode queue must carry the continuation ID"
+        )
 
     def test_rejected_continuation_requeue_keeps_the_id(self):
         # Round 5 item 2: a continuation rejected with "session already has an

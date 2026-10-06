@@ -15,21 +15,23 @@ Chromium page, run a genuine send() from the composer, and assert that
 ``request body: None`` tell the CI ``live-to-final`` job reported if the send
 path throws before the fetch.
 
-Covered end-to-end (maintainer's round-5 checklist):
+Covered end-to-end (maintainer's checklist, extended in round 6):
   1. ordinary send posts a chat/start body (the round-3 BRICK regression itself);
   2. a genuine user turn posts NO continuation ID while a continuation is queued;
   3. the queued-continuation drain hands its ID to that send and it is posted;
-  4. the requeue path (send while a drain is in flight) carries the ID on the
-     re-queued entry instead of dropping it;
+  4. a re-entrant genuine send (arriving while a continuation is parked in
+     uploadPendingFiles) must requeue WITHOUT any continuation ID — round 6 CORE;
   5. a refresh-restored continuation is a text-bound, one-shot draft: sending the
      restored text unchanged keeps the goal, REPLACING it fails closed, and a
      consumed draft leaves nothing behind;
-  6. a session boundary drops an unconsumed restored draft.
+  6. a session boundary drops an unconsumed restored draft;
+  7. a failed start restores the draft text AND its continuation ID.
 
 The round-5 CORE race (a genuine turn parked mid-await while the drain publishes
 the ID) is not reproducible through page timing, so it lives in
 tests/test_7855_goal_continuation_binding.py, which replays that exact sequence
-against the real send() in a Node VM.
+against the real send() in a Node VM — extended in round 6 for the re-entrant
+guard, the failed-start restore, and both busy-queue modes.
 """
 
 from __future__ import annotations
@@ -264,34 +266,33 @@ def main() -> int:
                     "(drain path did not hand cont-case3-drain to send())"
                 )
 
-        # ── Case 4: requeue path carries the ID ──
-        # With a simulated in-flight drain holding an ID, type a message (so the
-        # composer has text) and invoke the real requeue branch by calling
-        # send() while _sendInProgress is true, then inspect the queued entry
-        # (not the POST) for the carried ID.
+        # ── Case 4: a re-entrant genuine turn must NOT inherit the parked ID ──
+        # The in-flight send is a parked continuation holding the lock; a genuine
+        # send that arrives re-entrantly is queued FIRST. Inspect the queued entry
+        # (not the POST) to prove it carries no continuation ID.
+        # Fill the composer first — the re-entrant guard reads the live text.
         page.locator("#msg").fill("message sent during the drain window")
         page.wait_for_timeout(200)
         page.evaluate(
             """() => {
               window.__case4Result = null;
               const sid = S.session.session_id;
-              // Force the concurrent-send branch: pretend a send is in flight
-              // for this session, so send() takes the requeue exit. The in-flight
-              // send owns the continuation (round 5 replaced the shared slot with
-              // a value held by the lock holder itself).
+              // Force the concurrent-send branch: pretend a send is in flight for
+              // this session, so send() takes the requeue exit. There is no shared
+              // continuation slot to seed (round 6 removed it) — a re-entrant
+              // genuine turn may only use its OWN token, which this call has none of.
               _sendInProgress = true;
               _sendInProgressSid = sid;
-              _sendInProgressGoalContinuationId = 'cont-case4-requeue';
               const before = (typeof _readPersistedSessionQueue === 'function')
                 ? _readPersistedSessionQueue(sid) : [];
               const beforeCount = Array.isArray(before) ? before.length : 0;
-              Promise.resolve(send({requeueProbe: true})).then(() => {
+              Promise.resolve(send()).then(() => {
                 const after = (typeof _readPersistedSessionQueue === 'function')
                   ? _readPersistedSessionQueue(sid) : [];
                 const entries = Array.isArray(after) ? after : [];
                 window.__case4Result = {
                   beforeCount,
-                  carriedId: entries.some(e => e && e.goal_continuation_id === 'cont-case4-requeue'),
+                  carriedId: entries.some(e => e && e.goal_continuation_id),
                   entries: entries.map(e => (e && e.goal_continuation_id) || null),
                 };
               }).catch(err => { window.__case4Result = 'error: ' + String(err); });
@@ -307,16 +308,17 @@ def main() -> int:
         if isinstance(case4, str):
             failures.append(f"case4 requeue: send() raised {case4}")
         elif isinstance(case4, dict):
-            if not case4.get("carriedId"):
+            if case4.get("carriedId"):
                 failures.append(
-                    "case4 requeue: re-queued entry lost the continuation ID "
-                    f"(entries={case4.get('entries')!r}) — #7855 round-3 item 2"
+                    "case4 reentrant-genuine: the re-queued entry carries a continuation "
+                    f"ID it never owned (entries={case4.get('entries')!r}) — the genuine "
+                    "turn would consume the parked continuation's pending record"
                 )
             else:
-                print("OK  case4 requeued entry carries the continuation ID")
+                print("OK  case4 a re-entrant genuine turn requeues without any continuation ID")
         else:
             failures.append(f"case4 requeue: unexpected probe result {case4!r}")
-        page.evaluate("() => { _sendInProgress = false; _sendInProgressSid = null; _sendInProgressGoalContinuationId = ''; }")
+        page.evaluate("() => { _sendInProgress = false; _sendInProgressSid = null; }")
 
         # ── Case 5: the restored-continuation draft (reviewer's probe #3) ──
         # A refresh-restore used to publish its ID to a global slot, so a user
@@ -385,6 +387,54 @@ def main() -> int:
             )
         else:
             print("OK  case6 session boundary drops an unconsumed restored draft")
+
+        # ── Case 7: a failed start restores the draft text AND its ID ──
+        # Rejected POSTs never admit a turn, so the continuation ID must come back
+        # with the text: restore only the text and the retry becomes an ordinary
+        # turn that silently ends the goal loop (round 6 item 2).
+        failed_start = page.evaluate(
+            """() => {
+              if (typeof _restoreComposerDraftAfterFailedSend !== 'function') return 'helper-missing';
+              if (typeof _setRestoredGoalContinuationDraft !== 'function') return 'setter-missing';
+              if (typeof _takeRestoredDraftGoalContinuationId !== 'function') return 'reader-missing';
+              const _msg = document.getElementById('msg');
+              // An empty composer: the restore owns it (the pre-send wipe ran).
+              _msg.value = '';
+              _msg.dataset.goalContinuationId = '';
+              _msg.dataset.goalContinuationText = '';
+              const ok = _restoreComposerDraftAfterFailedSend(
+                'draft restored after a failed start', [], S.session.session_id,
+                Promise.resolve(), 'cont-case7-failedstart');
+              const idAfter = _msg.dataset.goalContinuationId || null;
+              const readBack = _takeRestoredDraftGoalContinuationId(_msg.value);
+              return {ok, text: _msg.value, idAfter, readBack};
+            }"""
+        )
+        if failed_start in ("helper-missing", "setter-missing", "reader-missing"):
+            failures.append(f"case7 failed-start restore: helper not reachable ({failed_start})")
+        elif not isinstance(failed_start, dict):
+            failures.append(f"case7 failed-start restore: unexpected probe result {failed_start!r}")
+        else:
+            if not failed_start.get("ok"):
+                failures.append("case7 failed-start restore: the draft text was not restored")
+            if failed_start.get("text") != "draft restored after a failed start":
+                failures.append(
+                    "case7 failed-start restore: restored the wrong text "
+                    f"({failed_start.get('text')!r})"
+                )
+            if failed_start.get("idAfter") != "cont-case7-failedstart":
+                failures.append(
+                    "case7 failed-start restore: the draft was restored WITHOUT its "
+                    f"continuation ID ({failed_start.get('idAfter')!r}) — the retry would "
+                    "post an empty ID and end the goal loop"
+                )
+            if failed_start.get("readBack") != "cont-case7-failedstart":
+                failures.append(
+                    "case7 failed-start restore: a retry of the restored text could not "
+                    f"read its ID back ({failed_start.get('readBack')!r})"
+                )
+            if not failures:
+                print("OK  case7 a failed start restores the draft text and its continuation ID")
 
         # ── The tell-tale check: NO ReferenceError may have hit the page ──
         ref_errors = [
