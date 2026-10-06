@@ -6782,6 +6782,10 @@ def request_log_forwarded_fields(handler) -> dict:
       mutually exclusive: a resolved field is never also flagged as ignored.
     * a direct client with no forwarded header gets NEITHER key, so the common
       case stays byte-identical to master's log line.
+    * the flag is emitted from BOTH branches. Round 6 (nesquena-hermes review,
+      SILENT) covered only the untrusted-peer side; a TRUSTED proxy whose chain
+      does not resolve produced neither key just as silently. See the trusted
+      branch below for the cases.
 
     Lives here (not inline in server.py) to keep the entrypoint under its
     760-line guard — see tests/test_sprint10.py.
@@ -6801,7 +6805,30 @@ def request_log_forwarded_fields(handler) -> dict:
     resolved = _forwarded_client_ip_from_trusted_proxy(handler, consult_real_ip=False)
     if resolved and resolved != remote:
         return {"forwarded_for": resolved}
-    return {}
+    # #7864 round 6 (nesquena-hermes review, SILENT): the trusted branch used to
+    # return a bare {} here, so a TRUSTED proxy that produced no address emitted
+    # a record with NEITHER key — exactly the silence this function exists to
+    # prevent, one branch over. On master the first row of each pair below still
+    # logged a forwarded_for (master recorded the raw left-most XFF hop for any
+    # peer), so an operator's fail2ban jail keyed on that field silently stopped
+    # matching these requests with nothing to show for it:
+    #
+    #   XFF "198.51.100.23"      -> {'forwarded_for': '198.51.100.23'}   (resolves)
+    #   XFF "198.51.100.23,"     -> {}  -> now {'forwarded_for_ignored': True}
+    #   XFF "," or " , "         -> {}  -> now {'forwarded_for_ignored': True}
+    #   XFF "not-an-ip"          -> {}  -> now {'forwarded_for_ignored': True}
+    #   XFF "198.51.100.23, garbage" -> {} -> now {'forwarded_for_ignored': True}
+    #
+    # A trailing comma is a real-world proxy shape, so this is not a contrived
+    # input. The key is identical in both branches for the same reason: the
+    # BOOLEAN, never the value (it is attacker-controlled text either way — a
+    # trusted peer can relay a client's malformed chain verbatim).
+    if not _has_forwarded_header(handler):
+        # No XFF at all: nothing was dropped, so there is nothing to flag. This
+        # is the plain direct-to-proxy request that master recorded as one peer
+        # address, and it must stay byte-identical to master's line.
+        return {}
+    return {"forwarded_for_ignored": True}
 
 
 def trusted_forwarded_client_ip(handler) -> str | None:
