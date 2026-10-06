@@ -14019,9 +14019,9 @@ def _read_installation_config() -> dict:
         # Missing / unreadable — indistinguishable from "no label set".
         return {}
     try:
-        import yaml as _yaml
+        from api import yaml_compat as yaml
 
-        loaded = _yaml.safe_load(raw.decode("utf-8", "replace"))
+        loaded = yaml.safe_load(raw.decode("utf-8", "replace"))
     except Exception:
         return {}
     if not isinstance(loaded, dict):
