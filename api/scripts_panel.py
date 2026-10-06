@@ -86,6 +86,42 @@ def _safe_join(base: Path, name: str) -> Path | None:
     return candidate
 
 
+def _base_open_flags() -> int:
+    """Open flags for the scripts *directory* fd.
+
+    Fail closed: O_NOFOLLOW and O_DIRECTORY are load-bearing for containment
+    (the leaf ``openat`` resolves relative to this fd, so an ancestor symlink
+    or a swapped-in file must never slip through), and there is no fallback
+    that preserves the guarantee on a platform without them. We therefore
+    raise ``OSError`` instead of silently substituting zero for a missing
+    flag, which would drop containment (#7685 finding 2).
+    """
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise OSError("O_NOFOLLOW not supported; refusing scripts directory open")
+    if not hasattr(os, "O_DIRECTORY"):
+        raise OSError("O_DIRECTORY not supported; refusing scripts directory open")
+    return os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+
+
+def _leaf_open_flags() -> int:
+    """Open flags for the scripts *leaf*.
+
+    Same fail-closed rule for O_NOFOLLOW: without it a symlink escape is
+    possible, so a missing flag is a refusal, not a silent zero.  O_NONBLOCK
+    IS the one tolerated absence — its job here is only to make a pathological
+    FIFO ``os.open`` return instead of blocking, and ``fstat`` still rejects
+    the FIFO afterwards.  O_CLOEXEC is best-effort and optional.
+    """
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise OSError("O_NOFOLLOW not supported; refusing scripts leaf open")
+    return (
+        os.O_RDONLY
+        | os.O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+
+
 def _open_script_for_read(base: Path, name: str) -> tuple[int, os.stat_result] | None:
     """Acquire a validated descriptor for ``base/name``.
 
@@ -98,10 +134,10 @@ def _open_script_for_read(base: Path, name: str) -> tuple[int, os.stat_result] |
 
     * **Symlink escape.** Following a symlink that points outside the
       scripts directory returned that target's description (and, for
-      ``read_script``, its contents). The fd is opened with
-      ``O_NOFOLLOW``; ``fstat`` then proves the opened object is a regular
-      file, so a race that swaps the leaf for a device, FIFO or directory
-      fails rather than blocks or dumps.
+      ``read_script``, its contents). The fd is opened with ``O_NOFOLLOW``;
+      ``fstat`` then proves the opened object is a regular file, so a race
+      that swaps the leaf for a device, FIFO or directory fails rather than
+      blocks or dumps.
     * **Leaf/ancestor swap.** The previous helper resolved the path, checked
       it, and then reopened it by name — two independent lookups an attacker
       could swap between. One ``openat`` on a directory fd pins BOTH the
@@ -114,39 +150,45 @@ def _open_script_for_read(base: Path, name: str) -> tuple[int, os.stat_result] |
       open fd is the metadata the size decision is made from, and the read
       itself is bounded to the cap at physical I/O.
 
-    ``base`` is opened read-only and re-checked to be a directory, so a
-    scripts path that is itself a symlink to elsewhere is refused.
+    Descriptor accounting (#7685 finding 1): every fd acquired here is
+    released on every exit — the base fd is always closed, and a leaf fd that
+    was opened but then rejected (non-regular object, ``fstat`` failure) is
+    closed too before ``None`` is returned.  Only the success path hands the
+    leaf fd to the caller, which then owns it.  A FIFO named ``*.py`` is
+    opened with ``O_NONBLOCK`` so ``os.open`` returns instead of blocking,
+    and is then rejected by the regular-file check.
     """
     if not _is_safe_script_name(name):
         return None
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
     base_fd = -1
     file_fd = -1
+    accepted = False
     try:
-        base_fd = os.open(base, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
-    except OSError:
-        return None
-    try:
+        base_fd = os.open(base, _base_open_flags())
         st = os.fstat(base_fd)
         if not stat_module.S_ISDIR(st.st_mode):
             return None
-        try:
-            file_fd = os.open(name, flags, dir_fd=base_fd)
-        except OSError:
-            return None
+        file_fd = os.open(name, _leaf_open_flags(), dir_fd=base_fd)
         fst = os.fstat(file_fd)
         if not stat_module.S_ISREG(fst.st_mode):
             return None
         # A hardlink out of the directory still has nlink > 1; nothing here
         # can detect that, but the name is confined and the content is the
         # user's own profile, so containment of the LOOKUP is what matters.
+        accepted = True
         return file_fd, fst
+    except OSError:
+        # Missing capability flag, permission error, symlink escape
+        # (ELOOP from O_NOFOLLOW), non-directory base, missing name, or an
+        # fstat failure all funnel here as a refusal.
+        return None
     finally:
         if base_fd >= 0:
             os.close(base_fd)
-    # The file fd is deliberately NOT closed here: ownership passes to the
-    # caller, which closes it on every exit path (``_close_quietly``).
-    return None
+        if not accepted and file_fd >= 0:
+            # The leaf was opened but then rejected: release it so it cannot
+            # leak one descriptor per list request.
+            _close_quietly(file_fd)
 
 
 def _close_quietly(fd: int) -> None:
@@ -158,25 +200,56 @@ def _close_quietly(fd: int) -> None:
         pass
 
 
-def _read_bounded(fd: int, limit: int) -> bytes:
+class _BoundedRead:
+    """Honest result of a bounded read.
+
+    ``ok`` is False when the underlying ``os.read`` raised; ``truncated`` is
+    True when the budget (``limit``) was exhausted and there might be bytes
+    left we did not read; ``content`` is whatever was read (possibly empty);
+    ``detail`` carries the exception text when ``ok`` is False.
+    """
+
+    __slots__ = ("ok", "truncated", "content", "detail")
+
+    def __init__(
+        self, ok: bool, truncated: bool, content: bytes, detail: str = ""
+    ) -> None:
+        self.ok = ok
+        self.truncated = truncated
+        self.content = content
+        self.detail = detail
+
+
+def _read_bounded(fd: int, limit: int) -> _BoundedRead:
     """Read at most ``limit`` bytes from ``fd`` (an open regular file).
 
-    Loop until EOF or the cap: a single ``os.read`` may return fewer bytes
-    than requested (short read), which would otherwise truncate the preview
-    silently.
+    Loops until EOF or the cap, so a short read does not silently truncate
+    the preview.  The result reports rather than hides two failure modes
+    (#7685 finding 3): a read that raises becomes ``ok=False`` instead of an
+    empty "complete" read, and stopping at the cap is ``truncated=True``
+    instead of being indistinguishable from EOF.
     """
     chunks: list[bytes] = []
     remaining = limit
+    failed = False
+    detail = ""
     while remaining > 0:
         try:
             chunk = os.read(fd, min(remaining, 65536))
-        except OSError:
+        except OSError as exc:
+            failed = True
+            detail = f"{exc.__class__.__name__}: {exc}"
             break
         if not chunk:
             break
         chunks.append(chunk)
         remaining -= len(chunk)
-    return b"".join(chunks)
+    return _BoundedRead(
+        ok=not failed,
+        truncated=not failed and remaining == 0 and limit > 0,
+        content=b"".join(chunks),
+        detail=detail,
+    )
 
 
 def _read_description(path: Path) -> str:
@@ -187,7 +260,7 @@ def _read_description(path: Path) -> str:
         return ""
     fd, _st = acquired
     try:
-        return _read_description_bytes(_read_bounded(fd, 4096), path.suffix.lower())
+        return _read_description_bytes(_read_bounded(fd, 4096).content, path.suffix.lower())
     finally:
         _close_quietly(fd)
 
@@ -246,7 +319,7 @@ def list_scripts() -> dict:
                 continue
             fd, st = acquired
             try:
-                raw = _read_bounded(fd, 4096)
+                raw = _read_bounded(fd, 4096).content
                 out.append(
                     {
                         "name": entry.name,
@@ -289,14 +362,24 @@ def read_script(name: str) -> dict | None:
                 "too_large": True,
                 "size": st.st_size,
             }
-        raw = _read_bounded(fd, _MAX_SCRIPT_BYTES)
-        content = raw.decode("utf-8", errors="replace")
+        res = _read_bounded(fd, _MAX_SCRIPT_BYTES)
+        if not res.ok:
+            # A read that raised must surface as an error, not as an empty
+            # "complete" script (#7685 finding 3).
+            return {
+                "name": name,
+                "error": "read_failed",
+                "detail": res.detail,
+                "size": st.st_size,
+            }
+        content = res.content.decode("utf-8", errors="replace")
         return {
             "name": name,
             "content": content,
             "size": st.st_size,
             "modified": int(st.st_mtime),
             "too_large": False,
+            "truncated": res.truncated,
         }
     finally:
         _close_quietly(fd)

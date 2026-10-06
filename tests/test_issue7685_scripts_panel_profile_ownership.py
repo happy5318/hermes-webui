@@ -116,13 +116,17 @@ def _format_size_fn() -> str:
     return _extract(PANELS_JS, "function _formatScriptSize(")
 
 
-_SCRIPTS_HELPERS = (
-    _extract(PANELS_JS, "async function loadScriptsList(")
-    + _extract(PANELS_JS, "function clearScriptsList(")
-    + _extract(PANELS_JS, "function _scriptsOwnerKey(")
-    + _extract(PANELS_JS, "function _renderScriptItem(")
-    + _extract(PANELS_JS, "function _formatScriptSize(")
-)
+def _scripts_helpers() -> str:
+    return (
+        _extract(PANELS_JS, "function _invalidateScriptsForProfileSwitch(")
+        + _extract(PANELS_JS, "function _refreshScriptsAfterProfileSwitch(")
+        + _extract(PANELS_JS, "async function loadScriptsList(")
+        + _extract(PANELS_JS, "function clearScriptsList(")
+        + _extract(PANELS_JS, "function _scriptsOwnerKey(")
+        + _extract(PANELS_JS, "function _scriptsReplyIsCurrent(")
+        + _extract(PANELS_JS, "function _renderScriptItem(")
+        + _extract(PANELS_JS, "function _formatScriptSize(")
+    )
 
 
 def _render_item_fn() -> str:
@@ -133,6 +137,7 @@ _DECLS = """
 let _scriptsOwnerProfile='';
 let _scriptsRequestSeq=0;
 let _scriptsLastDir=null;
+let _scriptsInvalidateSeq=0;
 let _scriptsSwitchNeedsRefresh=false;
 """
 
@@ -159,7 +164,7 @@ def test_late_reply_from_the_old_owner_is_discarded() -> None:
     source = (
         _dom_and_helpers()
         + _DECLS
-        + _SCRIPTS_HELPERS
+        + _scripts_helpers()
         + """
         // alpha's reply is scripted first, then beta's.
         _scripted.push({ data: { exists:true, scripts:[{name:'alpha.py',description:'A',size:10}] } });
@@ -186,7 +191,7 @@ def test_switch_clears_the_previous_profiles_rows() -> None:
     source = (
         _dom_and_helpers()
         + _DECLS
-        + _SCRIPTS_HELPERS
+        + _scripts_helpers()
         + """
         _scripted.push({ data: { exists:true, scripts:[{name:'old.py',description:'OLD',size:1}] } });
         await loadScriptsList(false);
@@ -210,7 +215,7 @@ def test_switch_refreshes_the_visible_scripts_pane() -> None:
     source = (
         _dom_and_helpers()
         + _DECLS
-        + _SCRIPTS_HELPERS
+        + _scripts_helpers()
         + """
         // The switch path (extracted inline below) marks the pane for refresh
         // because the Scripts subtab is the visible one.
@@ -263,6 +268,8 @@ def test_switch_hook_is_wired_into_switchprofile() -> None:
         "esc", "t", "S", "window", "document", "localStorage", "console",
         "clearScriptsList", "loadScriptsList", "switchToProfile",
         "showToast", "_wsTreeGen",
+        "_invalidateScriptsForProfileSwitch", "_refreshScriptsAfterProfileSwitch",
+        "_scriptsReplyIsCurrent",
     }
     keep_real = {
         "_applyModelToDropdown", "loadWorkspacesPanel", "loadWorkspaceList",
@@ -337,7 +344,7 @@ def test_switch_hook_is_wired_into_switchprofile() -> None:
     source = (
         _dom_and_helpers()
         + _DECLS
-        + _SCRIPTS_HELPERS
+        + _scripts_helpers()
         + f"""
         let _profileSwitchGeneration = 0;
         {stub_block}
