@@ -3247,24 +3247,42 @@ function _sortModelPickerEntries(items,providerHint){
 }
 function _sortModelPickerOptions(group){
   if(!group||!group.children) return;
+  const select=group.closest?group.closest('select'):null;
+  // Moving <option> nodes re-parents them, and a <select> keeps its selection
+  // by VALUE, not by node. Reordering therefore resets `selectedIndex` to the
+  // first option whenever the selected value's node moves — so "Show all"
+  // followed by picking another model silently stayed on the old session model
+  // (the unchanged-selection early return then saw a different value). Restore
+  // by OBJECT, never by value: a value match can lose the provider identity of
+  // routed twins that share a bare model id.
+  let selectedOption=null;
+  if(select&&typeof select.selectedOptions!=='undefined'&&select.selectedOptions&&select.selectedOptions.length){
+    selectedOption=select.selectedOptions[0];
+  }
   const options=Array.from(group.children).filter(option=>option&&option.tagName==='OPTION');
   const ordered=_sortModelPickerEntries(options);
   if(typeof group.replaceChildren==='function'){
     group.replaceChildren(...ordered);
-    return;
-  }
-  // Lightweight DOMs used by the picker regression driver expose children as
-  // an Array. Reorder that array directly so the fallback does not duplicate
-  // options by calling their simplified appendChild implementation.
-  if(Array.isArray(group.children)){
+  }else if(Array.isArray(group.children)){
+    // Lightweight DOMs used by the picker regression driver expose children as
+    // an Array. Reorder that array directly so the fallback does not duplicate
+    // options by calling their simplified appendChild implementation.
     group.children.splice(0,group.children.length,...ordered);
     for(const option of ordered){
       option.parentElement=group;
       if('parentNode' in option) option.parentNode=group;
     }
-    return;
+  }else{
+    for(const option of ordered) group.appendChild(option);
   }
-  for(const option of ordered) group.appendChild(option);
+  if(select&&selectedOption){
+    if(Array.from(group.children).indexOf(selectedOption)>=0){
+      selectedOption.selected=true;
+      if('selectedIndex' in select) select.selectedIndex=Array.from(select.options).indexOf(selectedOption);
+    }else if('selectedIndex' in select){
+      select.selectedIndex=-1;
+    }
+  }
 }
 const MODEL_STATE_KEY='hermes-webui-model-state';
 const PENDING_SESSION_MODEL_PREFIX='hermes-webui-pending-session-model:';

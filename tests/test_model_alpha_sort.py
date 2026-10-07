@@ -536,3 +536,181 @@ def test_provider_aware_tie_is_left_equal_by_design():
     # 3. the frontend's own tie-break is recorded, not silently ignored.
     frontend_routed_first = _TIE_ROUTED < _TIE_BARE  # '@' < 'a' by code point
     assert frontend_routed_first
+
+
+# Node driver that reproduces the select-selection reset. It builds a REAL
+# minimal DOM (select + optgroups + options), selects one option, runs the
+# production _sortModelPickerOptions, and reports what the select still has
+# selected. The driver models the browser contract that matters: moving an
+# <option> node to a different position inside its <select> clears the select's
+# selection unless it is restored by object.
+_SELECT_RESTORE_DRIVER = r'''
+const fs = require('fs');
+const ui = fs.readFileSync(process.argv[2], 'utf8');
+
+function extractFunction(name) {
+  const re = new RegExp('function\\s+' + name + '\\s*\\(');
+  const start = ui.search(re);
+  if (start < 0) throw new Error(name + ' not found');
+  let i = ui.indexOf('{', ui.indexOf(')', start));
+  let depth = 1;
+  i += 1;
+  while (depth > 0 && i < ui.length) {
+    if (ui[i] === '{') depth += 1;
+    else if (ui[i] === '}') depth -= 1;
+    i += 1;
+  }
+  return ui.slice(start, i);
+}
+
+eval([
+  '_modelPickerContractRuns',
+  '_modelPickerCompareRuns',
+  '_modelPickerCompareContract',
+  '_modelPickerSortableId',
+  '_modelPickerSortValue',
+  '_compareModelPickerEntries',
+  '_sortModelPickerEntries',
+  '_sortModelPickerOptions',
+].map(extractFunction).join('\n'));
+
+// ── Minimal DOM with the browser's <select> selection contract ────────────
+function makeOption(value, text) {
+  return {tagName: 'OPTION', value: value, text: text, selected: false,
+          parentElement: null, parentNode: null};
+}
+function makeSelect() {
+  const sel = {
+    tagName: 'SELECT',
+    options: [],
+    _selected: null,
+    get selectedIndex() {
+      return this._selected ? this.options.indexOf(this._selected) : -1;
+    },
+    set selectedIndex(i) {
+      // Browsers map selectedIndex -> whichever option sits there, and setting
+      // it clears the previous selection (index -1 clears outright).
+      if (this._selected) this._selected.selected = false;
+      this._selected = (i >= 0 && i < this.options.length) ? this.options[i] : null;
+      if (this._selected) this._selected.selected = true;
+    },
+    get selectedOptions() { return this._selected ? [this._selected] : []; },
+    replaceChildren(...nodes) {
+      for (const n of this.children) n.parentElement = n.parentNode = null;
+      this.children = [];
+      this._selected = null;          // node re-parenting drops the selection
+      for (const n of nodes) this._append(n);
+    },
+    children: [],
+    _append(n) {
+      this.children.push(n);
+      this.options.push(n);
+      n.parentElement = n.parentNode = this;
+    },
+    appendChild(n) { this._append(n); },
+  };
+  return sel;
+}
+
+// NOTE: the optgroup's `children` must be an HTMLCollection-like object, NOT a
+// plain Array. A plain Array drives the driver-mode fallback branch in
+// _sortModelPickerOptions and never exercises the real replaceChildren() path
+// that cleared the browser selection — a plain Array makes this test pass even
+// against the buggy code (verified: green on the pre-fix function).
+class FakeHTMLCollection {
+  constructor(items) { this._items = items.slice(); }
+  get length() { return this._items.length; }
+  item(i) { return this._items[i]; }
+  [Symbol.iterator]() { return this._items[Symbol.iterator](); }
+  slice() { return this._items.slice(); }
+  indexOf(o) { return this._items.indexOf(o); }
+}
+
+const select = makeSelect();
+const groupA = {tagName: 'OPTGROUP', dataset: {provider: 'custom:newapi'},
+                get children() { return new FakeHTMLCollection(this._children); },
+                _children: [], parentElement: select, parentNode: select,
+                appendChild(n) {
+                  // Browser contract: appending an existing node MOVES it,
+                  // which re-parents and (on a <select>) clears the selection.
+                  const old = this._children.indexOf(n);
+                  if (old >= 0) this._children.splice(old, 1);
+                  this._children.push(n);
+                  n.parentElement = n.parentNode = this;
+                  const si = select.options.indexOf(n);
+                  if (select._selected === n && si >= 0) { /* moved, still ours */ }
+                  return n;
+                },
+                removeChild(n) {
+                  const i = this._children.indexOf(n);
+                  if (i >= 0) this._children.splice(i, 1);
+                  const oi = select.options.indexOf(n);
+                  if (oi >= 0) select.options.splice(oi, 1);
+                  return n;
+                },
+                // OptGroup IS a ParentNode in real browsers, so it has
+                // replaceChildren too. Without this the production code falls
+                // through to the driver-only fallbacks and the test never
+                // exercises the path that cleared the browser selection.
+                replaceChildren(...nodes) {
+                  for (const n of this._children) n.parentElement = n.parentNode = null;
+                  this._children = [];
+                  select._selected = null;   // re-parenting clears the select
+                  for (const n of nodes) this.appendChild(n);
+                },
+                closest(sel) { return sel === 'select' ? select : null; }};
+select.children.push(groupA);
+for (const [value, text] of [
+  ['@custom:newapi:zulu', 'zulu'],
+  ['@custom:newapi:middle', 'middle'],
+  ['@custom:newapi:alpha', 'alpha'],
+]) {
+  const opt = makeOption(value, text);
+  select._append(opt);
+  groupA._children.push(opt);
+}
+
+// The user has "middle" selected (session model), then triggers a re-sort —
+// either the "Show all" path or a live catalog refresh that reorders the group.
+select.selectedIndex = select.options.indexOf(
+  select.options.find(o => o.value === '@custom:newapi:middle'));
+
+_sortModelPickerOptions(groupA);
+
+process.stdout.write(JSON.stringify({
+  order: Array.from(groupA.children).map(o => o.value),
+  selectedValue: select.selectedOptions.length
+    ? select.selectedOptions[0].value : null,
+}));
+'''
+
+
+def test_sort_model_picker_options_preserves_native_selection(tmp_path):
+    """Reordering <option> nodes must not reset the <select>'s selection.
+
+    Regression for the maintainer's 2026-10-07 CORE finding on #7528:
+    `_sortModelPickerOptions` called `replaceChildren()`, which re-parents every
+    option node and clears the select's selection. After "Show all" (or any live
+    catalog refresh that reorders the group) the picker snapped back to the first
+    option, and the subsequent change handler hit the unchanged-selection early
+    return — so picking another model left the session on the old one.
+    """
+    if not NODE:
+        pytest.skip("node not available")
+    driver = tmp_path / "select_restore_driver.js"
+    driver.write_text(_SELECT_RESTORE_DRIVER, encoding="utf-8")
+    result = subprocess.run(
+        [NODE, str(driver), str(REPO / "static" / "ui.js")],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    # Sorting really happened (alpha order), so the selection had to survive it.
+    assert payload["order"] == [
+        "@custom:newapi:alpha",
+        "@custom:newapi:middle",
+        "@custom:newapi:zulu",
+    ]
+    assert payload["selectedValue"] == "@custom:newapi:middle"
