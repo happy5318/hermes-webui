@@ -658,6 +658,11 @@ const LOCALES = {
     update_updating: 'Updating…',
     update_dirty_local_changes: 'Local changes detected',
     update_force: 'Force update',
+    // #7679 round 2: shown when the destructive grant is retired between the
+    // confirm and the POST (a newer check, a channel change, an Apply retry).
+    // Without this key the real locale runtime rendered the raw key name to the
+    // user, so the message read "force_no_longer_applicable".
+    force_no_longer_applicable: 'Force update is no longer applicable — the update state changed. Please check again.',
     update_clear_lock_retry: 'Clear lock and retry update',
     update_hard_refresh_now: 'Hard refresh now',
     update_no_target: 'No update target selected. Refresh update status and retry.',
@@ -2542,6 +2547,11 @@ const LOCALES = {
     update_updating: 'Updating…',
     update_dirty_local_changes: 'Modifiche locali rilevate',
     update_force: 'Force update',
+    // #7679 round 2: shown when the destructive grant is retired between the
+    // confirm and the POST (a newer check, a channel change, an Apply retry).
+    // Without this key the real locale runtime rendered the raw key name to the
+    // user, so the message read "force_no_longer_applicable".
+    force_no_longer_applicable: 'Force update is no longer applicable — the update state changed. Please check again.',
     update_clear_lock_retry: 'Clear lock and retry update',
     update_hard_refresh_now: 'Hard refresh now',
     update_no_target: 'No update target selected. Refresh update status and retry.',
@@ -8748,6 +8758,11 @@ const LOCALES = {
     update_updating: 'Updating…',
     update_dirty_local_changes: 'Se detectaron cambios locales',
     update_force: 'Force update',
+    // #7679 round 2: shown when the destructive grant is retired between the
+    // confirm and the POST (a newer check, a channel change, an Apply retry).
+    // Without this key the real locale runtime rendered the raw key name to the
+    // user, so the message read "force_no_longer_applicable".
+    force_no_longer_applicable: 'Force update is no longer applicable — the update state changed. Please check again.',
     update_clear_lock_retry: 'Clear lock and retry update',
     update_hard_refresh_now: 'Hard refresh now',
     update_no_target: 'No update target selected. Refresh update status and retry.',
@@ -10180,6 +10195,11 @@ const LOCALES = {
     update_updating: 'Updating…',
     update_dirty_local_changes: 'Lokale Änderungen erkannt',
     update_force: 'Force update',
+    // #7679 round 2: shown when the destructive grant is retired between the
+    // confirm and the POST (a newer check, a channel change, an Apply retry).
+    // Without this key the real locale runtime rendered the raw key name to the
+    // user, so the message read "force_no_longer_applicable".
+    force_no_longer_applicable: 'Force update is no longer applicable — the update state changed. Please check again.',
     update_clear_lock_retry: 'Clear lock and retry update',
     update_hard_refresh_now: 'Hard refresh now',
     update_no_target: 'No update target selected. Refresh update status and retry.',
@@ -13282,6 +13302,11 @@ const LOCALES = {
     update_updating: 'Updating…',
     update_dirty_local_changes: '偵測到本地修改',
     update_force: 'Force update',
+    // #7679 round 2: shown when the destructive grant is retired between the
+    // confirm and the POST (a newer check, a channel change, an Apply retry).
+    // Without this key the real locale runtime rendered the raw key name to the
+    // user, so the message read "force_no_longer_applicable".
+    force_no_longer_applicable: 'Force update is no longer applicable — the update state changed. Please check again.',
     update_clear_lock_retry: 'Clear lock and retry update',
     update_hard_refresh_now: 'Hard refresh now',
     update_no_target: 'No update target selected. Refresh update status and retry.',
@@ -15000,6 +15025,11 @@ const LOCALES = {
     update_updating: 'Updating…',
     update_dirty_local_changes: 'Alterações locais detectadas',
     update_force: 'Force update',
+    // #7679 round 2: shown when the destructive grant is retired between the
+    // confirm and the POST (a newer check, a channel change, an Apply retry).
+    // Without this key the real locale runtime rendered the raw key name to the
+    // user, so the message read "force_no_longer_applicable".
+    force_no_longer_applicable: 'Force update is no longer applicable — the update state changed. Please check again.',
     update_clear_lock_retry: 'Clear lock and retry update',
     update_hard_refresh_now: 'Hard refresh now',
     update_no_target: 'No update target selected. Refresh update status and retry.',
@@ -16722,6 +16752,11 @@ const LOCALES = {
     update_updating: 'Updating…',
     update_dirty_local_changes: '로컬 변경 사항 감지됨',
     update_force: 'Force update',
+    // #7679 round 2: shown when the destructive grant is retired between the
+    // confirm and the POST (a newer check, a channel change, an Apply retry).
+    // Without this key the real locale runtime rendered the raw key name to the
+    // user, so the message read "force_no_longer_applicable".
+    force_no_longer_applicable: 'Force update is no longer applicable — the update state changed. Please check again.',
     update_clear_lock_retry: 'Clear lock and retry update',
     update_hard_refresh_now: 'Hard refresh now',
     update_no_target: 'No update target selected. Refresh update status and retry.',
@@ -18560,6 +18595,11 @@ const LOCALES = {
     update_updating: 'Updating…',
     update_dirty_local_changes: 'Modifications locales détectées',
     update_force: 'Force update',
+    // #7679 round 2: shown when the destructive grant is retired between the
+    // confirm and the POST (a newer check, a channel change, an Apply retry).
+    // Without this key the real locale runtime rendered the raw key name to the
+    // user, so the message read "force_no_longer_applicable".
+    force_no_longer_applicable: 'Force update is no longer applicable — the update state changed. Please check again.',
     update_clear_lock_retry: 'Clear lock and retry update',
     update_hard_refresh_now: 'Hard refresh now',
     update_no_target: 'No update target selected. Refresh update status and retry.',
@@ -20815,6 +20855,11 @@ const LOCALES = {
     update_updating: 'Updating…',
     update_dirty_local_changes: 'Zjištěny místní změny',
     update_force: 'Force update',
+    // #7679 round 2: shown when the destructive grant is retired between the
+    // confirm and the POST (a newer check, a channel change, an Apply retry).
+    // Without this key the real locale runtime rendered the raw key name to the
+    // user, so the message read "force_no_longer_applicable".
+    force_no_longer_applicable: 'Force update is no longer applicable — the update state changed. Please check again.',
     update_clear_lock_retry: 'Clear lock and retry update',
     update_hard_refresh_now: 'Hard refresh now',
     update_no_target: 'No update target selected. Refresh update status and retry.',
@@ -22135,6 +22180,11 @@ const LOCALES = {
     update_updating: 'Updating…',
     update_dirty_local_changes: 'Yerel değişiklikler algılandı',
     update_force: 'Force update',
+    // #7679 round 2: shown when the destructive grant is retired between the
+    // confirm and the POST (a newer check, a channel change, an Apply retry).
+    // Without this key the real locale runtime rendered the raw key name to the
+    // user, so the message read "force_no_longer_applicable".
+    force_no_longer_applicable: 'Force update is no longer applicable — the update state changed. Please check again.',
     update_clear_lock_retry: 'Clear lock and retry update',
     update_hard_refresh_now: 'Hard refresh now',
     update_no_target: 'No update target selected. Refresh update status and retry.',
@@ -23975,6 +24025,11 @@ const LOCALES = {
     update_updating: 'Updating…',
     update_dirty_local_changes: 'Wykryto lokalne zmiany',
     update_force: 'Force update',
+    // #7679 round 2: shown when the destructive grant is retired between the
+    // confirm and the POST (a newer check, a channel change, an Apply retry).
+    // Without this key the real locale runtime rendered the raw key name to the
+    // user, so the message read "force_no_longer_applicable".
+    force_no_longer_applicable: 'Force update is no longer applicable — the update state changed. Please check again.',
     update_clear_lock_retry: 'Clear lock and retry update',
     update_hard_refresh_now: 'Hard refresh now',
     update_no_target: 'No update target selected. Refresh update status and retry.',
@@ -26815,6 +26870,11 @@ const LOCALES = {
     update_updating: 'Updating…',
     update_dirty_local_changes: 'Đã phát hiện thay đổi cục bộ',
     update_force: 'Force update',
+    // #7679 round 2: shown when the destructive grant is retired between the
+    // confirm and the POST (a newer check, a channel change, an Apply retry).
+    // Without this key the real locale runtime rendered the raw key name to the
+    // user, so the message read "force_no_longer_applicable".
+    force_no_longer_applicable: 'Force update is no longer applicable — the update state changed. Please check again.',
     update_clear_lock_retry: 'Clear lock and retry update',
     update_hard_refresh_now: 'Hard refresh now',
     update_no_target: 'No update target selected. Refresh update status and retry.',
