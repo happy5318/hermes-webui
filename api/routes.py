@@ -8670,6 +8670,101 @@ def _lookup_cli_session_metadata(session_id: str, *, all_profiles: bool = False)
     return {}
 
 
+def _lookup_cli_session_owner_readonly(
+    session_id: str,
+    *,
+    allowed_profiles: "list[str] | None" = None,
+) -> dict:
+    """Exact-owner, read-only cross-profile metadata lookup.
+
+    ``_lookup_cli_session_metadata(all_profiles=True)`` routes through
+    ``get_cli_sessions()``, whose projection reaches ``Session.load`` when a
+    legacy sidecar layout makes ``load_metadata_only`` fall back. That
+    collapse-and-save (with a ``.bak``) is a WRITE, and it fired on the
+    DENIED-archive path: a 409 for a foreign session still rewrote the
+    neighbouring sidecar (#7826 security finding, reproduced with real auth).
+
+    This helper never loads a sidecar. It enumerates each profile's
+    HERMES_HOME, opens that profile's ``state.db`` with
+    ``open_state_db_readonly``, and reads the one row for ``session_id``
+    through a parameterized query. ``allowed_profiles`` restricts the scan to
+    the profiles the caller is authorised for, so a bound user gets no
+    metadata about a foreign owner at all.
+
+    Returns ``{}`` when the id is unknown or lives outside the allowed set —
+    the caller then takes its normal 404 self-heal path.
+    """
+    if not session_id:
+        return {}
+    sid = str(session_id)
+    try:
+        from api.models import (
+            _active_state_db_path,
+            _all_profiles_cli_contexts,
+        )
+        from api.profiles import (
+            _profiles_root,
+            get_active_profile_name,
+            get_hermes_home_for_profile,
+        )
+    except Exception:
+        return {}
+
+    allowed = None
+    if allowed_profiles is not None:
+        allowed = {str(p or "default").strip() or "default" for p in allowed_profiles}
+
+    # Reuse the model layer's per-profile context enumeration (home + state.db
+    # path per profile) so this scan and the sidebar agree on what exists.
+    # ``_all_profiles_cli_contexts`` is itself exception-guarded and returns
+    # [] on any failure.
+    try:
+        contexts, _cache_key = _all_profiles_cli_contexts()
+    except Exception:
+        contexts = []
+
+    if not contexts:
+        # Single-profile fallback: the active profile's own store only.
+        try:
+            home = Path(get_hermes_home_for_profile(get_active_profile_name()))
+            db = home / "state.db"
+            contexts = [(home, db, str(get_active_profile_name() or "default"))]
+        except Exception:
+            return {}
+
+    for _home, db_path, profile_value in contexts:
+        profile_name = str(profile_value or "default").strip() or "default"
+        if allowed is not None and profile_name not in allowed:
+            continue
+        try:
+            if not db_path or not db_path.exists():
+                continue
+            with closing(open_state_db_readonly(db_path)) as conn:
+                conn.row_factory = sqlite3.Row
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT id, source, started_at, ended_at, message_count "
+                    "FROM sessions WHERE id = ? LIMIT 1",
+                    (sid,),
+                )
+                row = cur.fetchone()
+        except Exception:
+            continue
+        if row is None:
+            continue
+        return {
+            "session_id": sid,
+            "profile": profile_name,
+            "source": (row["source"] if "source" in row.keys() else "") or "",
+            "started_at": (row["started_at"] if "started_at" in row.keys() else None),
+            "ended_at": (row["ended_at"] if "ended_at" in row.keys() else None),
+            "message_count": (
+                row["message_count"] if "message_count" in row.keys() else 0
+            ),
+        }
+    return {}
+
+
 def _session_index_marks_was_webui(sid: str) -> bool:
     """Return True iff ``sid`` is in the WebUI session index as a WebUI- or
     fork-origin row whose sidecar is now gone.
@@ -18357,7 +18452,16 @@ def handle_post(handler, parsed) -> bool:
                 # #7549: the active-profile lookup above found nothing, but the
                 # all-profiles sidebar shows this session — retry the CLI
                 # metadata lookup across every profile before declaring 404.
-                cli_meta = _lookup_cli_session_metadata(sid, all_profiles=True)
+                # #7826 security: the all-profiles fallback must NOT go
+                # through get_cli_sessions() here. Its projection reaches
+                # Session.load on a legacy sidecar layout, which collapses
+                # duplicate partials and SAVES (with a .bak) — a WRITE that
+                # fired on this DENIED-archive path and rewrote a foreign
+                # sidecar. Use the read-only, exact-owner query instead: it
+                # opens each profile's state.db read-only and never loads a
+                # sidecar. Returns {} for unknown ids, so the 404 self-heal
+                # still fires exactly as before.
+                cli_meta = _lookup_cli_session_owner_readonly(sid)
             if not cli_meta:
                 return bad(handler, "Session not found", 404)
             # #7549: the session exists in another profile's store. Mirror the
