@@ -3383,9 +3383,15 @@ function _sortModelPickerOptions(group){
     for(const option of ordered) group.appendChild(option);
   }
   if(select&&selectedOption){
-    if(Array.from(group.children).indexOf(selectedOption)>=0){
+    // #7528 [CORE]: look the captured option up in the WHOLE select, not just
+    // this group. Sorting a second group re-orders its own <optgroup> and
+    // leaves the other groups' options in place, so a selection living in a
+    // different group is still in `select.options` but is no longer in
+    // `group.children` — the old membership check then cleared the selection.
+    const allOptions='options' in select?Array.from(select.options):Array.from(group.children);
+    if(allOptions.indexOf(selectedOption)>=0){
       selectedOption.selected=true;
-      if('selectedIndex' in select) select.selectedIndex=Array.from(select.options).indexOf(selectedOption);
+      if('selectedIndex' in select) select.selectedIndex=allOptions.indexOf(selectedOption);
     }else if('selectedIndex' in select){
       select.selectedIndex=-1;
     }

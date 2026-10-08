@@ -494,7 +494,8 @@ def test_python_comparator_classifies_only_ascii_digits_as_digit_runs():
 # A bare id and its routed twin (``a-model`` vs ``@custom:abc:a-model``) strip
 # to the same routing-stripped key, so they compare EQUAL here and Python's
 # stable sort preserves input order. The picker's ``_compareModelPickerEntries``
-# has a raw-id tie-break and sorts routed-first instead.
+# has a raw-id tie-break and sorts routed first — now verified by running the
+# real JS comparator rather than by comparing Python strings.
 #
 # This test PINS the deliberate asymmetry instead of "fixing" it. Adding a raw
 # tie-break to the API key was tried and is WRONG: it flips the API order for
@@ -534,8 +535,90 @@ def test_provider_aware_tie_is_left_equal_by_design():
     assert bare_key is not routed_key  # distinct objects that compare equal
 
     # 3. the frontend's own tie-break is recorded, not silently ignored.
-    frontend_routed_first = _TIE_ROUTED < _TIE_BARE  # '@' < 'a' by code point
-    assert frontend_routed_first
+    # The claim below used to be a plain Python string compare
+    # (`'@custom:abc:a-model' < 'a-model'`), which asserts Python's opinion
+    # rather than the shipped comparator's. It happens to agree on the direction
+    # (routed first), but it would keep passing even if the JS tie-break flipped,
+    # so run the REAL comparator and pin both directions.
+    assert _frontend_compares_routed_first() is True
+    assert _frontend_compares_bare_first() is False
+
+
+# ── Frontend comparator probe (#7528 round-5 maintainer item) ───────────────
+# `test_provider_aware_tie_is_left_equal_by_design` used to assert the JS
+# tie-break with a Python string compare (`'@custom:abc:a-model' < 'a-model'`).
+# That documents Python's opinion, not the browser's, so the tie-policy finding
+# stayed open. This driver runs the production `_compareModelPickerEntries`.
+_TIE_BREAK_DRIVER = r'''
+const fs = require('fs');
+const ui = fs.readFileSync(process.argv[2], 'utf8');
+
+function extractFunction(name) {
+  const re = new RegExp('function\\s+' + name + '\\s*\\(');
+  const start = ui.search(re);
+  if (start < 0) throw new Error(name + ' not found');
+  let i = ui.indexOf('{', ui.indexOf(')', start));
+  let depth = 1;
+  i += 1;
+  while (depth > 0 && i < ui.length) {
+    if (ui[i] === '{') depth += 1;
+    else if (ui[i] === '}') depth -= 1;
+    i += 1;
+  }
+  return ui.slice(start, i);
+}
+
+eval([
+  '_modelPickerContractRuns',
+  '_modelPickerCompareRuns',
+  '_modelPickerCompareContract',
+  '_modelPickerSortableId',
+  '_modelPickerSortValue',
+  '_compareModelPickerEntries',
+].map(extractFunction).join('\n'));
+
+const BARE = process.argv[3];
+const ROUTED = process.argv[4];
+// Negative => `first` sorts before `second`. The tie pair is
+// '@custom:abc:a-model' (routed) vs 'a-model' (bare).
+console.log(JSON.stringify({ cmp: _compareModelPickerEntries(ROUTED, BARE) }));
+'''
+
+
+def _frontend_compares_routed_first() -> bool:
+    """Run the production JS comparator on the tie pair and report its verdict."""
+    if NODE is None:
+        pytest.skip("node not on PATH")
+    return _run_frontend_tie_comparator(_TIE_ROUTED, _TIE_BARE) < 0
+
+
+def _frontend_compares_bare_first() -> bool:
+    """The mirror question, pinned so the tie-break direction cannot flip quietly."""
+    if NODE is None:
+        pytest.skip("node not on PATH")
+    return _run_frontend_tie_comparator(_TIE_BARE, _TIE_ROUTED) < 0
+
+
+def _run_frontend_tie_comparator(first: str, second: str) -> int:
+    """Call the shipped `_compareModelPickerEntries(first, second)` and return it."""
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(
+        "w", suffix=".js", delete=False, encoding="utf-8"
+    ) as fh:
+        fh.write(_TIE_BREAK_DRIVER)
+        driver = Path(fh.name)
+    try:
+        result = subprocess.run(
+            [NODE, str(driver), str(REPO / "static" / "ui.js"), first, second],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert result.returncode == 0, result.stderr
+        return int(json.loads(result.stdout)["cmp"])
+    finally:
+        driver.unlink(missing_ok=True)
 
 
 # Node driver that reproduces the select-selection reset. It builds a REAL
@@ -714,3 +797,233 @@ def test_sort_model_picker_options_preserves_native_selection(tmp_path):
         "@custom:newapi:zulu",
     ]
     assert payload["selectedValue"] == "@custom:newapi:middle"
+
+
+# ── Cross-group selection restore (#7528 round-5 maintainer CORE) ───────────
+# The single-group driver above can only catch a restore that looks in the WRONG
+# PLACE when the selection is inside the group being sorted. The maintainer's
+# remaining [CORE] is the other half: the selection lives in a DIFFERENT
+# optgroup. Sorting provider B re-orders B's own <optgroup> and leaves A's
+# options untouched, so the captured option is still in `select.options` but is
+# no longer in `group.children` — a restore that checks only the sorted group's
+# children concludes the option was removed and sets selectedIndex = -1.
+#
+# Reproduced by the maintainer in Chromium at 1280px and 390px: master retains
+# the selection, the PR head cleared it (Settings lost `other-z` on a zero-add
+# live refresh; a real HTTP Save left the default on `middle` with dirty state
+# cleared).
+_CROSS_GROUP_RESTORE_DRIVER = r'''
+const fs = require('fs');
+const ui = fs.readFileSync(process.argv[2], 'utf8');
+
+function extractFunction(name) {
+  const re = new RegExp('function\\s+' + name + '\\s*\\(');
+  const start = ui.search(re);
+  if (start < 0) throw new Error(name + ' not found');
+  let i = ui.indexOf('{', ui.indexOf(')', start));
+  let depth = 1;
+  i += 1;
+  while (depth > 0 && i < ui.length) {
+    if (ui[i] === '{') depth += 1;
+    else if (ui[i] === '}') depth -= 1;
+    i += 1;
+  }
+  return ui.slice(start, i);
+}
+
+eval([
+  '_modelPickerContractRuns',
+  '_modelPickerCompareRuns',
+  '_modelPickerCompareContract',
+  '_modelPickerSortableId',
+  '_modelPickerSortValue',
+  '_compareModelPickerEntries',
+  '_sortModelPickerEntries',
+  '_sortModelPickerOptions',
+].map(extractFunction).join('\n'));
+
+// ── Minimal DOM with the browser's <select> selection contract ────────────
+function makeOption(value, text) {
+  return {tagName: 'OPTION', value: value, text: text, selected: false,
+          parentElement: null, parentNode: null};
+}
+function makeSelect() {
+  const sel = {
+    tagName: 'SELECT',
+    options: [],
+    children: [],
+    _selected: null,
+    get selectedIndex() {
+      return this._selected ? this.options.indexOf(this._selected) : -1;
+    },
+    set selectedIndex(i) {
+      if (this._selected) this._selected.selected = false;
+      this._selected = (i >= 0 && i < this.options.length) ? this.options[i] : null;
+      if (this._selected) this._selected.selected = true;
+    },
+    get selectedOptions() { return this._selected ? [this._selected] : []; },
+    replaceChildren(...nodes) {
+      for (const n of this.children) n.parentElement = n.parentNode = null;
+      this.children = [];
+      this._selected = null;          // re-parenting drops the selection
+      for (const n of nodes) this._append(n);
+    },
+    _append(n) {
+      this.children.push(n);
+      this.options.push(n);
+      n.parentElement = n.parentNode = this;
+    },
+    appendChild(n) { this._append(n); },
+  };
+  return sel;
+}
+
+// Same contract as the single-group driver: `children` must be
+// HTMLCollection-like, otherwise the production code takes the driver-mode
+// fallback branch and never exercises the real replaceChildren() path.
+class FakeHTMLCollection {
+  constructor(items) { this._items = items.slice(); }
+  get length() { return this._items.length; }
+  item(i) { return this._items[i]; }
+  [Symbol.iterator]() { return this._items[Symbol.iterator](); }
+  slice() { return this._items.slice(); }
+  indexOf(o) { return this._items.indexOf(o); }
+}
+
+function makeGroup(select, provider) {
+  const group = {
+    tagName: 'OPTGROUP',
+    dataset: {provider: provider},
+    get children() { return new FakeHTMLCollection(this._children); },
+    _children: [],
+    parentElement: select, parentNode: select,
+    appendChild(n) {
+      const old = this._children.indexOf(n);
+      if (old >= 0) this._children.splice(old, 1);
+      this._children.push(n);
+      n.parentElement = n.parentNode = this;
+      return n;
+    },
+    removeChild(n) {
+      const i = this._children.indexOf(n);
+      if (i >= 0) this._children.splice(i, 1);
+      const oi = select.options.indexOf(n);
+      if (oi >= 0) select.options.splice(oi, 1);
+      return n;
+    },
+    replaceChildren(...nodes) {
+      for (const n of this._children) n.parentElement = n.parentNode = null;
+      this._children = [];
+      select._selected = null;   // re-parenting clears the select
+      for (const n of nodes) this.appendChild(n);
+    },
+    closest(sel) { return sel === 'select' ? select : null; },
+  };
+  select.children.push(group);
+  return group;
+}
+
+function addOption(select, group, value, text) {
+  const opt = makeOption(value, text);
+  select._append(opt);
+  group._children.push(opt);
+  opt.parentElement = opt.parentNode = group;
+  return opt;
+}
+
+const select = makeSelect();
+// Two provider groups. `options` is the whole <select>, `children` is per group.
+const groupA = makeGroup(select, 'custom:newapi');
+const groupB = makeGroup(select, 'custom:other');
+addOption(select, groupA, '@custom:newapi:zulu', 'zulu');
+addOption(select, groupB, '@custom:other:zulu', 'other-zulu');
+addOption(select, groupA, '@custom:newapi:alpha', 'alpha');
+addOption(select, groupB, '@custom:other:alpha', 'other-alpha');
+
+// The selection lives in group B. Sorting group A must not disturb it — the
+// captured option is still in select.options but is no longer in
+// groupA.children, which is exactly what the broken restore missed.
+const otherZulu = select.options.find(o => o.value === '@custom:other:zulu');
+select.selectedIndex = select.options.indexOf(otherZulu);
+
+_sortModelPickerOptions(groupA);
+
+process.stdout.write(JSON.stringify({
+  orderA: Array.from(groupA.children).map(o => o.value),
+  orderB: Array.from(groupB.children).map(o => o.value),
+  selectedValue: select.selectedOptions.length
+    ? select.selectedOptions[0].value : null,
+  selectedIndex: select.selectedIndex,
+}));
+'''
+
+
+def test_sorting_another_group_keeps_the_selected_option(tmp_path):
+    """Sorting provider A must not clear a selection that lives in provider B.
+
+    Regression for the maintainer's 2026-10-08 [CORE] on #7528: the restore
+    after a re-sort looked the captured option up only in the SORTED group's
+    `children`. Sorting a different provider re-orders that group's own
+    <optgroup> and leaves the other groups' options in place, so the selection
+    was still in `select.options` but not in `group.children` — the restore
+    concluded it had been removed and set `selectedIndex = -1`.
+
+    Verified in Chromium at 1280px and 390px: master retains the selection, the
+    PR head cleared it. In Settings a zero-add live refresh lost `other-z`, and
+    a real HTTP Save left the default on `middle` with dirty state cleared.
+    """
+    if not NODE:
+        pytest.skip("node not available")
+    driver = tmp_path / "cross_group_restore_driver.js"
+    driver.write_text(_CROSS_GROUP_RESTORE_DRIVER, encoding="utf-8")
+    result = subprocess.run(
+        [NODE, str(driver), str(REPO / "static" / "ui.js")],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    # The sort really happened (alpha order inside group A).
+    assert payload["orderA"] == [
+        "@custom:newapi:alpha",
+        "@custom:newapi:zulu",
+    ]
+    # Group B was not the sorted one, so its own order is untouched.
+    assert payload["orderB"] == [
+        "@custom:other:zulu",
+        "@custom:other:alpha",
+    ]
+    # The whole point: the selection in the OTHER group survives.
+    assert payload["selectedValue"] == "@custom:other:zulu"
+    assert payload["selectedIndex"] == 1
+
+
+def test_cross_group_restore_preserves_no_selection(tmp_path):
+    """`selectedIndex` must stay -1 when nothing was selected before the sort.
+
+    The fix looks the option up in the whole `select.options`; it must not turn
+    a genuinely empty selection into an accidental one, nor invent a selection
+    where the user had none.
+    """
+    if not NODE:
+        pytest.skip("node not available")
+    driver = tmp_path / "cross_group_noselect_driver.js"
+    driver.write_text(
+        _CROSS_GROUP_RESTORE_DRIVER.replace(
+            "const otherZulu = select.options.find(o => o.value === '@custom:other:zulu');\n"
+            "select.selectedIndex = select.options.indexOf(otherZulu);",
+            "// Nothing selected: leave selectedIndex at its initial -1.",
+        ),
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [NODE, str(driver), str(REPO / "static" / "ui.js")],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["selectedValue"] is None
+    assert payload["selectedIndex"] == -1

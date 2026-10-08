@@ -52,7 +52,7 @@ PORT = int(os.getenv("HERMES_WEBUI_PORT", "8787"))
 
 
 def _natural_model_id_key(_m, _provider_id: str = ""):
-    """Locale-independent natural sort key for model ids (#7528 round-4).
+    r"""Locale-independent natural sort key for model ids (#7528 round-4).
 
     Contract shared with the frontend ``_compareModelPickerEntries`` in
     ``static/ui.js``: no localeCompare, no browser collation — both sides run
@@ -7870,7 +7870,9 @@ def _static_models_catalog_without_live_probes() -> dict:
 
         # Alphabetize model entries within each provider group (natural,
         # case-insensitive numeric order, mirroring the frontend
-        # localeCompare(numeric:true) comparator). Previously models kept
+        # `_natural_model_id_key` comparator — the localeCompare(numeric:true)
+        # comparator this comment used to name was replaced in #7528).
+        # Previously models kept
         # insertion order from config/live /v1/models probes, so a group
         # like newapi showed jd-* / sn-* / sub-* intermixed in scramble
         # (user request 2026-09-05). Natural order keeps model-2 before
@@ -11366,7 +11368,8 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
 
         # Alphabetize model entries within each provider group (natural,
         # case-insensitive numeric order). Mirrors the static catalog path
-        # (and the frontend localeCompare(numeric:true) comparator) so live
+        # (and the frontend `_natural_model_id_key` comparator, which replaced
+        # the localeCompare(numeric:true) one this comment used to name) so live
         # /v1/models probe results are also sorted by model id, with
         # model-2 before model-10 at every boundary (user request 2026-09-05).
         for _group in groups:
