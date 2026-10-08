@@ -48,11 +48,17 @@ def scripts_dir() -> Path:
 
 
 def _is_safe_script_name(name: str) -> bool:
-    """Slug-format guard for ``?name=`` query params.
+    """Containment guard for a script name coming from outside this module.
 
-    Reject empty, slash, backslash, dot-dot, control characters, and
-    anything that isn't a portable POSIX filename. The route layer
-    should call this before any filesystem read.
+    Rejects empty, over-long, path separators, NUL, control characters and the
+    dot entries. This is a SECURITY boundary, not a filename policy: a script
+    the installed Agent will run must not disappear from the panel because its
+    name is not a URL slug (#7685 finding 3). ``my job.py`` and ``résumé.sh``
+    are perfectly good scripts, so anything that survives the traversal checks
+    below is accepted and the transport encodes it.
+
+    The checks are ordered cheapest-first and every one of them is a traversal
+    or control-character test — never a character-class whitelist.
     """
     if not name or len(name) > 128:
         return False
@@ -60,7 +66,13 @@ def _is_safe_script_name(name: str) -> bool:
         return False
     if name in (".", ".."):
         return False
-    if not re.fullmatch(r"[A-Za-z0-9._-]+", name):
+    # A leading dot would hide the entry from the Agent's own conventions and
+    # from a plain directory listing, so it is not a runnable script name.
+    if name.startswith("."):
+        return False
+    # Control characters have no business in a filename and would corrupt the
+    # HTTP response that carries it.
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in name):
         return False
     return True
 
@@ -233,6 +245,13 @@ def _read_bounded(fd: int, limit: int) -> _BoundedRead:
     remaining = limit
     failed = False
     detail = ""
+    # #7685 finding 3 (SHOULD-FIX): "stopped at the cap" is not the same as
+    # "there is more". A file of EXACTLY `limit` bytes reads to remaining == 0
+    # and then hits EOF, so it is complete — the old `remaining == 0` test
+    # reported it as truncated. Truncation means the cap was reached AND at
+    # least one more byte exists, so the loop below records whether the read
+    # that emptied `remaining` was an EOF or another chunk.
+    hit_eof = False
     while remaining > 0:
         try:
             chunk = os.read(fd, min(remaining, 65536))
@@ -241,12 +260,25 @@ def _read_bounded(fd: int, limit: int) -> _BoundedRead:
             detail = f"{exc.__class__.__name__}: {exc}"
             break
         if not chunk:
+            hit_eof = True
             break
         chunks.append(chunk)
         remaining -= len(chunk)
+    # The cap truncates only when it stopped the read before EOF. A file of
+    # exactly `limit` bytes fills the budget and then hits EOF on the NEXT read,
+    # so after the loop empties `remaining` we probe once more: an empty read
+    # proves the file ended exactly at the cap and is complete.
+    if not failed and remaining == 0 and limit > 0:
+        try:
+            hit_eof = not os.read(fd, 1)
+        except OSError:
+            # The probe itself failed; treat the cap as truncating rather than
+            # claiming a completeness we could not observe.
+            hit_eof = False
+    truncated = not failed and not hit_eof and remaining == 0 and limit > 0
     return _BoundedRead(
         ok=not failed,
-        truncated=not failed and remaining == 0 and limit > 0,
+        truncated=truncated,
         content=b"".join(chunks),
         detail=detail,
     )

@@ -1092,13 +1092,24 @@ function _invalidateScriptsForProfileSwitch(){
 
 // Shared refresh: called when a switch is ACCEPTED (new owner is now the
 // current profile) AND when a switch is REFUSED (we are still on the old
-// profile — restoring beats leaving the pane blank, #7685 finding 5). The
-// load is silent-on-error so a background switch refresh that fails cannot
-// paint a spurious banner over a pane we are deliberately repopulating.
+// profile — restoring beats leaving the pane blank, #7685 finding 5).
+//
+// #7685 finding 1 (MUST-FIX): the refresh decision is made HERE, from the
+// subtab's visibility AT THIS MOMENT, not from a flag captured at switch
+// start. Opening Scripts while a switch is still pending used to leave the
+// flag false, so nothing repainted the pane for the new owner.
+//
+// The load is silent-on-error ONLY when the pane is not visible: a background
+// switch refresh must not paint a banner over a pane we are deliberately
+// repopulating, but a VISIBLE pane that fails to reload must keep showing
+// "Could not load scripts." instead of going blank (#7685 finding 2).
 function _refreshScriptsAfterProfileSwitch(){
-  if (!_scriptsSwitchNeedsRefresh) return;
+  if (_currentTasksSubtab !== 'scripts') return;
   _scriptsSwitchNeedsRefresh = false;
-  if (typeof loadScriptsList === 'function') loadScriptsList(true, true);
+  if (typeof loadScriptsList !== 'function') return;
+  // `silent` is false for a visible pane so a failed reload keeps its error
+  // state; the pane is dimmed while the load is in flight.
+  loadScriptsList(false, false);
 }
 
 // The publication gate every Scripts reply must pass. A reply is current
@@ -7335,6 +7346,17 @@ async function switchToProfile(name) {
     // the new owner (its rows were cleared at switch start). The load's own
     // owner/generation gate drops any still-in-flight reply from the old
     // owner.
+    //
+    // #7685 finding 1 (MUST-FIX): invalidate AGAIN here, at accept. The
+    // canonical switch does not change S.activeProfile until its POST
+    // returns, so a list load issued while the switch was PENDING captured
+    // the OLD owner key and passed its gate — it repainted the previous
+    // profile's rows under the new profile. Bumping the generation at accept
+    // retires that in-flight reply, and the refresh below repopulates the
+    // pane for the owner that is now current.
+    if (typeof _invalidateScriptsForProfileSwitch === 'function') {
+      _invalidateScriptsForProfileSwitch();
+    }
     if (typeof _refreshScriptsAfterProfileSwitch === 'function') {
       _refreshScriptsAfterProfileSwitch();
     }

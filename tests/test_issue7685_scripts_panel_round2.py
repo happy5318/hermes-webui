@@ -332,8 +332,13 @@ def test_short_read_still_loops_and_then_marks_truncation_at_the_cap(
 def test_a_capped_read_is_flagged_truncated(scripts_module) -> None:
     """A read that stopped at the cap must say so; the old flag was missing."""
     mod, scripts_dir = scripts_module
-    # Exactly the cap: the reader stops when the budget is exhausted, which
-    # means there might be more — and by construction there is.
+    # Exactly the cap, and NOTHING after it: the reader stops when the budget is
+    # exhausted, but a follow-up read returns EOF, so the file is COMPLETE.
+    #
+    # #7685 finding 3: this assertion used to demand truncated=True here. The
+    # old reader treated "budget exhausted" as "there is more", which is wrong
+    # for the exact-cap file — it is the only size where the two are not
+    # distinguishable by the budget alone, so the reader now probes once more.
     (scripts_dir / "exact.py").write_text(
         "a" * mod._MAX_SCRIPT_BYTES, encoding="utf-8"
     )
@@ -342,7 +347,7 @@ def test_a_capped_read_is_flagged_truncated(scripts_module) -> None:
     assert result["size"] == mod._MAX_SCRIPT_BYTES
     assert result["too_large"] is False
     assert len(result["content"]) == mod._MAX_SCRIPT_BYTES
-    assert result["truncated"] is True
+    assert result["truncated"] is False
 
 
 def test_a_failed_read_reports_the_error_it_caught(scripts_module, monkeypatch) -> None:
