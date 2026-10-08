@@ -1448,13 +1448,17 @@ function _restoreComposerDraftAfterFailedSend(draftText, filesSnapshot, sid, cle
         if(stillVisible){
           const inp=$('msg');
           const liveText=inp?String(inp.value||''):restore;
-          if(_restoreContId&&typeof _setRestoredGoalContinuationDraft==='function'){
-            // Keep the token bound to whatever text is now in the composer: the
-            // unchanged restore keeps it; a user edit makes the token fail
-            // closed (it no longer belongs to that text).
-            _setRestoredGoalContinuationDraft(_restoreContId,liveText);
+          // #7855 CORE (round 6): the token survives the reload only if it is
+          // persisted WITH this text. Pass it through; the save helper drops it
+          // when the text is gone, so an abandoned draft cannot orphan a token.
+          if(_restoreContId&&typeof _setRestoredGoalContinuationDraft==='function'
+             && String(liveText||'').trim()===String(restore||'').trim()){
+            // Unchanged restore: keep the one-shot binding so a one-key resend
+            // still carries the token in-page as well as across a reload.
+            _setRestoredGoalContinuationDraft(_restoreContId,restore);
           }
-          _saveComposerDraftNow(sid, liveText, S.pendingFiles?[...S.pendingFiles]:[]);
+          _saveComposerDraftNow(sid, liveText, S.pendingFiles?[...S.pendingFiles]:[],
+            String(liveText||'').trim()===String(restore||'').trim()?_restoreContId:'');
         } else if(!restoredVisible){
           // Background failure (sid was never the visible session): no live
           // composer to read, so persist the captured snapshot — it's the only copy.
@@ -1501,7 +1505,17 @@ async function send(){
       // pending record before the real continuation drained. So the only ID
       // this entry may carry is one this invocation owns.
       const _requeueEntry={text:_text,files:[...S.pendingFiles],model:_modelState.model,model_provider:_modelState.model_provider,profile:S.activeProfile||'default'};
-      if(_goalContinuationId) _requeueEntry.goal_continuation_id=_goalContinuationId;
+      // #7855 SHOULD-FIX (round 6): the re-entrant guard runs BEFORE the
+      // restored-draft resolution below, so a restored continuation that is
+      // re-entered while a send is in flight was queued WITHOUT its token and
+      // left the dataset marker on the composer. Resolve the token here too —
+      // only when this invocation does not already own one from its argument,
+      // so a genuine turn can never inherit another invocation's ID.
+      let _requeueContId=_goalContinuationId;
+      if(!_requeueContId&&typeof _takeRestoredDraftGoalContinuationId==='function'){
+        _requeueContId=_takeRestoredDraftGoalContinuationId(_text);
+      }
+      if(_requeueContId) _requeueEntry.goal_continuation_id=_requeueContId;
       queueSessionMessage(_targetSid,_requeueEntry);
       _clearComposerAfterQueuedSelectionSend();
       if(_targetSid&&typeof _clearComposerDraft==='function'&&_targetSid!==(S.session&&S.session.session_id)) _clearComposerDraft(_targetSid,_text,S.pendingFiles?[...S.pendingFiles]:[]);
@@ -1581,12 +1595,19 @@ async function send(){
         }
       }
     const defaultMessageMode=window._defaultMessageMode||'steer';
-      if(defaultMessageMode==='steer'&&S.activeStreamId&&typeof _trySteer==='function'){
+      if(defaultMessageMode==='steer'&&S.activeStreamId&&typeof _trySteer==='function'&&!_goalContinuationId){
         // Real steer: clear the input first so the user gets immediate
         // feedback, then ship the steer payload via /api/chat/steer.
         // _trySteer captures the owner session/files before awaiting uploads,
         // restores/persists the draft on failure, and clears the owner draft
         // only after /api/chat/steer accepts.
+        //
+        // #7855 SHOULD-FIX (round 6): a tokenized continuation must NOT be
+        // steered. Steering injects it into the live run, nothing is queued or
+        // posted, and the server's pending continuation record is orphaned (no
+        // TTL) — on master the loop continued on the next turn, so steering it
+        // here is a step back. A continuation falls through to the queue
+        // branches, which carry the token.
         $('msg').value='';autoResize();
         // Do NOT clear pendingFiles yet — _trySteer uploads with clearPending=false,
         // and a failed steer must keep staged files available for the user's next explicit action.

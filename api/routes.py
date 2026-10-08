@@ -8754,6 +8754,40 @@ def _is_subagent_child_session_id(sid: str) -> bool:
     return _state_db_session_source(sid) == "subagent"
 
 
+def _project_session_draft_write(write: dict, current_draft: dict) -> dict:
+    """Apply a ``/api/session/draft`` write to the stored draft.
+
+    #7855 CORE (round 6): the goal-continuation token is PART of the draft, so
+    it is written and cleared by exactly the same rules as the text:
+
+    - a non-empty ``goal_continuation_id`` is stored alongside the text it
+      belongs to;
+    - an explicitly EMPTY string clears it (the draft was edited, abandoned or
+      submitted);
+    - an absent field (``None``) leaves the stored token alone, so a plain
+      keystroke auto-save does not drop it.
+
+    Persisting the text without this is what made a reload between a failed
+    continuation start and its retry restore the words and lose the token — the
+    retry then posted ``goal_continuation_id: None`` and start admission scored
+    it ``goal_related=false``.
+    """
+    next_draft = dict(current_draft or {})
+    text = write.get("text")
+    files = write.get("files")
+    token = write.get("goal_continuation_id")
+    if text is not None:
+        next_draft["text"] = text
+    if files is not None:
+        next_draft["files"] = files
+    if token is not None:
+        if token:
+            next_draft["goal_continuation_id"] = token
+        else:
+            next_draft.pop("goal_continuation_id", None)
+    return next_draft
+
+
 def _session_is_subagent_view_only(sid: str) -> bool:
     """Return True when ``sid`` is a delegated subagent child by ANY signal —
     state.db source OR a persisted WebUI sidecar tagged subagent.
@@ -16954,6 +16988,16 @@ def handle_post(handler, parsed) -> bool:
             return bad(handler, "Subagent sessions are view-only and cannot store a draft from WebUI", 400)
         text = body.get("text")
         files = body.get("files")
+        # #7855 CORE (round 6): the goal-continuation token travels with the draft
+        # it belongs to. Persisting the text alone meant a reload between a failed
+        # continuation start and its retry restored the words and dropped the
+        # token, so the retry posted goal_continuation_id: None and start
+        # admission scored it goal_related=false.
+        goal_continuation_id = body.get("goal_continuation_id")
+        if goal_continuation_id is not None and not isinstance(goal_continuation_id, str):
+            goal_continuation_id = ""
+        if isinstance(goal_continuation_id, str):
+            goal_continuation_id = goal_continuation_id.strip()
         # Stage-326 hardening (per Opus advisor): size + type validation on
         # the draft inputs. Without this, a misbehaving or malicious client
         # can persist multi-MB strings into the session JSON on every keystroke
@@ -16982,6 +17026,10 @@ def handle_post(handler, parsed) -> bool:
                 next_draft["text"] = text
             if files is not None:
                 next_draft["files"] = files
+            next_draft = _project_session_draft_write(
+                {"text": text, "files": files, "goal_continuation_id": goal_continuation_id},
+                next_draft,
+            )
             if next_draft == current_draft:
                 unchanged = True
                 saved_draft = current_draft

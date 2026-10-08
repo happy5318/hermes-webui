@@ -98,8 +98,14 @@ def test_reentrancy_guard_never_reads_a_shared_continuation_slot():
         "the shared in-flight continuation slot must be gone — it is what let a "
         "genuine re-entrant turn steal the parked continuation's ID"
     )
-    assert "if(_goalContinuationId) _requeueEntry.goal_continuation_id=_goalContinuationId;" in guard_block, (
-        "a re-entrant send may only requeue with a continuation ID of its OWN"
+    # Round 6 SHOULD-FIX: the guard also resolves a restored-draft token, but
+    # only one bound to the exact text being sent — never another invocation's.
+    assert "_requeueContId=_goalContinuationId" in guard_block, (
+        "the re-entrant guard must seed the requeue token from its own argument"
+    )
+    assert "_takeRestoredDraftGoalContinuationId(_text)" in guard_block, (
+        "a restored continuation re-entered mid-send must resolve its token "
+        "inside the guard, or it is queued without one"
     )
 
 

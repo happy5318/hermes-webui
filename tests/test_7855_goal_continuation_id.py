@@ -461,8 +461,21 @@ class TestFrontendWiring:
         assert "_normalizeGoalContinuationId(_sendInProgressGoalContinuationId)" not in guard, (
             "the re-entrant guard must not read a shared in-flight continuation ID"
         )
-        assert "if(_goalContinuationId) _requeueEntry.goal_continuation_id=_goalContinuationId;" in guard, (
-            "a re-entrant send may only requeue with a continuation ID of its OWN"
+        # Round 6 SHOULD-FIX: the guard runs before the restored-draft
+        # resolution, so a restored continuation re-entered mid-send was queued
+        # without its token. It now resolves the token the same one-shot way
+        # send() does — from its OWN argument first, then from the restored
+        # draft bound to the exact text being sent. Still never another
+        # invocation's ID.
+        assert "_requeueContId=_goalContinuationId" in guard, (
+            "the re-entrant guard must seed the requeue token from its own argument"
+        )
+        assert "_takeRestoredDraftGoalContinuationId(_text)" in guard, (
+            "a restored continuation re-entered mid-send must resolve its token "
+            "inside the guard, or it is queued without one"
+        )
+        assert "_requeueEntry.goal_continuation_id=_requeueContId" in guard, (
+            "the requeue entry must carry the token this invocation owns"
         )
 
     def test_failed_start_restore_carries_the_id(self):
