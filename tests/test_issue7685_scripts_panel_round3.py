@@ -30,7 +30,6 @@ Driven against the REAL functions, same harness style as
 from __future__ import annotations
 
 import os
-import stat as stat_module
 import subprocess
 import sys
 import tempfile
