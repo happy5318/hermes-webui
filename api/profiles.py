@@ -1221,7 +1221,15 @@ def profile_env_for_background_worker(
         # unresolvable profile home logs a diagnosable line and degrades to
         # the current env instead of breaking the worker (pre-existing
         # contract pinned by the title-routing regression test).
-        logger.debug(
+        #
+        # #7724 finding "Logger Override Is Bypassed": this path used the
+        # module logger, so a caller that supplied an override (background
+        # title, compression, checkpoint and route workers all do) lost this
+        # diagnostic from its intended channel — precisely when profile
+        # routing could not be established, which is when the line matters
+        # most. Every sibling failure path in this module already honours the
+        # override; this one was the exception.
+        (logger_override or logger).debug(
             "Failed to resolve profile env for %s profile %s; falling back to current env",
             purpose,
             profile,

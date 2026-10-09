@@ -11184,6 +11184,20 @@ def _maybe_start_session_visit_background_rebuild() -> None:
                     box["result"] = get_available_models(force_refresh=True)
             except BaseException as exc:  # noqa: BLE001
                 box["error"] = exc
+                # #7724 finding "Refresh Failures Stay Silent": the box used to
+                # be write-only. The thread is untracked the moment it exits, so
+                # a failure here left no diagnostic at all — the stale catalog
+                # stayed in place and every later stale visit silently launched
+                # another expensive retry. Log it the same way the foreground
+                # refresh path does, so a permanently failing rebuild is
+                # visible instead of looking like healthy staleness.
+                import logging as _logging
+
+                _logging.getLogger("api.config").debug(
+                    "session-visit background models rebuild failed for profile %r",
+                    profile_key or "",
+                    exc_info=exc,
+                )
             finally:
                 with _session_visit_rebuild_lock:
                     tracked = _session_visit_rebuild_threads.get(profile_key)
@@ -11196,7 +11210,32 @@ def _maybe_start_session_visit_background_rebuild() -> None:
             daemon=True,
         )
         _session_visit_rebuild_threads[profile_key] = thread
+
+    # #7724 finding "Thread Failure Breaks Cache": thread.start() can raise
+    # (e.g. can't create new thread under resource pressure). The exception used
+    # to escape this helper, so a session-visit request that already had a
+    # perfectly usable stale catalog in hand turned into an HTTP 500 — and the
+    # cleanup that removes the tracker entry lives inside the worker, which
+    # never ran. Untrack here and fall through to the caller's stale return,
+    # matching the analogous stale-cache launcher elsewhere in this module.
+    #
+    # This MUST run outside ``_session_visit_rebuild_lock``: that lock is not
+    # reentrant and the tracker mutation above happens inside it, so taking it
+    # again here would self-deadlock and hang the request thread — a strictly
+    # worse outcome than the 500 being fixed.
+    try:
         thread.start()
+    except Exception:
+        with _session_visit_rebuild_lock:
+            if _session_visit_rebuild_threads.get(profile_key) is thread:
+                _session_visit_rebuild_threads.pop(profile_key, None)
+        import logging as _logging
+
+        _logging.getLogger("api.config").debug(
+            "session-visit background models rebuild could not start for profile %r",
+            profile_key or "",
+            exc_info=True,
+        )
 
 
 def _maybe_log_slow_stages(
