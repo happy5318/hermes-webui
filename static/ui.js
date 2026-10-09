@@ -3395,6 +3395,14 @@ function _sortModelPickerOptions(group){
     }else if('selectedIndex' in select){
       select.selectedIndex=-1;
     }
+  }else if(select&&'selectedIndex' in select){
+    // #7528 [SILENT]: a zero-add live refresh on an initially unselected
+    // picker must keep it unselected. `selectedOption` is null here, so the
+    // restore above is skipped entirely and the browser is free to keep (or
+    // adopt) whatever index the re-rendered options left behind — observed as
+    // selectedIndex=-1 becoming a real model, which a later Settings save then
+    // persists as the default. Master preserves the empty selection.
+    select.selectedIndex=-1;
   }
 }
 const MODEL_STATE_KEY='hermes-webui-model-state';
