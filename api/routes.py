@@ -8785,6 +8785,28 @@ def _project_session_draft_write(write: dict, current_draft: dict) -> dict:
             next_draft["goal_continuation_id"] = token
         else:
             next_draft.pop("goal_continuation_id", None)
+    else:
+        # #7855 CORE (round 7, MUST-FIX 1): a keystroke changes the text the
+        # token is bound to, so "the user has not touched the token" is not a
+        # reason to keep it. The keystroke autosave (static/boot.js -> static/
+        # sessions.js) and the session-switch save never send the field, and
+        # the old absent-field rule then stored the user's edited text next to
+        # the stale token. Restoring that pair on reload and sending it posted
+        # the edited text WITH the continuation id, so a genuine turn consumed
+        # the real continuation record (the #6885 bug this PR exists to fix).
+        #
+        # When the stored draft's text changed, the token no longer describes
+        # it: drop it. An unchanged text (a plain re-save of the same draft)
+        # keeps it, which is the case the absent-field rule was written for.
+        # Pending records have no TTL (api/goals.py), so nothing else expires
+        # the stale binding.
+        _stored_text = (current_draft or {}).get("text")
+        if (
+            "goal_continuation_id" in next_draft
+            and text is not None
+            and text != _stored_text
+        ):
+            next_draft.pop("goal_continuation_id", None)
     return next_draft
 
 
@@ -16998,6 +17020,21 @@ def handle_post(handler, parsed) -> bool:
             goal_continuation_id = ""
         if isinstance(goal_continuation_id, str):
             goal_continuation_id = goal_continuation_id.strip()
+        # #7855 P1 (Greptile, round 7): unlike draft text, this field had no
+        # size or shape limit before it was persisted into the session JSON.
+        # An authenticated client could submit a value approaching the
+        # request-body limit on every keystroke, consuming storage and
+        # slowing session operations. The producer mints uuid4().hex
+        # (api/goals.py) and admission itself requires exactly 32 lowercase
+        # hex characters, so anything else can never match a pending record
+        # anyway — drop it here rather than store it.
+        if isinstance(goal_continuation_id, str) and goal_continuation_id:
+            _looks_like_cont_id = (
+                len(goal_continuation_id) == 32
+                and all(c in "0123456789abcdef" for c in goal_continuation_id.lower())
+            )
+            if not _looks_like_cont_id:
+                goal_continuation_id = ""
         # Stage-326 hardening (per Opus advisor): size + type validation on
         # the draft inputs. Without this, a misbehaving or malicious client
         # can persist multi-MB strings into the session JSON on every keystroke

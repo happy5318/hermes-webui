@@ -87,6 +87,23 @@ function _clearRestoredGoalContinuationDraft(){
     delete _msg.dataset.goalContinuationText;
   }catch(_){ }
 }
+// #7855 CORE (round 7): the NON-CONSUMING read of the same binding. The
+// session-switch save needs to persist the departing session's continuation
+// token, but consuming it here would disarm the one-shot marker before the
+// user's resend could claim it. Returns {id, text} or null, and never mutates
+// the dataset — callers compare text themselves and decide what to persist.
+function _peekRestoredGoalContinuationDraft(){
+  try{
+    const _msg=(typeof $==='function')?$('msg'):null;
+    if(!_msg||!_msg.dataset) return null;
+    const _draftId=_normalizeGoalContinuationId(_msg.dataset.goalContinuationId);
+    if(!_draftId) return null;
+    return {
+      id:_draftId,
+      text:String(_msg.dataset.goalContinuationText||'').trim(),
+    };
+  }catch(_){ return null; }
+}
 
 function _bgTaskCompleteRingBufferAdd(sid, evt_id) {
   // Missing key → treat as "seen/skip" (return true). The sole caller already
@@ -1462,7 +1479,12 @@ function _restoreComposerDraftAfterFailedSend(draftText, filesSnapshot, sid, cle
         } else if(!restoredVisible){
           // Background failure (sid was never the visible session): no live
           // composer to read, so persist the captured snapshot — it's the only copy.
-          _saveComposerDraftNow(sid, restore, files);
+          // #7855 CORE (round 7): the token must travel with that snapshot.
+          // The background restore saves only text/files, so a return to this
+          // session and a retry posted no id and start admission scored it
+          // goal_related=false (master scores true). Pass the restored
+          // continuation id alongside the exact text it belongs to.
+          _saveComposerDraftNow(sid, restore, files, _restoreContId);
         }
         // else: restored the visible composer, then the user switched away — the
         // session-switch save path already saved sid's composer; skip stale write.
