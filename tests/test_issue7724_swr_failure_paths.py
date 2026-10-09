@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import logging
 import threading as _real_threading
-from types import SimpleNamespace
 
 import pytest
 
