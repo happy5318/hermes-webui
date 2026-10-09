@@ -425,7 +425,7 @@ def test_models_sync_rebuild_uses_legacy_mirrored_env(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "_available_models_cache_source_fingerprint", None)
     monkeypatch.setattr(config, "_cache_build_in_progress", False)
     monkeypatch.setattr(config, "_load_models_cache_from_disk", lambda: None)
-    monkeypatch.setattr(config, "_save_models_cache_to_disk", lambda result: None)
+    monkeypatch.setattr(config, "_save_models_cache_to_disk", lambda result, **_kwargs: None)
     monkeypatch.setattr(config, "_models_cache_source_fingerprint", lambda: "issue-3957")
     seen = {}
 
@@ -515,11 +515,11 @@ def test_models_sync_rebuild_preserves_request_profile_after_publication(
 
     real_save = config._save_models_cache_to_disk
 
-    def _save_probe(cache):
+    def _save_probe(cache, **_kwargs):
         seen["save_name"] = profiles.get_active_profile_name()
         seen["save_path"] = config._get_models_cache_path().name
         seen["save_hermes_home"] = os.environ.get("HERMES_HOME")
-        return real_save(cache)
+        return real_save(cache, **_kwargs)
 
     monkeypatch.setattr(config, "_save_models_cache_to_disk", _save_probe)
 

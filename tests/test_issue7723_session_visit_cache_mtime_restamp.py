@@ -261,7 +261,7 @@ def test_dual_profile_alternation_triggers_per_profile_rebuild(tmp_path, monkeyp
     monkeypatch.setattr(cfg, "_load_models_cache_from_disk", _load_for_profile)
     monkeypatch.setattr(cfg, "_load_stale_models_cache_from_disk", _load_for_profile)
     monkeypatch.setattr(cfg, "_models_cache_source_fingerprint", lambda: {"profile": "test"})
-    monkeypatch.setattr(cfg, "_save_models_cache_to_disk", lambda _cache: None)
+    monkeypatch.setattr(cfg, "_save_models_cache_to_disk", lambda _cache, **_kw: None)
     # Force every visit to walk the disk / SWR path (process-global memory
     # cache is irrelevant to this test's per-profile horizon semantics).
     monkeypatch.setattr(cfg, "_get_fresh_memory_models_cache", lambda _now: None)
@@ -419,7 +419,7 @@ def test_same_profile_concurrent_stale_visits_coalesce_to_one_rebuild(tmp_path, 
     monkeypatch.setattr(cfg, "_load_models_cache_from_disk", lambda: stale_catalog)
     monkeypatch.setattr(cfg, "_load_stale_models_cache_from_disk", lambda: stale_catalog)
     monkeypatch.setattr(cfg, "_models_cache_source_fingerprint", lambda: {"profile": "demo"})
-    monkeypatch.setattr(cfg, "_save_models_cache_to_disk", lambda _cache: None)
+    monkeypatch.setattr(cfg, "_save_models_cache_to_disk", lambda _cache, **_kw: None)
     monkeypatch.setattr(cfg, "get_available_models", _slow_rebuild)
 
     with ThreadPoolExecutor(max_workers=2) as executor:
@@ -467,7 +467,7 @@ def test_disk_mtime_only_moves_on_real_rebuild(tmp_path, monkeypatch):
     rebuild_started = threading.Event()
     rebuild_release = threading.Event()
 
-    def _track_save(cache):
+    def _track_save(cache, **_kw):
         disk_save_calls.append({"time": time.time()})
         # Mimic the real save's mtime advance (write_text does os.write +
         # close, which updates st_mtime to "now" on most filesystems).
@@ -809,7 +809,7 @@ def test_swr_two_profile_barrier_no_env_leak(tmp_path, monkeypatch):
     monkeypatch.setattr(cfg, "_load_models_cache_from_disk", lambda: _catalog("stale"))
     monkeypatch.setattr(cfg, "_load_stale_models_cache_from_disk", lambda: _catalog("stale"))
     monkeypatch.setattr(cfg, "_models_cache_source_fingerprint", lambda: {"profile": "test"})
-    monkeypatch.setattr(cfg, "_save_models_cache_to_disk", lambda _cache: None)
+    monkeypatch.setattr(cfg, "_save_models_cache_to_disk", lambda _cache, **_kw: None)
     monkeypatch.setattr(cfg, "_get_fresh_memory_models_cache", lambda _now: None)
 
     def _stale_visit_for(profile_name: str, cache_path: Path):
