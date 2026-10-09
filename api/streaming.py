@@ -7368,6 +7368,7 @@ def _sanitize_messages_for_agent(
     effective_provider: str | None = None,
     effective_base_url: str | None = None,
     requested_provider: str = "",
+    normalize_bare_assistant_adjacency: bool = False,
 ):
     """Build the internal Agent replay projection with ``api_content`` intact.
 
@@ -7375,8 +7376,17 @@ def _sanitize_messages_for_agent(
     payload field.  Keep this opt-in at one named boundary so every Agent
     history call uses the same contract while ordinary API/compression callers
     continue to use the default-stripping sanitizer.
+
+    ``normalize_bare_assistant_adjacency`` (``#7237 review round 3 finding 5``)
+    collapses two adjacent BARE assistant rows the way the installed Agent's
+    own ``repair_message_sequence`` does. It defaults to False because the
+    direct-provider projection and the Gateway runs-API history builder must
+    keep those rows as separate turns (#8034 parity). Only the Agent-replay
+    caller turns it on: that is the path whose snapshot the settle compares
+    against the Agent's returned list, so it must model the Agent's merge or
+    every second successive follow-up drops its prompt and reply.
     """
-    return _sanitize_messages_for_api(
+    sanitized = _sanitize_messages_for_api(
         messages,
         cfg=cfg,
         effective_model=effective_model,
@@ -7385,6 +7395,60 @@ def _sanitize_messages_for_agent(
         preserve_api_content=True,
         requested_provider=requested_provider,
     )
+    if normalize_bare_assistant_adjacency:
+        sanitized = _merge_agent_replay_bare_assistant_rows(sanitized)
+    return sanitized
+
+
+def _merge_agent_replay_bare_assistant_rows(messages):
+    """Mirror the installed Agent's merge of adjacent bare assistant rows.
+
+    The Agent's ``repair_message_sequence`` merges consecutive assistant turns
+    unconditionally, including two plain-text rows with no tool call and no
+    merge-visible discriminator. ``_merge_consecutive_assistant_rows``
+    deliberately leaves that pair alone so the #8034 direct-provider/Gateway
+    parity contract holds.
+
+    The Agent-replay projection cannot follow either contract in isolation: it
+    is the input the Agent will re-merge, and it is also the snapshot the settle
+    diffs against the Agent's output. Leaving the pair unmerged there means the
+    Agent merges it, the returned prefix no longer matches the snapshot, and
+    settlement rejects the changed prefix — dropping the next prompt and reply
+    (#7237 review round 3 finding 5).
+
+    This helper applies the Agent's rule only, on a copy, for that one caller.
+    It never widens the provider projection.
+    """
+    if not isinstance(messages, list):
+        return messages
+    merged: list = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            merged.append(msg)
+            continue
+        prev = merged[-1] if merged and isinstance(merged[-1], dict) else None
+        if (
+            prev is not None
+            and prev.get("role") == "assistant"
+            and msg.get("role") == "assistant"
+        ):
+            survivor = copy.deepcopy(prev)
+            prev_content = survivor.get("content")
+            new_content = msg.get("content")
+            if isinstance(prev_content, str) and isinstance(new_content, str):
+                joined = "\n".join(
+                    part for part in (prev_content.strip(), new_content.strip()) if part
+                )
+                if joined:
+                    survivor["content"] = joined
+            elif not prev_content and new_content is not None:
+                survivor["content"] = new_content
+            if not survivor.get("reasoning_content") and msg.get("reasoning_content"):
+                survivor["reasoning_content"] = msg.get("reasoning_content")
+            merged[-1] = survivor
+            continue
+        merged.append(msg)
+    return merged
 
 
 def _api_safe_message_positions(messages):
@@ -8748,36 +8812,54 @@ def _current_turn_compression_rotation(
         # positional heuristics used to trust — is historical material and
         # must fail closed.
         return False
-    result = list(result_messages or [])
-    markers = [
-        (idx, m)
-        for idx, m in enumerate(result)
-        if isinstance(m, dict) and _is_context_compression_marker(m)
-    ]
-    if not markers:
-        return False
-    # The PRODUCER has already granted this turn's rotation authority, so no
-    # positional or role restriction may refuse it. The installed compressor
-    # emits the summary card in shapes this head previously rejected:
+    # #7237 review round 3 finding 4 (nesquena-hermes 2026-10-06): the producer
+    # has committed this rotation, so a MISSING marker must not veto it. The
+    # installed ``ContextCompressor.compress()`` assembles its summary as an
+    # assistant ``[PRIOR CONTEXT ...]`` carrier, which is not spelled
+    # ``[CONTEXT COMPACTION``; requiring that spelling refused a compression
+    # that had really run — 7 returned rows became 25 persisted old rows and
+    # the answer was absent, even with ``compression_authorized=True``.
     #
-    #   * first compression with a protected head: the head is kept verbatim
-    #     (user, assistant, user) and the synthetic summary lands AFTER it at
-    #     index 3 as an ASSISTANT row (``_summary_placement`` -> assistant);
-    #   * a later compression whose head protection has decayed
-    #     (``compress_start == 0``) forces a user-leading summary card at
-    #     index 0 with role USER.
-    #
-    # A helper that demands ``markers[0][0] == 0`` refuses the protected-head
-    # shape, and one that drops user-role markers refuses the decayed-head
-    # shape. Both are genuine productions of the context layer and must be
-    # accepted for wholesale replacement: the session id has rotated, the
-    # answer is displayed, but persisting the uncompacted raw history
-    # resends oversized context on the next turn and re-authorizes the
-    # plague. With authority in hand, the only remaining guard is that a
-    # compaction card actually exists somewhere in the return (any role, any
-    # position). (#7237 review round-N+2 finding 1, nesquena-hermes
-    # 2026-10-05).
+    # Authority comes from the producer, never from marker presence. The shapes
+    # the installed compressor emits vary by head protection — an assistant
+    # ``[PRIOR CONTEXT ...]`` carrier, a user-leading card at index 0, a card
+    # after a protected head — so this helper deliberately inspects none of
+    # them. Every accepted shape is a genuine production of the context layer,
+    # and every rejected shape is a caller that observed no rotation.
     return True
+
+
+def _producer_committed_compression(agent, session_id):
+    """True when the PRODUCER really replaced the context inside this call.
+
+    ``#7237 review round 3 (nesquena-hermes 2026-10-06)``: wholesale-replacement
+    authority must be derived from actual producer commitment, never from marker
+    spelling, marker placement, or a single proxy signal.
+
+    Two independent producer commitments exist, and a settle must honour both:
+
+    1. **Rotated session id.** The context layer hands a rotated conversation a
+       fresh id, so a non-empty continuation id inside this call means a
+       compression really ran here.
+
+    2. **Committed in-place compression.** The installed Agent can compress
+       *in place*: it keeps its session id, rewrites the context, and records
+       ``agent._last_compaction_in_place = True``. This is the default on the
+       installed Agent, so the id-rotation proxy alone never sees it — the settle
+       then refused a compression the producer had already committed, and the
+       sync route kept the 24 old context rows while dropping the answer.
+
+    A marker appearing in the payload is NOT evidence: a replayed, drifted, or
+    relocated marker is historical material and earns no authority.
+    """
+    if agent is None:
+        return False
+    rotated = bool(
+        getattr(agent, "session_id", None)
+        and getattr(agent, "session_id", None) != session_id
+    )
+    in_place = bool(getattr(agent, "_last_compaction_in_place", False))
+    return rotated or in_place
 
 
 def _dedupe_replayed_context_messages(
@@ -9510,6 +9592,20 @@ def _proven_tail_merge_exchange(
         return None
     # The merged row carries the polluted tail + current prompt; clean it back to
     # the submitted turn and keep every row after it (the current-turn suffix).
+    #
+    # #7237 review round 3 finding 3 (nesquena-hermes 2026-10-06): the boundary
+    # row's ownership is ESTABLISHED here — it is the row the Agent produced for
+    # THIS call, validated by ``_detect_stale_user_merge`` against the submitted
+    # prompt. Content equality must not erase that.
+    #
+    # The replay stripper keys purely on ``(role, text, tool ids)``
+    # (``_message_replay_key`` -> ``_message_identity``), so a same-text re-ask
+    # makes the cleaned boundary row byte-identical to the unanswered tail at
+    # the end of ``previous_context``. ``_strip_replayed_prefix`` then measures
+    # that as a replay overlap and drops the row — the reply ships with no
+    # prompt in front of it, and the current turn's user row is gone. The token
+    # survives ``copy.deepcopy``, so ownership IS available here; the stripper
+    # simply cannot see it.
     cleaned_boundary = copy.deepcopy(boundary_row)
     cleaned_boundary["content"] = msg_text
     cleaned_boundary.pop("api_content", None)
@@ -9519,6 +9615,25 @@ def _proven_tail_merge_exchange(
         _clean = _strip_replayed_context_items(previous_context, _clean)
     if not _clean:
         return cleaned_rows, None
+    # Restore the verified boundary row if the text-keyed strip consumed it.
+    # This is NOT a blanket "keep the current turn" rule: the row was proven to
+    # be the Agent's output for THIS call by ``_detect_stale_user_merge``, so
+    # removing it discards a turn the producer really answered. A row that
+    # fails that proof never reaches this branch (the gate above returns None),
+    # so the re-ask cannot use this path to resurrect historical material.
+    #
+    # It goes back where the Agent put it: immediately before the current-turn
+    # assistant suffix that follows it. Inserting after that suffix would
+    # produce ``assistant, user`` — a user turn answering nothing.
+    if not any(
+        isinstance(row, dict) and row is cleaned_boundary for row in _clean
+    ):
+        _insert_at = len(_clean)
+        for _idx, _row in enumerate(_clean):
+            if isinstance(_row, dict) and _row.get("role") == "assistant":
+                _insert_at = _idx
+                break
+        _clean = _clean[:_insert_at] + [cleaned_boundary] + _clean[_insert_at:]
     return _clean, None
 
 
@@ -14403,6 +14518,14 @@ def _run_agent_streaming(
                     effective_provider=resolved_provider,
                     effective_base_url=resolved_base_url,
                     requested_provider=(_session_requested_provider or ""),
+                    # #7237 review round 3 finding 5 (nesquena-hermes
+                    # 2026-10-06): model the installed Agent's unconditional
+                    # merge of adjacent bare assistant rows on the replay
+                    # projection. Without it the Agent merges the pair, the
+                    # returned prefix stops matching this snapshot, and the
+                    # second successive follow-up loses its prompt and reply.
+                    # Default-off elsewhere so #8034 wire parity is untouched.
+                    normalize_bare_assistant_adjacency=True,
                 ),
                 conversation_history_revision=_conversation_history_revision,
                 task_id=session_id,
@@ -14485,10 +14608,16 @@ def _run_agent_streaming(
             # merely appears — replayed, drifted, or relocated to index 0 — is
             # historical material and gets no authority. Computed once, right
             # after the Agent returns, and threaded per-call into the settle.
-            _compressed_this_turn = bool(
-                getattr(agent, "session_id", None)
-                and getattr(agent, "session_id", None) != session_id
-            )
+            # ``#7237 review round 3 (nesquena-hermes 2026-10-06)``: the
+            # producer can commit compression in place (keeping its session id
+            # and setting ``_last_compaction_in_place``), which the installed
+            # Agent does by default. The old id-rotation-only proxy therefore
+            # never saw the most common case, and a genuinely compressed turn
+            # was refused by the settle — the answer vanished and the 24 old
+            # rows survived. Honour both producer commitments through the
+            # shared predicate, which both the streaming and sync settles now
+            # call so they cannot drift apart again.
+            _compressed_this_turn = _producer_committed_compression(agent, session_id)
             _active_turn_identity = _resolve_active_turn_authority(
                 _active_turn_identity,
                 result=result,
@@ -15043,6 +15172,13 @@ def _run_agent_streaming(
                                         effective_provider=resolved_provider,
                                         effective_base_url=resolved_base_url,
                                         requested_provider=(_session_requested_provider or ""),
+                                        # #7237 round 3 finding 5: the heal retry
+                                        # re-enters the same Agent with the same
+                                        # replay contract, so it must apply the
+                                        # same bare-assistant normalization as
+                                        # the primary send or the retry's snapshot
+                                        # diverges from what the Agent returns.
+                                        normalize_bare_assistant_adjacency=True,
                                     ),
                                     conversation_history_revision=(
                                         _heal_conversation_history_revision
@@ -16418,6 +16554,10 @@ def _run_agent_streaming(
                                 effective_provider=resolved_provider,
                                 effective_base_url=resolved_base_url,
                                 requested_provider=(_session_requested_provider or ""),
+                                # #7237 round 3 finding 5: same Agent-replay
+                                # normalization as the primary send and the
+                                # first heal retry.
+                                normalize_bare_assistant_adjacency=True,
                             ),
                             conversation_history_revision=(
                                 _heal_conversation_history_revision

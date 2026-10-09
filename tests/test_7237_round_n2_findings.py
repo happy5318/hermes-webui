@@ -135,14 +135,39 @@ class TestFinding1AuthorizedGenuineRotationAccepted:
             result, self._projection(), self.PROMPT, compression_authorized=False,
         ), "without producer authority even a genuine-looking marker must fail closed"
 
-    def test_authorized_no_marker_fails_closed(self):
+    def test_authorized_no_marker_is_still_a_rotation(self):
+        """#7237 round 3 finding 4, REVERSED: marker presence is not authority.
+
+        This test previously asserted the opposite — that an authorized return
+        with no ``[CONTEXT COMPACTION`` card must fail closed. The reviewer
+        disproved that against the real producer: the installed
+        ``ContextCompressor.compress()`` assembles its summary as an assistant
+        ``[PRIOR CONTEXT ...]`` carrier, which is not spelled that way, so the
+        spelling check refused a compression that had genuinely run (7 returned
+        rows became 25 persisted old rows, answer absent).
+
+        Authority comes from the producer, never from marker presence.
+        """
+        result = [
+            {"role": "user", "content": self.PROMPT},
+            {"role": "assistant", "content": "the answer"},
+        ]
+        assert _current_turn_compression_rotation(
+            result, self._projection(), self.PROMPT, compression_authorized=True,
+        ), (
+            "producer authority must be enough on its own; requiring a "
+            "[CONTEXT COMPACTION card refuses real [PRIOR CONTEXT] summaries"
+        )
+
+    def test_unauthorized_no_marker_still_fails_closed(self):
+        """The negative control: no producer authority, no rotation — ever."""
         result = [
             {"role": "user", "content": self.PROMPT},
             {"role": "assistant", "content": "the answer"},
         ]
         assert not _current_turn_compression_rotation(
-            result, self._projection(), self.PROMPT, compression_authorized=True,
-        ), "authority without any compaction card in the return is not a rotation"
+            result, self._projection(), self.PROMPT, compression_authorized=False,
+        ), "without producer authority nothing may be treated as a rotation"
 
     def test_authorized_protected_head_full_settle_wholesales(self):
         projected = self._projection()

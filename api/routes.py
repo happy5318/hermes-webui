@@ -11470,6 +11470,7 @@ from api.streaming import (
     _sse_keepalive,
     _sse_set_write_deadline,
     _run_agent_streaming,
+    _producer_committed_compression,
     cancel_stream,
     _materialize_pending_user_turn_before_error,
     generate_session_title_for_session,
@@ -26912,12 +26913,30 @@ def _handle_chat_sync(handler, body):
             # sanitizer-rewritten historical rows beside the raw history
             # (#7237 review data-regression finding, nesquena-hermes
             # 2026-09-23).
-            _run_conversation_projected_history = _sanitize_messages_for_agent(
-                _previous_context_messages,
-                cfg=get_config(),
-                effective_model=_model,
-                effective_provider=_provider,
-                effective_base_url=_base_url,
+            # #7237 review round 3 finding 2 (nesquena-hermes 2026-10-06): the
+            # projection used to be passed BY REFERENCE and then reused for the
+            # prefix proof. The real Agent shallow-copies the list and performs
+            # its consecutive-user repair on the tail dict, so the same object
+            # the settle compares against had already been mutated. An
+            # unanswered-tail follow-up therefore lost its current user row.
+            #
+            # Take an INDEPENDENT deep snapshot here: the value handed to the
+            # Agent and the value compared at settle time must be two objects,
+            # or "what we sent" is a moving target.
+            _run_conversation_projected_history = copy.deepcopy(
+                _sanitize_messages_for_agent(
+                    _previous_context_messages,
+                    cfg=get_config(),
+                    effective_model=_model,
+                    effective_provider=_provider,
+                    effective_base_url=_base_url,
+                    # #7237 review round 3 finding 5 (nesquena-hermes
+                    # 2026-10-06): same Agent-replay adjacency normalization the
+                    # streaming path applies, so the sync settle models the
+                    # Agent's merge of bare assistant rows instead of rejecting
+                    # the changed prefix and dropping the exchange.
+                    normalize_bare_assistant_adjacency=True,
+                )
             )
 
             result = agent.run_conversation(
@@ -26962,10 +26981,16 @@ def _handle_chat_sync(handler, body):
     # producer signal is the same as the streaming path: the Agent rotating
     # its own session_id inside this call proves the context layer really ran
     # a compression turn.
-    _compression_authorized = bool(
-        getattr(agent, "session_id", None)
-        and getattr(agent, "session_id", None) != _sync_session_id
-    )
+    # #7237 review round 3 (nesquena-hermes 2026-10-06): the installed Agent
+    # compresses IN PLACE by default — it keeps its session id and commits
+    # ``_last_compaction_in_place``. The previous proxy
+    # (``agent.session_id != _sync_session_id``) could only see a rotation, so
+    # the default case was treated as "no compression", the settle refused the
+    # compacted result, and the route kept the 24 old context rows without the
+    # current answer. Derive the authority from actual producer commitment via
+    # the shared predicate the streaming settle uses, so the two paths cannot
+    # drift apart again.
+    _compression_authorized = _producer_committed_compression(agent, _sync_session_id)
     with _get_session_agent_lock(s.session_id):
         _result_messages = result.get("messages") or _previous_context_messages
         # Active-turn boundary is fixed BEFORE any restoration (same as streaming),
