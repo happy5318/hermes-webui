@@ -15316,7 +15316,8 @@ def _run_agent_streaming(
                 # the default profile's key.
                 from api import profiles as _profiles_api
                 with _profiles_api.profile_scope_for_detached_worker(
-                    _resolved_profile_name, "credential self-heal", logger_override=logger
+                    _resolved_profile_name, "credential self-heal", logger_override=logger,
+                    bind_root=_profiles_api.detached_worker_bind_root_for_profile(_resolved_profile_name),
                 ):
                     if _alias_route is not None:
                         # Re-read the alias's own credential source: the
