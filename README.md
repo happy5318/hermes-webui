@@ -211,7 +211,7 @@ If an AI assistant is helping with install, reinstall, bootstrap, provider setup
 - Message timestamps (HH:MM next to each message, full date on hover)
 - Code block copy button with "Copied!" feedback
 - Syntax highlighting via Prism.js (Python, JS, bash, JSON, SQL, and more)
-- Highlighted code blocks survive session switches and page reloads: tokenized HTML is cached per block, and a cache hit reproduces Prism's element setup (normalized `language-*` class on `<code>`/`<pre>`, keyboard-focusable `<pre>`) so a restored block is indistinguishable from a freshly highlighted one
+- Highlighted code blocks survive session switches: tokenized HTML is cached per block in a page-local map, and a cache hit reproduces Prism's element setup (normalized `language-*` class on `<code>`/`<pre>`, keyboard-focusable `<pre>`) so a restored block is indistinguishable from a freshly highlighted one. A cache entry is dropped once the Prism grammar state moves on, so returning to a session after another session loaded more grammars re-highlights instead of restoring stale tokens. The cache does not survive a page reload.
 - Safe HTML rendering in AI responses (bold, italic, code converted to markdown)
 - Bare HTTP(S) URLs are auto-linked without absorbing adjacent CJK prose; Unicode IDN host separators and raw-CJK IRI paths remain linkable
 - rAF-throttled token streaming for smoother rendering during long responses
