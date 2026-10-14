@@ -288,7 +288,19 @@ def _run_git(args, cwd, timeout=10):
             return stdout, True
         return stderr or stdout or f"git exited with status {r.returncode}", False
     except subprocess.TimeoutExpired as exc:
-        detail = (getattr(exc, 'stderr', None) or getattr(exc, 'stdout', None) or '').strip()
+        # text=True decodes only the *completed* run's pipes; on a timeout
+        # subprocess still hands back the raw partial output as bytes, so a
+        # timed-out command that had already printed (e.g. a slow `git pull`
+        # on a bad link) used to leak bytes into callers' str handling and
+        # crash the update endpoint with TypeError (#8198).
+        raw = getattr(exc, 'stderr', None) or getattr(exc, 'stdout', None) or ''
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode('utf-8', 'replace')
+        # The partial output is user-facing git text: a pull that died on a
+        # credentialed remote can echo the URL (with its token) before timing
+        # out, so run it through the same credential scrub the fetch path uses.
+        # limit=sys.maxsize: never truncate. Redaction can lengthen the text, so len(raw) would cut its tail.
+        detail = _sanitize_git_diagnostic(raw, limit=sys.maxsize)
         return detail or f"git {' '.join(args)} timed out after {timeout}s", False
     except FileNotFoundError:
         return 'git executable not found', False
@@ -2442,6 +2454,10 @@ def _apply_update_inner(target, channel=DEFAULT_UPDATE_CHANNEL):
         pull_args.extend(['origin', compare_ref])
     pull_out, pull_ok = _run_git(pull_args, path, timeout=30)
     if not pull_ok:
+        # Every pull-failure message below interpolates git's own output, and
+        # git echoes the remote URL (token included) when a pull dies. Scrub
+        # once here so no branch can leak it (#8198 follow-up).
+        pull_out = _sanitize_git_diagnostic(pull_out, limit=sys.maxsize)  # never truncate (redaction can lengthen)
         if _is_git_lock_error(pull_out):
             # Lock conflict during pull. If a stash was pushed for the local
             # modifications, attempt to restore it before returning so the

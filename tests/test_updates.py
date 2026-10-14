@@ -2392,3 +2392,130 @@ def test_run_git_still_authenticates_with_a_cached_credential(
     # path the prompt branch is unreachable and such an assertion could never fail:
     # structure, not evidence. The prompt path is asserted where it can fail, in
     # test_run_git_uses_a_configured_gui_credential_helper_without_prompting.
+
+
+def test_run_git_decodes_timeout_output_bytes(tmp_path):
+    """A timed-out git command that already printed must not leak bytes (#8198).
+
+    ``subprocess.run(text=True)`` only decodes the pipes of a *completed*
+    run; on ``TimeoutExpired`` the partial ``stdout``/``stderr`` still come
+    back as bytes. Returning them unchanged crashed every str-based caller
+    (e.g. the pull-failure diagnosis in apply_update) with TypeError.
+    """
+    with patch('subprocess.run') as mock_run:
+        mock_run.side_effect = subprocess.TimeoutExpired(
+            cmd=['git', 'pull', '--ff-only'], timeout=30,
+            output=b'remote: Counting objects:  50% (1/2)\r',
+        )
+        out, ok = updates._run_git(['pull', '--ff-only'], tmp_path, timeout=30)
+
+    assert ok is False
+    assert isinstance(out, str)
+    assert 'Counting objects' in out
+
+
+def test_run_git_timeout_without_output_reports_duration(tmp_path):
+    """Timeout with empty output still yields a readable str message."""
+    with patch('subprocess.run') as mock_run:
+        mock_run.side_effect = subprocess.TimeoutExpired(
+            cmd=['git', 'pull'], timeout=7,
+        )
+        out, ok = updates._run_git(['pull'], tmp_path, timeout=7)
+
+    assert ok is False
+    assert isinstance(out, str)
+    assert 'timed out after 7s' in out
+
+
+def test_apply_update_pull_timeout_returns_error_not_typeerror(tmp_path):
+    """apply_update must answer a pull timeout with a clean 200 payload.
+
+    End-to-end regression for #8198: the pull step times out after having
+    printed partial output, ``subprocess`` hands those bytes back on
+    ``TimeoutExpired``, and the old timeout branch forwarded them as-is.
+    The pull-failure diagnosis then did ``str in bytes`` and raised
+    TypeError, turning the endpoint into a 500 before the stash restore.
+    """
+    repo = tmp_path / 'repo'
+    (repo / '.git').mkdir(parents=True)
+
+    def fake_run(cmd, cwd=None, capture_output=False, text=False,
+                 timeout=10, encoding=None, errors=None, **kwargs):
+        # master's update-path git security probes (core.gitProxy, credential
+        # helpers, ...) read config before fetch/pull; real git exits 1 with
+        # no output when a key is unset.
+        if 'config' in cmd:
+            empty = '' if (text or encoding) else b''
+            return subprocess.CompletedProcess(cmd, 1, stdout=empty, stderr=empty)
+        if 'ls-remote' in cmd and '--get-url' in cmd:
+            url = 'https://github.com/nesquena/hermes-webui.git\n'
+            out = url if (text or encoding) else url.encode()
+            return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr=out[:0])
+        # fetch + status succeed; the pull hangs past its timeout with partial
+        # output already written to the pipe.
+        if 'fetch' in cmd:
+            return subprocess.CompletedProcess(cmd, 0, stdout='', stderr='')
+        if 'status' in cmd:
+            return subprocess.CompletedProcess(cmd, 0, stdout='', stderr='')
+        if 'pull' in cmd:
+            raise subprocess.TimeoutExpired(
+                cmd=cmd, timeout=timeout,
+                output=b'remote: Counting objects:  50% (1/2)\r',
+            )
+        raise AssertionError(f'unexpected git cmd: {cmd!r}')
+
+    with patch('subprocess.run', side_effect=fake_run), \
+         patch.object(updates, 'REPO_ROOT', repo), \
+         patch.object(updates, '_select_apply_compare_ref', return_value='origin/master'):
+        result = updates.apply_update('webui')
+
+    assert result['ok'] is False
+    assert isinstance(result['message'], str)
+    assert 'Counting objects' in result['message']
+
+
+def test_apply_update_pull_timeout_does_not_leak_remote_token(tmp_path):
+    """A timed-out pull must not echo a credentialed remote URL to the user.
+
+    git prints the remote it is talking to before a pull dies, and that URL
+    can carry a token (`?token=...`). The timeout branch surfaces its partial
+    output as the update-failure message, so it has to go through the same
+    credential scrub the fetch path uses.
+    """
+    repo = tmp_path / 'repo'
+    (repo / '.git').mkdir(parents=True)
+    secret = 'tok_' + 'A' * 30
+
+    def fake_run(cmd, cwd=None, capture_output=False, text=False,
+                 timeout=10, encoding=None, errors=None, **kwargs):
+        if 'config' in cmd:
+            empty = '' if (text or encoding) else b''
+            return subprocess.CompletedProcess(cmd, 1, stdout=empty, stderr=empty)
+        if 'ls-remote' in cmd and '--get-url' in cmd:
+            url = 'https://github.com/nesquena/hermes-webui.git\n'
+            out = url if (text or encoding) else url.encode()
+            return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr=out[:0])
+        if 'fetch' in cmd:
+            return subprocess.CompletedProcess(cmd, 0, stdout='', stderr='')
+        if 'status' in cmd:
+            return subprocess.CompletedProcess(cmd, 0, stdout='', stderr='')
+        if 'pull' in cmd:
+            raise subprocess.TimeoutExpired(
+                cmd=cmd, timeout=timeout,
+                output=(
+                    "fatal: unable to access "
+                    f"'https://user:{secret}@github.com/private/repo.git/': "
+                    "Operation timed out\n"
+                ).encode(),
+            )
+        raise AssertionError(f'unexpected git cmd: {cmd!r}')
+
+    with patch('subprocess.run', side_effect=fake_run), \
+         patch.object(updates, 'REPO_ROOT', repo), \
+         patch.object(updates, '_select_apply_compare_ref', return_value='origin/master'):
+        result = updates.apply_update('webui')
+
+    assert result['ok'] is False
+    assert secret not in result['message']
+    assert '<redacted>' in result['message']
+

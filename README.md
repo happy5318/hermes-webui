@@ -203,6 +203,7 @@ If an AI assistant is helping with install, reinstall, bootstrap, provider setup
 - Cancel a running task directly from the composer footer (Stop button next to Send)
 - Tool call cards inline -- each shows the tool name, args, and result snippet; expand/collapse all toggle for multi-tool turns
 - Subagent delegation cards -- child agent activity shown with distinct icon and indented border
+- Detached child results are delivered to the parent as internal wakeups. Their raw prompts and completion toasts do not appear as messages from the user; the parent can summarize the results in its own reply. Ordinary background-process wakeups remain visible. A completed parent reply does not, by itself, cancel or suppress outstanding children; a later result may still start a follow-up turn.
 - Mermaid diagram rendering inline (flowcharts, sequence diagrams, gantt charts)
 - Thinking/reasoning display -- collapsible gold-themed cards for Claude extended thinking and o3 reasoning blocks
 - Approval card for dangerous shell commands (allow once / session / always / deny)
@@ -398,8 +399,8 @@ before the session's named-profile Gateway ownership is known.
 
 | Thing | How it finds it |
 |---|---|
-| Hermes agent dir | `HERMES_WEBUI_AGENT_DIR`, then known checkout paths, the `hermes` launcher on `PATH`, and finally the installed `run_agent` module exposed by `HERMES_WEBUI_PYTHON` |
-| Python executable | Agent venv first, then `.venv` in this repo, then system `python3` |
+| Hermes agent dir | `HERMES_WEBUI_AGENT_DIR`, then valid authoritative `run_agent.py` checkouts, the `hermes` launcher, the selected Python, valid fallback checkouts, and finally marker-only roots |
+| Python executable | `HERMES_WEBUI_PYTHON`, Agent venv, interpreter that proved the Agent root, `.venv` in this repo, then system Python |
 | State directory | `HERMES_WEBUI_STATE_DIR` env, then `$HERMES_HOME/webui` (Windows default `%LOCALAPPDATA%\hermes\webui`, POSIX default `~/.hermes/webui`) |
 | Default workspace | `HERMES_WEBUI_DEFAULT_WORKSPACE` env, then `~/workspace`, then state dir |
 | Port | `HERMES_WEBUI_PORT` env or first argument, default `8787` |
@@ -419,6 +420,8 @@ export HERMES_WEBUI_PORT=9000
 export HERMES_WEBUI_AUTO_INSTALL=1  # enable auto-install of agent deps (disabled by default)
 ./start.sh
 ```
+
+Auto-install requires the selected Agent to match `HERMES_WEBUI_AGENT_DIR` or the Agent under `HERMES_HOME`, and still checks ownership and permissions.
 
 Or inline:
 
