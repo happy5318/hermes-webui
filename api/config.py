@@ -24,6 +24,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 import weakref
 from pathlib import Path
 from typing import Any
