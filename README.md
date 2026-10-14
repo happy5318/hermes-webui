@@ -223,6 +223,7 @@ If an AI assistant is helping with install, reinstall, bootstrap, provider setup
 - Pinned-conversation limits apply separately to each session's owning profile; root/default aliases share a limit. Unpin an empty session before switching its profile through chat or `/goal`.
 - Archive sessions (hide without deleting, toggle to show)
 - Session projects -- named groups with colors for organizing sessions; delegated subagent sessions have no project of their own and follow their nearest ancestor's project in the project filter and the Unassigned chip; forks and other child sessions keep their own project, so a fork moved to "No project" stays Unassigned
+- Project bindings -- right-click a project chip and pick **Project settings…** to pin a default workspace (or several workspaces, with one marked default) and a model. The chip's **+** (and New Chat while the project filter is active) then opens a session already in that workspace/model. The reasoning-effort binding stays in the API (`POST /api/projects/bind`) but is dormant: the dialog no longer offers the row, and nothing applies a stored value to a new session any more — the only mechanism would be the **profile-wide** reasoning-effort preference (the same `agent.reasoning_effort` setting the `/reasoning` command writes), so a row inside a per-project dialog read as per-project while silently moving the whole profile's effort; it comes back with per-session effort (#7881)
 - Session tags -- add #tag to titles for colored chips and click-to-filter
 - Grouped by Today / Yesterday / Earlier in the sidebar (collapsible date groups)
 - Download as Markdown transcript, full JSON export, or import from JSON
@@ -240,6 +241,12 @@ If an AI assistant is helping with install, reinstall, bootstrap, provider setup
 - Edit, create, delete, and rename files; create folders
 - Binary file download (auto-detected from server)
 - File preview auto-closes on directory navigation (with unsaved-edit guard)
+- Dismissing the workspace panel is respected: resizing the viewport or showing the
+  on-screen keyboard no longer force-reopens the panel after you close it (#6710)
+- Previews report their real load outcome -- a broken source is reported as a
+  failure instead of a silent success -- and a response that never settles is
+  released by a bounded wait so the panel still opens; the source keeps loading
+  and a late failure is surfaced in the status line (#6710)
 - Git detection -- branch name and dirty file count badge in workspace header
 - Right panel is drag-resizable
 - Syntax highlighted code preview (Prism.js)
@@ -396,6 +403,8 @@ before the session's named-profile Gateway ownership is known.
 | State directory | `HERMES_WEBUI_STATE_DIR` env, then `$HERMES_HOME/webui` (Windows default `%LOCALAPPDATA%\hermes\webui`, POSIX default `~/.hermes/webui`) |
 | Default workspace | `HERMES_WEBUI_DEFAULT_WORKSPACE` env, then `~/workspace`, then state dir |
 | Port | `HERMES_WEBUI_PORT` env or first argument, default `8787` |
+
+Before it installs the agent or writes any state, the bootstrap binds the resolved host and port as a preflight. If another service already holds the port, it stops right there, names the address it could not bind, and prints a free alternative to pass to `./start.sh <port>` or set as `HERMES_WEBUI_PORT` in `.env`. The running service and your existing configuration are left untouched. When the listener on that port is a healthy WebUI -- the instance you already started -- bootstrap reports it ready and leaves it alone, browser included; only a foreign service gets the conflict message.
 
 If discovery finds everything, nothing else is required.
 
