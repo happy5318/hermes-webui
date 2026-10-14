@@ -1682,6 +1682,44 @@ def _custom_endpoint_slugs_for_base_url(value: object) -> set[str]:
     return {f"custom:{host}:{port}", f"custom:{host}-{port}"}
 
 
+def _named_custom_slug_fallback(record: dict, name: str) -> str:
+    """Deterministic ASCII slug for a custom_providers entry with no slugable name.
+
+    ``_custom_provider_slug_from_name()`` returns ``""`` for a name made only of
+    non-ASCII characters (e.g. a pure-CJK name), which made the catalog builder
+    drop the whole entry: its models never reached the picker while the CLI
+    kept working (#8017). Derive a stable identity instead, in order:
+
+    1. an explicit ``provider_key`` (the user's own handle for the endpoint);
+    2. the endpoint-derived slug shape (``custom:<host>-<port>``);
+    3. a short stable hash of the name.
+
+    Returns ``""`` only when the record offers none of these (no key, no
+    usable base_url) — the caller records a diagnostic in that case.
+    """
+    provider_key = str(record.get("provider_key") or "").strip()
+    if provider_key:
+        slug = _custom_provider_slug_from_name(provider_key)
+        if slug:
+            return slug
+        # A non-ASCII provider_key is still a stable, user-chosen identity.
+        digest = hashlib.sha1(provider_key.encode("utf-8")).hexdigest()[:8]
+        return f"custom:{digest}"
+
+    base_url = str(record.get("base_url") or "").strip()
+    endpoint_slugs = _custom_endpoint_slugs_for_base_url(base_url)
+    # Prefer the hyphenated form: it is the one that stays a single path
+    # segment / safe identifier in every downstream consumer.
+    for candidate in sorted(endpoint_slugs):
+        if ":" not in candidate.split(":", 1)[1]:
+            return candidate
+    if endpoint_slugs:
+        return sorted(endpoint_slugs)[0]
+
+    digest = hashlib.sha1(str(name).encode("utf-8")).hexdigest()[:8]
+    return f"custom:{digest}"
+
+
 _LEGACY_CUSTOM_API_KEY_ENV_WARNED: set[str] = set()
 
 
@@ -10365,6 +10403,15 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                     continue
                 _cp_name = (_cp.get("name") or "").strip()
                 _slug = _custom_provider_slug_from_name(_cp_name) if _cp_name else None
+                if not _slug and _cp_name:
+                    # A name with no ASCII characters at all (e.g. a pure-CJK
+                    # name) slugifies to "" — the entry used to be dropped
+                    # silently, so its models never reached the picker while
+                    # the CLI kept working (#8017). Fall back to an explicit
+                    # provider_key, then to the endpoint-derived slug shape,
+                    # then to a short stable hash so the record always has a
+                    # stable ASCII identity to round-trip.
+                    _slug = _named_custom_slug_fallback(_cp, _cp_name)
                 if _slug and _slug not in _named_custom_groups:
                     _named_custom_groups[_slug] = (_cp_name, [])
 
