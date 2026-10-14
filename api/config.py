@@ -12148,32 +12148,34 @@ def _maybe_start_session_visit_background_rebuild() -> None:
             daemon=True,
         )
         _session_visit_rebuild_threads[profile_key] = thread
-
-    # #7724 finding "Thread Failure Breaks Cache": thread.start() can raise
-    # (e.g. can't create new thread under resource pressure). The exception used
-    # to escape this helper, so a session-visit request that already had a
-    # perfectly usable stale catalog in hand turned into an HTTP 500 — and the
-    # cleanup that removes the tracker entry lives inside the worker, which
-    # never ran. Untrack here and fall through to the caller's stale return,
-    # matching the analogous stale-cache launcher elsewhere in this module.
-    #
-    # This MUST run outside ``_session_visit_rebuild_lock``: that lock is not
-    # reentrant and the tracker mutation above happens inside it, so taking it
-    # again here would self-deadlock and hang the request thread — a strictly
-    # worse outcome than the 500 being fixed.
-    try:
-        thread.start()
-    except Exception:
-        with _session_visit_rebuild_lock:
+        try:
+            # Start inside the lock so a concurrent stale visit can never see a
+            # registered-but-not-started thread: registration and start are
+            # atomic, so the coalescing check above (`existing.is_alive()`) is
+            # only ever reached against a thread that is genuinely running (or
+            # already finished). Starting outside the lock left a window where
+            # visit B could observe visit A's registered thread before
+            # ``thread.start()`` ran and launch a second rebuild — visible as
+            # the flaky ``test_same_profile_concurrent_stale_visits_coalesce_to_one_rebuild``.
+            # The worker's ``finally`` acquires this same lock, but only after
+            # ``get_available_models`` completes, so it can never deadlock the
+            # launcher (which holds the lock only until start() returns).
+            thread.start()
+        except Exception:
+            # start() can raise (e.g. can't create a new thread under resource
+            # pressure). We already hold the lock here, so pop directly without
+            # re-acquiring (the lock is not reentrant). The exception used to
+            # escape this helper and turned a usable stale-catalog response
+            # into an HTTP 500; untrack and fall through to the stale return.
             if _session_visit_rebuild_threads.get(profile_key) is thread:
                 _session_visit_rebuild_threads.pop(profile_key, None)
-        import logging as _logging
+            import logging as _logging
 
-        _logging.getLogger("api.config").debug(
-            "session-visit background models rebuild could not start for profile %r",
-            profile_key or "",
-            exc_info=True,
-        )
+            _logging.getLogger("api.config").debug(
+                "session-visit background models rebuild could not start for profile %r",
+                profile_key or "",
+                exc_info=True,
+            )
 
 
 def _maybe_log_slow_stages(
