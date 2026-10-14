@@ -1087,3 +1087,86 @@ def test_busy_stop_executes_real_cancel_branch():
     assert out["result"]["agents"] == {"intercepted": False}
     assert any(c.startswith("cancelStream:slash-stop") for c in out["calls"]), out["calls"]
     assert not any(c.startswith("steer") for c in out["calls"]), out["calls"]
+
+
+def test_slash_autocomplete_treats_underscore_like_hyphen():
+    """A typed underscore prefix must still suggest hyphenated commands (#8143).
+
+    The agent-side skill/bundle resolver documents `_` ≡ `-` for command
+    slugs, but the WebUI autocomplete compared the typed prefix literally,
+    so `/knowledge_` found nothing while `/knowledge-` matched.
+    """
+    result = _run_commands_js(
+        """
+        // master holds plain skills until bundle metadata settles (#8050-era gate)
+        _bundleCommandCacheReady = true;
+        _skillCommandCache.length = 0;
+        _skillCommandCache.push({name: 'knowledge-loop', desc: 'Loop', source: 'skill', skillName: 'knowledge-loop'});
+        _skillCommandCache.push({name: 'knowledgebase', desc: 'Base', source: 'skill', skillName: 'knowledgebase'});
+        return {
+          hyphen_prefix: getMatchingCommands('knowledge-').map(c => c.name),
+          underscore_prefix: getMatchingCommands('knowledge_').map(c => c.name),
+          neighbour_hit: getMatchingCommands('knowledge_').map(c => c.name).includes('knowledgebase')
+        };
+        """
+    )
+
+    assert result["hyphen_prefix"] == ["knowledge-loop"]
+    assert result["underscore_prefix"] == ["knowledge-loop"]
+    # The alias must not widen into neighbouring slugs.
+    assert result["neighbour_hit"] is False
+
+
+def test_slash_alias_matching_covers_skill_and_agent_rounds():
+    """Skill and agent/plugin command rounds both honour the underscore alias."""
+    result = _run_commands_js(
+        """
+        _bundleCommandCacheReady = true;
+        _skillCommandCache.length = 0;
+        _skillCommandCache.push({name: 'some-skill', desc: 'S', source: 'skill', skillName: 'some-skill'});
+        _agentCommandCache = [{name: 'plugin-review', description: 'Review', cli_only: false, category: 'Plugin'}];
+        return {
+          skill: getMatchingCommands('some_').map(c => c.name),
+          agent: getMatchingCommands('plugin_').map(c => c.name),
+          agent_canonical: getMatchingCommands('plugin-').map(c => c.name)
+        };
+        """
+    )
+
+    assert result["skill"] == ["some-skill"]
+    assert result["agent"] == ["plugin-review"]
+    # Both spellings surface the same command set.
+    assert result["agent"] == result["agent_canonical"]
+
+
+def test_slash_underscore_prefix_does_not_collapse_to_empty_or_global():
+    """A trailing underscore must not degrade into an empty (match-all) prefix."""
+    result = _run_commands_js(
+        """
+        _bundleCommandCacheReady = true;
+        _skillCommandCache.length = 0;
+        _skillCommandCache.push({name: 'knowledge-loop', desc: 'Loop', source: 'skill', skillName: 'knowledge-loop'});
+        _skillCommandCache.push({name: 'other-thing', desc: 'Other', source: 'skill', skillName: 'other-thing'});
+        return getMatchingCommands('knowledge_').map(c => c.name);
+        """
+    )
+
+    assert result == ["knowledge-loop"]
+
+
+def test_slash_alias_matching_covers_bundle_rows():
+    """Bundle rows are prefix-matched, so they honour the alias too."""
+    result = _run_commands_js(
+        """
+        _agentCommandCacheReady = true;
+        _bundleCommandCache.length = 0;
+        _bundleCommandCache.push({name: 'knowledge-loop', desc: 'Bundle', source: 'bundle'});
+        return {
+          underscore: getMatchingCommands('knowledge_').map(c => c.name),
+          hyphen: getMatchingCommands('knowledge-').map(c => c.name)
+        };
+        """
+    )
+
+    assert result["underscore"] == ["knowledge-loop"]
+    assert result["hyphen"] == ["knowledge-loop"]
