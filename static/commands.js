@@ -240,6 +240,21 @@ function _slashCommandNameIncludes(name,q){
   const n=String(name||'').toLowerCase();
   return _slashCommandSlugVariants(q).some(v=>n.includes(v));
 }
+// With the `_` ≡ `-` alias active, a typed prefix can match BOTH spellings of
+// a command registered twice (e.g. plugin-review and plugin_review). Row zero
+// is what an Enter dispatches, so the literal as-typed match must rank ahead
+// of the alias-only match — registry order alone would let /plugin_review
+// dispatch /plugin-review (or vice versa once registration order flips).
+// Stable sort keeps original order within each rank.
+function _rankLiteralPrefixMatchesFirst(matches,q){
+  const needle=String(q||'').toLowerCase();
+  if(!needle||matches.length<2)return matches;
+  return matches.slice().sort((a,b)=>{
+    const an=String(a&&a.name||'').toLowerCase();
+    const bn=String(b&&b.name||'').toLowerCase();
+    return (an.startsWith(needle)?0:1)-(bn.startsWith(needle)?0:1);
+  });
+}
 
 function getMatchingCommands(prefix){
   const q=prefix.toLowerCase();
@@ -295,7 +310,7 @@ function getMatchingCommands(prefix){
   // A same-slug bundle owns dispatch. Hold plain skills until the independent
   // bundle metadata request settles so a slow bundle response cannot briefly
   // expose a selectable, shadowed skill.
-  if(!_bundleCommandCacheReady)return matches;
+  if(!_bundleCommandCacheReady)return _rankLiteralPrefixMatchesFirst(matches,q);
   for(const skill of _skillCommandCache){
     const name=String(skill&&skill.name||'').toLowerCase();
     const description=String(skill&&skill.desc||'').toLowerCase();
@@ -303,7 +318,7 @@ function getMatchingCommands(prefix){
     matches.push(skill);
     seen.add(name);
   }
-  return matches;
+  return _rankLiteralPrefixMatchesFirst(matches,q);
 }
 
 let _forcedSkillDirectivePending=null;
@@ -2341,7 +2356,16 @@ async function getBundleCommandMetadata(name){
   const needle=String(name||'').trim().toLowerCase();
   if(!needle) return null;
   const bundles=await loadBundleCommands();
-  return bundles.find(bundle=>String(bundle&&bundle.name||'').toLowerCase()===needle)||null;
+  // Same `_` ≡ `-` treatment the autocomplete matcher applies: a user typing
+  // the underscore spelling must still resolve the canonical hyphenated
+  // bundle. Without this the literal `===` compare returned null and the send
+  // path posted `/knowledge_loop do X` as plain chat instead of dispatching it
+  // (#8143, #8203 round 2).
+  const needles=_slashCommandSlugVariants(needle);
+  return bundles.find(bundle=>{
+    const n=String(bundle&&bundle.name||'').toLowerCase();
+    return needles.some(v=>n===v);
+  })||null;
 }
 // The composer text the user last closed the list on, by picking a command or pressing
 // Escape. A refresh that was not caused by typing (a slash-command loader landing late,

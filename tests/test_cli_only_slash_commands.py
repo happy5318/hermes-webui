@@ -1170,3 +1170,72 @@ def test_slash_alias_matching_covers_bundle_rows():
 
     assert result["underscore"] == ["knowledge-loop"]
     assert result["hyphen"] == ["knowledge-loop"]
+
+
+def test_slash_dual_spelling_registry_dispatches_literal_spelling_exactly():
+    """When both `_` and `-` spellings are registered, the row an Enter would
+    dispatch (row zero) must be the literal spelling the user typed, in either
+    registration order (#8203 round 2).
+
+    Round 1 made the matcher treat `_` ≡ `-`, which surfaced BOTH spellings
+    for either typed prefix; the dropdown then took row zero in registry
+    order, so `/plugin_review` could dispatch `/plugin-review` (and reversing
+    the registration broke the hyphen spelling instead).
+    """
+    script = """
+        _bundleCommandCacheReady = true;
+        _skillCommandCache.length = 0;
+        _agentCommandCache = %s;
+        return {
+          underscore_typed: getMatchingCommands('plugin_review').map(c => c.name),
+          hyphen_typed: getMatchingCommands('plugin-review').map(c => c.name)
+        };
+    """
+    for reg_order in (
+        # hyphen-first registration
+        "[{name: 'plugin-review', description: 'Review A', cli_only: false, category: 'Plugin'}, {name: 'plugin_review', description: 'Review B', cli_only: false, category: 'Plugin'}]",
+        # underscore-first registration
+        "[{name: 'plugin_review', description: 'Review B', cli_only: false, category: 'Plugin'}, {name: 'plugin-review', description: 'Review A', cli_only: false, category: 'Plugin'}]",
+    ):
+        result = _run_commands_js(script % reg_order)
+        # The literal spelling typed must own row zero regardless of registry order.
+        assert result["underscore_typed"] == ["plugin_review", "plugin-review"], reg_order
+        assert result["hyphen_typed"] == ["plugin-review", "plugin_review"], reg_order
+
+
+def test_bundle_command_metadata_resolves_underscore_spelling_of_hyphenated_bundle():
+    """The submit-time bundle lookup must normalise `_`/`-` like the matcher.
+
+    With only the hyphenated bundle registered, `getBundleCommandMetadata(
+    'incident_review')` returned null on the round-1 head (literal `===`
+    compare), so the send path posted `/incident_review ...` as plain chat
+    instead of dispatching it — the #8143 symptom (e.g. `/knowledge_loop do X`).
+    """
+    result = _run_commands_js(
+        """
+        const byHyphen = await getBundleCommandMetadata('incident-review');
+        const byUnderscore = await getBundleCommandMetadata('incident_review');
+        const byHyphenUnderscore = await getBundleCommandMetadata('triage_review');
+        const missing = await getBundleCommandMetadata('does-not-exist');
+        // Reverse direction: an underscore-named bundle resolved by the hyphen spelling.
+        _bundleCommandCacheReady = true;
+        _bundleCommandCache.length = 0;
+        _bundleCommandCache.push({name: 'knowledge_loop', desc: 'Underscore bundle', source: 'bundle'});
+        const reverse = await getBundleCommandMetadata('knowledge-loop');
+        return {
+          hyphen: byHyphen && byHyphen.name,
+          underscore: byUnderscore && byUnderscore.name,
+          hyphen_underscore: byHyphenUnderscore === null,  // reserved bundles must stay unresolvable under the alias too
+          missing: missing === null,
+          reverse: reverse && reverse.name
+        };
+        """
+    )
+
+    assert result == {
+        "hyphen": "incident-review",
+        "underscore": "incident-review",
+        "hyphen_underscore": True,
+        "missing": True,
+        "reverse": "knowledge_loop",
+    }
