@@ -8940,7 +8940,7 @@ function _sidebarDisplayBucketIsCli(s, rowsById, memo){
       if(!parent) break;
       cur=parent;
     }
-    if(cur!==s){
+    if(!resolved&&cur!==s){
       result=_isCliSession(cur);
       resolved=true;
     } else if(!resolved){

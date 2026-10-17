@@ -219,6 +219,31 @@ console.log(JSON.stringify({inProj, otherProj}));
     assert out["otherProj"]["top"] == [], out
 
 
+def test_nested_delegated_grandchild_keeps_inherited_cli_bucket():
+    """Nested delegation: CLI parent -> subagent child -> subagent grandchild.
+
+    With the grandchild row processed before its intermediate parent (payload
+    row order), the grandchild's lineage walk memo-hits the CLI parent
+    mid-chain. The later ``if (cur !== s)`` branch must NOT overwrite the
+    inherited CLI bucket with the intermediate subagent's raw (non-CLI)
+    classification — otherwise both the grandchild and its intermediate
+    parent get memoized as WebUI and drift into the wrong bucket (the CLI
+    badge then loses both rows and nothing attaches under the CLI parent).
+    """
+    out = _run("""
+const cliIntermediate = Object.assign({}, cliSub1, { session_id:'cli_intermediate' });
+const cliGrandchild = Object.assign({}, cliSub1, { session_id:'cli_grandchild',
+  parent_session_id:'cli_intermediate' });
+console.log(JSON.stringify(renderFor('cli', [cliParent, cliGrandchild, cliIntermediate])));
+""")
+    assert out["cliRaw"] == ["cli_grandchild", "cli_intermediate", "cli_parent"], out
+    assert out["webuiRaw"] == [], out
+    assert out["top"] == ["cli_parent"], out
+    # The attach helper nests depth-2 children flat under the visible top row
+    # (the intermediate is the segment marker, not a second visible level).
+    assert out["children"]["cli_parent"] == ["cli_intermediate", "cli_grandchild"], out
+
+
 # ---------------------------------------------------------------------------
 # Server-side: display-bucket helpers (Python)
 # ---------------------------------------------------------------------------
