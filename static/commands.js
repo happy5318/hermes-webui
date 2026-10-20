@@ -516,9 +516,22 @@ async function getAgentCommandMetadata(name){
   const needle=String(name||'').trim().toLowerCase();
   if(!needle) return null;
   const commands=await loadAgentCommandMetadata();
+  // Exact native-name match ranks first: when BOTH `_` and `-` spellings are
+  // genuinely registered, the literal spelling the user typed must win
+  // regardless of registry order (#8203 round 2 re-gate).
+  const byName=commands.find(cmd=>String(cmd&&cmd.name||'').toLowerCase()===needle);
+  if(byName) return byName;
+  // Then the EXPLICIT aliases array (registry order preserved).
+  const byAlias=commands.find(cmd=>Array.isArray(cmd&&cmd.aliases)&&cmd.aliases.some(a=>String(a||'').toLowerCase()===needle));
+  if(byAlias) return byAlias;
+  // Finally the same `_` ≡ `-` slug variants the autocomplete matcher
+  // advertises: typing the underscore spelling of a hyphenated command (or
+  // vice versa) must resolve the registered native name, so the submit path
+  // dispatches it instead of falling through to chat (#8143, #8203 round 2).
+  const needles=_slashCommandSlugVariants(needle);
   return commands.find(cmd=>{
-    if(String(cmd&&cmd.name||'').toLowerCase()===needle) return true;
-    return Array.isArray(cmd&&cmd.aliases)&&cmd.aliases.some(a=>String(a||'').toLowerCase()===needle);
+    const n=String(cmd&&cmd.name||'').toLowerCase();
+    return needles.some(v=>n===v);
   })||null;
 }
 
@@ -541,12 +554,40 @@ async function executeAgentPluginCommand(text,_meta){
   return _runAgentCommandTransport(text,_meta);
 }
 
+function _canonicalizeSlashCommandToken(text,_meta){
+  const s=String(text||'').trim();
+  const name=String(_meta&&_meta.name||'').trim();
+  if(!name||!s.startsWith('/')) return s;
+  const m=/^\/([^\s/]+)([\s\S]*)$/.exec(s);
+  if(!m) return s;
+  const token=m[1];
+  const tk=token.toLowerCase();
+  const nm=name.toLowerCase();
+  // Already canonical: keep the exact spelling the user typed so a genuinely
+  // registered `_`-named command is dispatched verbatim (#8203 precedence).
+  if(tk===nm) return s;
+  // Rewrite ONLY alias-equivalent spellings: the typed token must be a `_`/`-`
+  // slug variant of the native name (the relation the matcher advertises) or
+  // one of its explicit aliases. A mismatched _meta must never rewrite text.
+  const equivalent=_slashCommandSlugVariants(tk).indexOf(nm)!==-1
+    || _slashCommandSlugVariants(nm).indexOf(tk)!==-1
+    || (Array.isArray(_meta&&_meta.aliases)&&_meta.aliases.some(a=>String(a||'').toLowerCase()===tk));
+  if(!equivalent) return s;
+  // Canonicalize ONLY the command token; the user's arguments stay untouched.
+  return '/'+name+m[2];
+}
+
 async function _runAgentCommandTransport(text,_meta){
   const command=String(text||'').trim();
   if(!command) throw new Error('command is required');
+  // The metadata resolver may have matched an alias/variant spelling the exec
+  // endpoint does not accept as typed (e.g. `/leaf_review` for a registered
+  // `leaf-review`). Canonicalize the command token to the resolved native name
+  // before transport so the advertised spelling makes the request (#8203).
+  const transportCommand=_canonicalizeSlashCommandToken(command,_meta);
   const data=await api('/api/commands/exec',{
     method:'POST',
-    body:JSON.stringify({command})
+    body:JSON.stringify({command:transportCommand})
   });
   return String(data&&data.output||'(no output)');
 }

@@ -1239,3 +1239,145 @@ def test_bundle_command_metadata_resolves_underscore_spelling_of_hyphenated_bund
         "missing": True,
         "reverse": "knowledge_loop",
     }
+
+
+# ── #8203 re-gate: advertised `_`/`-` alias must resolve at submit time ──────
+
+
+def test_agent_command_metadata_resolves_implicit_underscore_spelling():
+    """A typed underscore spelling of a hyphenated agent command must resolve
+    the registered native name even when it is NOT an explicit alias
+    (aliases: []), and vice versa (#8203 re-gate). Without this,
+    `/leaf_review do X` reached the ordinary-chat fallthrough and made zero
+    /api/commands/exec requests."""
+    result = _run_commands_js(
+        """
+        _agentCommandCacheReady = true;
+        _agentCommandCache = [
+          {name: 'leaf-review', description: 'Run leaf review', aliases: [], cli_only: false, category: 'Plugin'},
+          {name: 'knowledge_loop', description: 'Loop', aliases: [], cli_only: false, category: 'Tools'}
+        ];
+        const leafByUnderscore = await getAgentCommandMetadata('leaf_review');
+        const leafByHyphen = await getAgentCommandMetadata('leaf-review');
+        const reverse = await getAgentCommandMetadata('knowledge-loop');
+        const missing = await getAgentCommandMetadata('does-not-exist');
+        return {
+          leaf_by_underscore: leafByUnderscore && leafByUnderscore.name,
+          leaf_by_hyphen: leafByHyphen && leafByHyphen.name,
+          reverse: reverse && reverse.name,
+          missing: missing === null
+        };
+        """
+    )
+
+    assert result == {
+        "leaf_by_underscore": "leaf-review",
+        "leaf_by_hyphen": "leaf-review",
+        "reverse": "knowledge_loop",
+        "missing": True,
+    }
+
+
+def test_agent_command_metadata_dual_spelling_keeps_literal_precedence():
+    """When both `_` and `-` spellings are registered as native names, the
+    submit-time resolver must return the literal spelling the user typed, in
+    either registration order (#8203 re-gate)."""
+    script = """
+        _agentCommandCacheReady = true;
+        _agentCommandCache = %s;
+        const u = await getAgentCommandMetadata('plugin_review');
+        const h = await getAgentCommandMetadata('plugin-review');
+        return {
+          underscore_typed: u && u.name,
+          hyphen_typed: h && h.name
+        };
+    """
+    for reg_order in (
+        # hyphen-first registration
+        "[{name: 'plugin-review', description: 'Review A', cli_only: false, category: 'Plugin'}, {name: 'plugin_review', description: 'Review B', cli_only: false, category: 'Plugin'}]",
+        # underscore-first registration
+        "[{name: 'plugin_review', description: 'Review B', cli_only: false, category: 'Plugin'}, {name: 'plugin-review', description: 'Review A', cli_only: false, category: 'Plugin'}]",
+    ):
+        result = _run_commands_js(script % reg_order)
+        assert result["underscore_typed"] == "plugin_review", reg_order
+        assert result["hyphen_typed"] == "plugin-review", reg_order
+
+
+def _run_exec_transport_js(script_body: str) -> dict:
+    """Run the REAL _runAgentCommandTransport with a stub api that records
+    every /api/commands/exec payload it receives."""
+    script = textwrap.dedent(
+        f"""
+        const vm = require('vm');
+        const execCalls = [];
+        const ctx = {{
+          console,
+          localStorage: {{ getItem(){{return null;}}, setItem(){{}}, removeItem(){{}} }},
+          t: (key) => key,
+          api: async (path, options) => {{
+            if (path === '/api/commands/exec') {{
+              const command = JSON.parse(options.body).command;
+              execCalls.push(command);
+              return {{ output: 'ran ' + command }};
+            }}
+            throw new Error('unexpected api path: ' + path);
+          }}
+        }};
+        vm.createContext(ctx);
+        vm.runInContext({json.dumps(COMMANDS_JS)}, ctx);
+        (async () => {{
+          const result = await vm.runInContext(`(async () => {{ {script_body} }})()`, ctx);
+          process.stdout.write(JSON.stringify({{ result, execCalls }}));
+        }})().catch(err => {{
+          console.error(err && err.stack || err);
+          process.exit(1);
+        }});
+        """
+    )
+    with tempfile.NamedTemporaryFile("w", suffix=".js", encoding="utf-8", delete=False) as handle:
+        handle.write(script)
+        script_path = Path(handle.name)
+    try:
+        proc = subprocess.run(["node", str(script_path)], check=True, capture_output=True, text=True)
+    finally:
+        script_path.unlink(missing_ok=True)
+    return json.loads(proc.stdout)
+
+
+def test_exec_transport_canonicalizes_alias_token_and_keeps_args():
+    """The transport must POST the resolved native command name, not the typed
+    alias token, while retaining the user's arguments verbatim (#8203 re-gate).
+    An already-canonical native spelling must be posted exactly as typed."""
+    out = _run_exec_transport_js(
+        """
+        _agentCommandCacheReady = true;
+        _agentCommandCache = [
+          {name: 'leaf-review', description: 'Run leaf review', aliases: [], cli_only: false, category: 'Plugin'},
+          {name: 'plugin_review', description: 'Review B', aliases: [], cli_only: false, category: 'Plugin'},
+          {name: 'browser', description: 'Attach browser tools', aliases: ['browse'], cli_only: true, gateway_only: false}
+        ];
+        const leaf = await getAgentCommandMetadata('leaf_review');
+        const plugin = await getAgentCommandMetadata('plugin_review');
+        const browser = await getAgentCommandMetadata('browse');
+        const outLeaf = await _runAgentCommandTransport('/leaf_review do X with args', leaf);
+        const outPlugin = await _runAgentCommandTransport('/plugin_review do Y', plugin);
+        const outBare = await _runAgentCommandTransport('/leaf_review', leaf);
+        const outAlias = await _runAgentCommandTransport('/browse connect', browser);
+        const outUnknown = await _runAgentCommandTransport('/mystery foo', {name: 'mystery'});
+        return { outLeaf, outPlugin, outBare, outAlias, outUnknown };
+        """
+    )
+
+    assert out["execCalls"] == [
+        "/leaf-review do X with args",
+        "/plugin_review do Y",
+        "/leaf-review",
+        "/browser connect",
+        "/mystery foo",
+    ]
+    assert out["result"]["outLeaf"] == "ran /leaf-review do X with args"
+    assert out["result"]["outPlugin"] == "ran /plugin_review do Y"
+    assert out["result"]["outBare"] == "ran /leaf-review"
+    assert out["result"]["outAlias"] == "ran /browser connect"
+    assert out["result"]["outUnknown"] == "ran /mystery foo"
+
