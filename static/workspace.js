@@ -636,8 +636,63 @@ async function _workspacePathExists(path){
   const name=parts.pop();
   if(!name) return false;
   const dir=parts.length?parts.join('/'):'.';
-  const data=await api(`/api/list?session_id=${encodeURIComponent(S.session.session_id)}&path=${encodeURIComponent(dir)}`);
-  return (data.entries||[]).some(entry=>entry&&((entry.path===path)||entry.name===name));
+  // Fast path: the parent listing usually already knows the answer.
+  //
+  // The listing is bounded (the server caps a single directory response), so a
+  // workspace with more entries than the cap drops the tail of the sorted
+  // list. A file past the cap is then absent from `entries` even though it
+  // exists on disk — the browser used to conclude "file open failed" for it.
+  // Directories sort before files, and CJK names sort after ASCII, so the
+  // victims were typically Chinese-named documents at the end of a busy
+  // workspace.
+  //
+  // So: trust the listing when it contains the name, and otherwise fall back
+  // to probing the path itself. The fallback asks the server for the file and
+  // only cares about whether it resolves — a missing file answers 404, an
+  // existing one answers 200. That makes the check independent of how many
+  // siblings the directory happens to have.
+  try{
+    const data=await api(`/api/list?session_id=${encodeURIComponent(S.session.session_id)}&path=${encodeURIComponent(dir)}`);
+    const entries=data.entries||[];
+    const hit=entries.some(entry=>entry&&((entry.path===path)||entry.name===name));
+    if(hit) return true;
+    // Not in the listing — but the listing may be capped, so its silence is
+    // not proof of absence. Probe the file directly.
+    return await _workspaceProbeFile(path);
+  }catch(_){
+    // The listing failed (network / stale session). Probe the file directly
+    // before giving up, so a transient listing error cannot masquerade as a
+    // missing file.
+    try{ return await _workspaceProbeFile(path); }catch(_){ return false; }
+  }
+}
+
+// Existence probe that does not depend on any directory listing: ask the
+// server for the file and look only at whether the request resolved. A
+// missing file answers 404 (the api() helper rejects with .status attached);
+// an existing file answers 200.
+//
+// The `raw` route is used rather than the `read` route on purpose: `read`
+// enforces MAX_FILE_BYTES and answers 404 for an over-sized file, which would
+// make a perfectly real (large) file look absent. `raw` streams whatever is
+// there and only 404s when the path genuinely does not resolve. The body is
+// dropped (statusOnly) so a large file is not buffered just to answer "does
+// it exist?".
+async function _workspaceProbeFile(path){
+  if(!S.session||!path) return false;
+  const route=_workspaceRouteForPath(path, 'raw');
+  if(!route) return false;
+  try{
+    await api(route, {statusOnly:true});
+    return true;
+  }catch(err){
+    // 404 means "not there"; anything else (403/503/timeout) is inconclusive
+    // and must not be reported as a hard "missing" verdict, because the caller
+    // turns a false negative into "file open failed".
+    const status=err&&err.status;
+    if(status===404) return false;
+    throw err;
+  }
 }
 
 /**
