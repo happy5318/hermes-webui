@@ -77,7 +77,7 @@ function check(label, cond, extra) {
   apiCalls = [];
   apiImpl = async (url) => {
     if (url.includes('/api/list')) return { entries: [{ name: 'other.md' }] };
-    return {}; // raw probe resolves → 200
+    return { status: 200 }; // raw probe resolves → 200 (api() statusOnly contract)
   };
   r = await _workspacePathExists('a-file-past-the-cap.md');
   check('returns true via the direct probe', r === true, `got ${r}`);
@@ -103,7 +103,7 @@ function check(label, cond, extra) {
   apiCalls = [];
   apiImpl = async (url) => {
     if (url.includes('/api/list')) throw new Error('network down');
-    return {}; // probe succeeds
+    return { status: 200 }; // probe succeeds
   };
   r = await _workspacePathExists('note.md');
   check('falls back to the probe and returns true', r === true, `got ${r}`);
@@ -132,6 +132,20 @@ function check(label, cond, extra) {
   // still resolve to "exists".
   check('probe was attempted (not skipped)', apiCalls.length >= 2, `api calls: ${apiCalls.length}`);
   check('reports not-openable for an inconclusive probe', r === false, `got ${r}`);
+
+  // ── Branch 6: the probe resolves but carries NO status → not proof of
+  // existence. A helper that resolves without a status (or with a non-2xx)
+  // must not be reported as "the file is there" — otherwise a missing
+  // artifact would be treated as openable.
+  console.log('\nBranch 6: probe resolves without a status');
+  apiCalls = [];
+  apiImpl = async (url) => {
+    if (url.includes('/api/list')) return { entries: [] };
+    return { entries: [] }; // resolves, but there is no status
+  };
+  r = await _workspacePathExists('missing.md');
+  check('does NOT claim the file exists', r === false, `got ${r}`);
+  check('the probe was still attempted', apiCalls.length >= 2, `api calls: ${apiCalls.length}`);
 
   console.log(`\n${failures === 0 ? '✅ ALL BRANCHES OK' : `❌ ${failures} check(s) failed`}`);
   process.exit(failures === 0 ? 0 : 1);

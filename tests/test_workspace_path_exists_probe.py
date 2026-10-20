@@ -64,6 +64,9 @@ def test_probe_uses_the_raw_route_not_the_size_capped_read_route():
     # Only a 404 counts as absent; other failures are inconclusive and must
     # not be turned into a hard "missing" verdict.
     assert re.search(r"if\s*\(\s*status\s*===\s*404\s*\)\s*return false", probe)
+    # A resolved response is not proof of existence: only an explicit 2xx is.
+    assert re.search(r"status\s*>=\s*200", probe), "probe must require a 2xx status"
+    assert re.search(r"status\s*<\s*300", probe), "probe must reject non-2xx statuses"
     # The body is dropped so a large file is not buffered for an existence check.
     assert "statusOnly:true" in probe
 
@@ -116,6 +119,11 @@ def test_browser_existence_logic_behaviour():
       4. the listing request itself fails       -> still probes the file
       5. a non-404 probe failure               -> reported as not-openable,
          never as a fabricated "missing" verdict
+      6. the probe resolves but carries NO status -> NOT reported as existing.
+         A resolved response is not proof of existence; only an explicit 2xx
+         is. This mirrors the upstream contract in
+         tests/test_issue6867_artifacts_settled_recovery.py, where a missing
+         artifact path must stay blocked.
     """
     if shutil.which("node") is None:
         pytest.skip("node is unavailable on this host")

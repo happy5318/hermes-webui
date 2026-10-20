@@ -648,7 +648,7 @@ async function _workspacePathExists(path){
   //
   // So: trust the listing when it contains the name, and otherwise fall back
   // to probing the path itself. The fallback asks the server for the file and
-  // only cares about whether it resolves — a missing file answers 404, an
+  // only cares about the response status — a missing file answers 404, an
   // existing one answers 200. That makes the check independent of how many
   // siblings the directory happens to have.
   try{
@@ -668,9 +668,10 @@ async function _workspacePathExists(path){
 }
 
 // Existence probe that does not depend on any directory listing: ask the
-// server for the file and look only at whether the request resolved. A
-// missing file answers 404 (the api() helper rejects with .status attached);
-// an existing file answers 200.
+// server for the file and read the status off the response. A missing file
+// answers 404 (the api() helper rejects with .status attached); an existing
+// one answers 200. Only an explicit 2xx counts as "the file is there" — a
+// response that resolves without a status is not proof of existence.
 //
 // The `raw` route is used rather than the `read` route on purpose: `read`
 // enforces MAX_FILE_BYTES and answers 404 for an over-sized file, which would
@@ -683,8 +684,12 @@ async function _workspaceProbeFile(path){
   const route=_workspaceRouteForPath(path, 'raw');
   if(!route) return false;
   try{
-    await api(route, {statusOnly:true});
-    return true;
+    const res=await api(route, {statusOnly:true});
+    // statusOnly resolves with {status}. Only a 2xx proves the path really
+    // resolves; a response without a status is NOT proof of existence, so it
+    // must not be reported as "the file is there".
+    const status=res&&res.status;
+    return typeof status==='number' && status>=200 && status<300;
   }catch(err){
     // 404 means "not there"; anything else (403/503/timeout) is inconclusive
     // and must not be reported as a hard "missing" verdict, because the caller
