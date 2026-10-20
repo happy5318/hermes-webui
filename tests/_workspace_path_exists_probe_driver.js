@@ -119,18 +119,18 @@ function check(label, cond, extra) {
     throw err;
   };
   r = await _workspacePathExists('note.md');
-  // Real contract: _workspaceProbeFile re-throws any non-404 failure, and the
-  // caller's outer catch turns that into false. So an inconclusive probe
-  // (403/503/timeout) does end up as "not openable" — which is the intended
-  // outcome for an expired escape grant, where "file open failed" is the
-  // honest message. What must NOT happen is the probe being skipped, or a
-  // 404-shaped error being invented.
+  // Real contract: _workspaceProbeFile re-raises any non-404, non-timeout
+  // failure, and the caller turns that into false. So an inconclusive probe
+  // (403/503) ends up as "not openable" — the intended outcome for an expired
+  // escape grant, where "file open failed" is the honest message. What must
+  // NOT happen is the probe being skipped, or a 404-shaped error being
+  // invented.
   //
-  // The probe is attempted at least once; on a non-404 failure the caller's
-  // outer catch retries the probe once more, so the count is 3 here
-  // (list, probe, retry-probe). The retry is what lets a transient error
-  // still resolve to "exists".
+  // The probe must be attempted exactly once here: a probe that raises is a
+  // verdict in itself, not a reason to ask again. Asking twice could even
+  // return two different answers for the same path.
   check('probe was attempted (not skipped)', apiCalls.length >= 2, `api calls: ${apiCalls.length}`);
+  check('the probe is NOT retried after it raised', apiCalls.length === 2, `api calls: ${apiCalls.length}`);
   check('reports not-openable for an inconclusive probe', r === false, `got ${r}`);
 
   // ── Branch 6: the probe resolves but carries NO status → not proof of
@@ -146,6 +146,23 @@ function check(label, cond, extra) {
   r = await _workspacePathExists('missing.md');
   check('does NOT claim the file exists', r === false, `got ${r}`);
   check('the probe was still attempted', apiCalls.length >= 2, `api calls: ${apiCalls.length}`);
+
+  // ── Branch 7: the probe TIMES OUT → must NOT be reported as missing.
+  // #6710: only a confirmed HTTP answer proves absence. A timeout means the
+  // server is slow, not that the file was deleted — reporting "file open
+  // failed" here would tell the user a file is gone when it is not.
+  console.log('\nBranch 7: probe times out');
+  apiCalls = [];
+  apiImpl = async (url) => {
+    if (url.includes('/api/list')) return { entries: [] };
+    const err = new Error('Request timed out. Please try again.');
+    err.name = 'TimeoutError';
+    err.timeout = true;
+    throw err;
+  };
+  r = await _workspacePathExists('slow.md');
+  check('is NOT reported as missing', r === true, `got ${r}`);
+  check('the probe was attempted', apiCalls.length >= 2, `api calls: ${apiCalls.length}`);
 
   console.log(`\n${failures === 0 ? '✅ ALL BRANCHES OK' : `❌ ${failures} check(s) failed`}`);
   process.exit(failures === 0 ? 0 : 1);

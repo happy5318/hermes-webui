@@ -67,6 +67,10 @@ def test_probe_uses_the_raw_route_not_the_size_capped_read_route():
     # A resolved response is not proof of existence: only an explicit 2xx is.
     assert re.search(r"status\s*>=\s*200", probe), "probe must require a 2xx status"
     assert re.search(r"status\s*<\s*300", probe), "probe must reject non-2xx statuses"
+    # #6710: a timeout is not evidence of absence — it must not become a hard
+    # "missing" verdict (which the caller renders as "file open failed").
+    assert re.search(r"timeout\s*===\s*true", probe), "probe must treat a timeout as inconclusive"
+    assert re.search(r"name\s*===\s*'TimeoutError'", probe)
     # The body is dropped so a large file is not buffered for an existence check.
     assert "statusOnly:true" in probe
 
@@ -124,6 +128,9 @@ def test_browser_existence_logic_behaviour():
          is. This mirrors the upstream contract in
          tests/test_issue6867_artifacts_settled_recovery.py, where a missing
          artifact path must stay blocked.
+      7. the probe TIMES OUT -> NOT reported as missing. Per #6710, only a
+         confirmed HTTP answer proves absence; a timeout means the server is
+         slow, not that the file was deleted.
     """
     if shutil.which("node") is None:
         pytest.skip("node is unavailable on this host")

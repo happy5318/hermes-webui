@@ -651,19 +651,28 @@ async function _workspacePathExists(path){
   // only cares about the response status — a missing file answers 404, an
   // existing one answers 200. That makes the check independent of how many
   // siblings the directory happens to have.
+  //
+  // The listing is fetched in its own try: a failed listing (network, stale
+  // session) must fall through to the probe instead of being reported as a
+  // missing file, and the probe must NOT be re-run from that catch — a probe
+  // that raises is a verdict in itself, not a reason to ask again.
+  let hit=false;
   try{
     const data=await api(`/api/list?session_id=${encodeURIComponent(S.session.session_id)}&path=${encodeURIComponent(dir)}`);
     const entries=data.entries||[];
-    const hit=entries.some(entry=>entry&&((entry.path===path)||entry.name===name));
-    if(hit) return true;
-    // Not in the listing — but the listing may be capped, so its silence is
-    // not proof of absence. Probe the file directly.
+    hit=entries.some(entry=>entry&&((entry.path===path)||(entry.name===name)));
+  }catch(_){
+    // Listing unavailable — fall through to the probe below.
+  }
+  if(hit) return true;
+  // Not in the listing — but the listing may be capped, so its silence is
+  // not proof of absence. Probe the file directly.
+  try{
     return await _workspaceProbeFile(path);
   }catch(_){
-    // The listing failed (network / stale session). Probe the file directly
-    // before giving up, so a transient listing error cannot masquerade as a
-    // missing file.
-    try{ return await _workspaceProbeFile(path); }catch(_){ return false; }
+    // The probe could not answer (e.g. 403, no escape grant). The user still
+    // cannot open the file, so report it as not openable.
+    return false;
   }
 }
 
@@ -691,11 +700,17 @@ async function _workspaceProbeFile(path){
     const status=res&&res.status;
     return typeof status==='number' && status>=200 && status<300;
   }catch(err){
-    // 404 means "not there"; anything else (403/503/timeout) is inconclusive
-    // and must not be reported as a hard "missing" verdict, because the caller
-    // turns a false negative into "file open failed".
+    // Only a confirmed HTTP answer proves absence:
+    //   404 — the file is gone
+    //   403 — the escape grant is gone (the user cannot open it either, so
+    //         "file open failed" is the honest answer)
+    // A timeout is NOT proof of absence: per #6710, a slow answer must not be
+    // reported as "the file is missing", so it stays inconclusive and the open
+    // proceeds. Anything else is re-raised so the caller reports it as
+    // not-openable rather than inventing a "missing" verdict.
     const status=err&&err.status;
     if(status===404) return false;
+    if(err&&(err.timeout===true||err.name==='TimeoutError')) return true;
     throw err;
   }
 }
