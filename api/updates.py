@@ -69,6 +69,24 @@ _FETCH_NETWORK_FAILURE_SIGNATURES = (
     'tls connection was non-properly terminated',
     'ssl certificate problem',
 )
+# `_run_git` reports a command it cancelled at its own timeout as
+# "git <args> timed out after <n>s". That line is our deadline, not a network
+# symptom: the apply fetch runs with a 15 s budget, so classify the marker as
+# a timeout with its bound. libcurl's real "Operation timed out after <n>
+# milliseconds" stalls are not `git `-prefixed and keep network guidance.
+_FETCH_DEADLINE_TIMEOUT_RE = re.compile(
+    r'^git (?P<operation>.+?) timed out after (?P<bound>\d+(?:\.\d+)?)s$',
+    re.MULTILINE,
+)
+# Git < 2.51 names the blocking ref ("'refs/remotes/origin/x' exists; cannot
+# create 'refs/remotes/origin/x/y'"). Git >= 2.51 batches fetch ref updates
+# and reports the same name conflict only through the summary hint, which
+# fetch.c emits solely for REF_TRANSACTION_ERROR_NAME_CONFLICT; stale-lock
+# failures keep their "Unable to create '...lock'" wording and never match.
+_REMOTE_REF_COLLISION_RE = re.compile(
+    r"exists; cannot create ['\"]refs/remotes/origin/"
+    r"|some local refs could not be updated; try running\s+['\"]git remote prune origin['\"]"
+)
 _RELEASE_TAG_RE = re.compile(r'^v[0-9][0-9A-Za-z.+-]*$')
 _EXPERIMENTAL_RELEASE_TAG_RE = re.compile(r'^exp-v[0-9]+(?:\.[0-9]+)*$')
 _GITHUB_RELEASE_TAGS_URL = 'https://api.github.com/repos/nesquena/hermes-webui/tags?per_page=100'
@@ -130,7 +148,18 @@ def _sanitize_git_diagnostic(output: str, *, limit: int = _GIT_DIAGNOSTIC_MAX_CH
 
 
 def _apply_fetch_failure_message(fetch_out: str, network_message: str) -> str:
-    """Return the apply-path fetch failure message for the given stderr."""
+    """Return the apply-path fetch failure message for the given stderr.
+
+    A fetch the updater cancelled at its own deadline is a timeout: say so,
+    naming the cancelled command and its bound. Only real network signatures
+    keep the connectivity guidance.
+    """
+    cancelled = _FETCH_DEADLINE_TIMEOUT_RE.search(fetch_out or '')
+    if cancelled:
+        return (
+            f'The fetch was cancelled after {cancelled.group("bound")}s — '
+            f'git {cancelled.group("operation")} did not finish before the update deadline.'
+        )
     detail = _sanitize_git_diagnostic(fetch_out)
     if not detail:
         return network_message
@@ -286,6 +315,16 @@ def _run_git(args, cwd, timeout=10):
         stderr = (r.stderr or '').strip()
         if r.returncode == 0:
             return stdout, True
+        if (args[:2] == ['fetch', 'origin']
+                and all(arg in {'--quiet', '--tags', '--force'} for arg in args[2:])
+                and _REMOTE_REF_COLLISION_RE.search(stderr or stdout)):
+            refspec, refspec_ok = _run_git(['config', '--get-all', 'remote.origin.fetch'], cwd)
+            # Custom destinations may prune local tags or branches; fail closed.
+            if refspec_ok and refspec == '+refs/heads/*:refs/remotes/origin/*':
+                return _run_git([
+                    'fetch', 'origin', '--prune', '--no-prune-tags', '--refmap=',
+                    *args[2:], '+refs/heads/*:refs/remotes/origin/*',
+                ], cwd, timeout=timeout)
         return stderr or stdout or f"git exited with status {r.returncode}", False
     except subprocess.TimeoutExpired as exc:
         # text=True decodes only the *completed* run's pipes; on a timeout
@@ -1033,6 +1072,11 @@ def _check_webui_published_release_update(channel=DEFAULT_UPDATE_CHANNEL):
         'release_based': True,
         'current_version': current_version,
         'latest_version': latest_version,
+        # Same field as the git paths: on the no-git/Docker payload the
+        # frontend's "Latest tag:" suffix would otherwise fall back to the
+        # Agent's tag (e.g. "Latest tag: v2026.9.24" while trailing a WebUI
+        # release). Maintainer fold, PR #6859 round 3.
+        'latest_tag': latest_version,
         'compare_url': _build_compare_url(repo_url, current_ref, latest_ref),
         'manual_update': True,
         'channel': channel,
@@ -1147,7 +1191,7 @@ def _select_apply_compare_ref(path, channel=DEFAULT_UPDATE_CHANNEL, target=None)
     return f'origin/{branch}'
 
 
-def _channel_up_to_date_info(path, name, channel, current_tag):
+def _channel_up_to_date_info(path, name, channel, current_tag, latest_tag=None):
     """Return an 'up to date' payload for a channel that must NOT branch-compare.
 
     Used by the stable channel: stable tags are a promoted subset of master, so
@@ -1167,6 +1211,10 @@ def _channel_up_to_date_info(path, name, channel, current_tag):
         'release_based': True,
         'current_version': current_tag,
         'latest_version': current_tag,
+        # Real latest channel tag for the frontend's "Latest tag:" suffix —
+        # latest_version here holds the CURRENT tag (HEAD is on it), so the
+        # frontend must never fall back to it as a "latest" tag. (#6859 S1)
+        'latest_tag': latest_tag or current_tag,
         'channel': channel,
     }
 
@@ -1233,7 +1281,7 @@ def _check_repo_release(path, name, channel=DEFAULT_UPDATE_CHANNEL):
     suppress_stable_fallthrough = (channel == 'stable' and name == 'webui')
     if behind == 0 and _head_is_past_latest_tag(path, current_tag, channel):
         if suppress_stable_fallthrough:
-            return _channel_up_to_date_info(path, name, channel, current_tag)
+            return _channel_up_to_date_info(path, name, channel, current_tag, latest_tag)
         return None
 
     # Users tracking main can already contain the newest fetched release tag
@@ -1243,7 +1291,7 @@ def _check_repo_release(path, name, channel=DEFAULT_UPDATE_CHANNEL):
     # configured upstream instead of advertising a tag that cannot fast-forward.
     if behind > 0 and _head_contains_ref(path, latest_tag):
         if suppress_stable_fallthrough:
-            return _channel_up_to_date_info(path, name, channel, current_tag)
+            return _channel_up_to_date_info(path, name, channel, current_tag, latest_tag)
         return None
 
     # Patch releases can land on a side branch while day-to-day installs track
@@ -1251,7 +1299,7 @@ def _check_repo_release(path, name, channel=DEFAULT_UPDATE_CHANNEL):
     # that `git pull --ff-only <latest-tag>` cannot reach.
     if behind > 0 and not _can_fast_forward_to(path, latest_tag):
         if suppress_stable_fallthrough:
-            return _channel_up_to_date_info(path, name, channel, current_tag)
+            return _channel_up_to_date_info(path, name, channel, current_tag, latest_tag)
         return None
 
     remote_url, _ = _run_git(['remote', 'get-url', 'origin'], path)
@@ -1274,6 +1322,7 @@ def _check_repo_release(path, name, channel=DEFAULT_UPDATE_CHANNEL):
         'release_based': True,
         'current_version': current_version_display,
         'latest_version': latest_tag,
+        'latest_tag': latest_tag,
         'channel': channel,
     }
 
@@ -1540,11 +1589,27 @@ def _check_repo(path, name, channel=DEFAULT_UPDATE_CHANNEL):
         release_info['dirty'] = _is_dirty(path)
         return attach_recovery(release_info, release_info.get('branch'))
 
+    # When the release check found no update gap (HEAD already contains the
+    # latest tag), we fall through to the branch check below.  Before doing
+    # that, probe for tag info so the frontend can show "Latest tag: vX.Y.Z"
+    # even when the user is on main ahead of the latest release.  The tag
+    # data is purely informational — the branch check determines whether an
+    # update is actionable.  (_run_git never raises; guard on falsy returns.)
+    _tags = _release_tags(path, channel)
+    _tag_info = None
+    if _tags:
+        _latest = _tags[0]
+        _current = _current_release_tag(path, channel)
+        _tag_info = {'latest_tag': _latest, 'current_tag': _current}
+
     branch_info = _check_repo_branch(path, name, fetch=False)
     if branch_info is not None:
         branch_info = dict(branch_info)
         branch_info['dirty'] = _is_dirty(path)
         branch_info['channel'] = channel
+        if _tag_info is not None:
+            branch_info['latest_tag'] = _tag_info['latest_tag']
+            branch_info['current_tag'] = _tag_info['current_tag']
         return attach_recovery(branch_info, branch_info.get('branch'))
     return None
 
