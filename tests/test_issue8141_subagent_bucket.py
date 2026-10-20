@@ -58,7 +58,7 @@ for (const fn of ['_isSessionLocallyStreaming','_hasPendingUserMessageSignal','_
   '_isChildSession','_isForkWithResolvableParent','_sessionLineageKey','_sidebarLineageKeyForRow',
   '_collapseSessionLineageForSidebar','_attachChildSessionsToSidebarRows','_sessionAttentionState',
   '_sidebarRowHasVisibleMessages','_isDelegatedSubagentRow','_sidebarProjectResolver','_sidebarRowsById','_sidebarHasUnprojectedRows',
-  '_isDelegatedSubagentChild','_sidebarDisplayBucketIsCli',
+  '_isDelegatedSubagentChild','_sidebarSameProfileForLineage','_sidebarDisplayBucketIsCli',
   '_partitionSidebarSessionRows','_scopedSidebarReferenceRows','_renderSidebarRowsFromRawSessions']) {
   eval.call(global, extractFunc(fn));
 }
@@ -563,3 +563,64 @@ def test_archived_cli_owned_child_counted_under_archived_cli(monkeypatch):
     )
     assert payload["archived_cli_count"] == 2, payload
     assert payload["archived_webui_count"] == 0, payload
+
+
+# ---------------------------------------------------------------------------
+# 2026-10-19 re-gate: the archive pager's loaded count and the cross-profile
+# lineage lookup.
+# ---------------------------------------------------------------------------
+
+
+def test_archive_pager_loaded_count_uses_the_derived_bucket() -> None:
+    """The CLI tab's "Load more archived" must reach zero.
+
+    ``archived_cli_count`` comes from the server's DERIVED bucket, so an
+    archived delegated child of a CLI parent is inside that total. The loaded
+    count used the raw ``_isCliSession()``, which never sees the child, so
+    ``remaining`` never reached zero and the pager kept offering more rows
+    after everything was loaded. The count must use the same derivation.
+    """
+    src = (Path(__file__).resolve().parents[1] / "static" / "sessions.js").read_text(
+        encoding="utf-8"
+    )
+    marker = "const _archivedInBucket="
+    assert marker in src, "the archive pager's bucket predicate was not found"
+    block = src[src.find(marker) : src.find(marker) + 800]
+    assert "_sidebarDisplayBucketIsCli" in block, (
+        "the archive pager must count loaded rows with the derived display "
+        "bucket, not the raw _isCliSession(), so an archived delegated child "
+        "of a CLI parent is counted on both sides of `remaining`"
+    )
+    assert "_isCliSession(s)" not in block, (
+        "the raw classifier must not be used for the loaded count"
+    )
+    # ...and the count itself must be driven by that predicate.
+    count_at = src.find("const loadedArchivedCount=sidebarRows.filter(_archivedInBucket)")
+    assert count_at > src.find(marker), (
+        "the loaded count must be computed through the derived-bucket predicate"
+    )
+
+
+def test_lineage_lookup_refuses_a_parent_from_another_profile() -> None:
+    """The All-profiles view must not inherit another profile's bucket.
+
+    Session ids are unique per profile home and the All-profiles view merges
+    several homes into one lookup map, so a bare id lookup can resolve a parent
+    that belongs to a different profile. A lineage edge is only meaningful
+    inside one profile: a cross-profile hit is treated as absent and the row
+    keeps its own raw bucket.
+    """
+    src = (Path(__file__).resolve().parents[1] / "static" / "sessions.js").read_text(
+        encoding="utf-8"
+    )
+    assert "function _sidebarSameProfileForLineage(" in src, (
+        "the lineage walk needs a same-profile guard helper"
+    )
+    walk = src[src.find("function _sidebarDisplayBucketIsCli(") :]
+    walk = walk[: walk.find("\nfunction ", 10)]
+    assert "_sidebarSameProfileForLineage(cur,parent)" in walk, (
+        "the parent walk must refuse a cross-profile parent"
+    )
+    assert "_sidebarSameProfileForLineage(s,lineageRow)" in walk, (
+        "the lineage root/tip fallback must refuse a cross-profile row"
+    )

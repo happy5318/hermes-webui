@@ -8917,6 +8917,18 @@ function _isDelegatedSubagentChild(s){
   const src=String(s.raw_source||s.source_tag||s.session_source||s.source||'').trim().toLowerCase();
   return src==='subagent';
 }
+// A lineage edge (parent_session_id / lineage root / lineage tip) is only
+// meaningful inside one profile: session ids are unique per profile home, and
+// the All-profiles view merges several homes into one lookup map. Treat a row
+// whose profile differs as absent rather than following the edge — inheriting
+// another profile's bucket misclassifies the row (#8245 re-gate, 2026-10-19).
+function _sidebarSameProfileForLineage(a,b){
+  if(!a||!b) return false;
+  const pa=String(a.profile||a.profile_name||'').trim();
+  const pb=String(b.profile||b.profile_name||'').trim();
+  if(!pa||!pb) return true;   // a row without profile info carries no cross-profile risk
+  return pa===pb;
+}
 function _sidebarDisplayBucketIsCli(s, rowsById, memo){
   if(!s) return false;
   if(memo&&s.session_id&&memo.has(s.session_id)) return memo.get(s.session_id);
@@ -8937,7 +8949,13 @@ function _sidebarDisplayBucketIsCli(s, rowsById, memo){
         break;
       }
       const parent=rowsById.get(parentId);
-      if(!parent) break;
+      // #8245 re-gate (2026-10-19): the All-profiles view puts several
+      // profiles' rows in one map, so a bare id lookup can resolve a parent
+      // that belongs to a DIFFERENT profile and inherit its bucket. A lineage
+      // edge is only meaningful within the same profile, so require the
+      // profiles to agree before following it; a cross-profile hit is treated
+      // as "parent not present" (the row keeps its own raw bucket).
+      if(!parent||!_sidebarSameProfileForLineage(cur,parent)) break;
       cur=parent;
     }
     if(!resolved&&cur!==s){
@@ -8949,7 +8967,11 @@ function _sidebarDisplayBucketIsCli(s, rowsById, memo){
       for(const key of ['_parent_lineage_root_id','_parent_lineage_tip_id']){
         const lineageId=String(s[key]||'').trim();
         if(lineageId&&lineageId!==s.session_id&&rowsById.has(lineageId)){
-          result=_isCliSession(rowsById.get(lineageId));
+          const lineageRow=rowsById.get(lineageId);
+          // Same profile guard as the parent walk: a lineage id from another
+          // profile's home must not derive this row's bucket.
+          if(!_sidebarSameProfileForLineage(s,lineageRow)) continue;
+          result=_isCliSession(lineageRow);
           resolved=true;
           break;
         }
@@ -9591,7 +9613,24 @@ function renderSessionListFromCache(){
   const archivePagingFilterActive=_sessionArchivePagingFilterActive();
   if(_showArchived&&!archivePagingFilterActive){
     const activeArchivedTotal=_sessionSourceFilter==='cli'?_archivedCliCount:_archivedWebuiCount;
-    const loadedArchivedCount=sidebarRows.filter(s=>s&&s.archived&&(_sessionSourceFilter==='cli'?_isCliSession(s):!_isCliSession(s))).length;
+    // #8245 re-gate (2026-10-19): the server total comes from the DERIVED bucket
+    // (api/routes.py computes archived_cli_count with the ownership rule), so the
+    // loaded count must use the same rule. Counting loaded rows with the raw
+    // _isCliSession() never sees an archived delegated child of a CLI parent:
+    // it is in the server total but not in this count, so `remaining` never
+    // reaches zero and the CLI tab keeps offering "Load more archived" after
+    // everything is loaded (master does not).
+    const _archivedBucketRowsById=new Map(
+      sidebarRows.filter(s=>s&&s.session_id).map(s=>[String(s.session_id),s])
+    );
+    const _archivedDisplayBucketMemo=new Map();
+    const _archivedInBucket=(s)=>{
+      if(!s||!s.archived) return false;
+      return _sessionSourceFilter==='cli'
+        ? !!_sidebarDisplayBucketIsCli(s, _archivedBucketRowsById, _archivedDisplayBucketMemo)
+        : !_sidebarDisplayBucketIsCli(s, _archivedBucketRowsById, _archivedDisplayBucketMemo);
+    };
+    const loadedArchivedCount=sidebarRows.filter(_archivedInBucket).length;
     const archiveLoadCapReached=Number(_archivedRowsLoadedLimit||0)>=SESSION_ARCHIVED_MAX_LOADED_LIMIT;
     const remainingArchived=archiveLoadCapReached?0:Math.max(0, Number(activeArchivedTotal||0)-loadedArchivedCount);
     if(remainingArchived>0){

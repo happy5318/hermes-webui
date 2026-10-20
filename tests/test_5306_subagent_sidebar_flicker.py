@@ -97,6 +97,7 @@ eval(extractFunc('_isDelegatedSubagentRow'));
 eval(extractFunc('_sidebarProjectResolver'));
 eval(extractFunc('_sidebarRowsById'));
 eval(extractFunc('_isDelegatedSubagentChild'));
+eval(extractFunc('_sidebarSameProfileForLineage'));
 eval(extractFunc('_sidebarDisplayBucketIsCli'));
 eval(extractFunc('_partitionSidebarSessionRows'));
 eval(extractFunc('_scopedSidebarReferenceRows'));
