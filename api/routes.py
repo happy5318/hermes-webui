@@ -24634,15 +24634,8 @@ def _handle_file_raw(handler, parsed):
         return bad(handler, "Session not found", 404)
     rel = qs.get("path", [""])[0]
     force_download = qs.get("download", [""])[0] == "1"
-    # ?workspace_only=1 scopes the lookup to the workspace: this session's
-    # attachment inbox is not consulted. The browser existence probe uses it so
-    # an upload that only lives in the inbox cannot answer "the workspace file
-    # is there". Default behaviour (inbox fallback for chat uploads) is
-    # unchanged for every other caller.
-    workspace_only = qs.get("workspace_only", [""])[0] == "1"
-    resolved = _file_raw_target(
-        s, sid, rel, allow_attachment_fallback=not workspace_only
-    )
+    workspace_only = qs.get("workspace_only", [""])[0] == "1"  # probe provenance
+    resolved = _file_raw_target(s, sid, rel, allow_attachment_fallback=not workspace_only)
     if resolved is None:
         return j(handler, {"error": "not found"}, status=404)
     anchor_root, target = resolved
