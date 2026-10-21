@@ -24423,8 +24423,17 @@ def _handle_media(handler, parsed):
     return _serve_file_bytes(handler, target, mime, disposition, cache_control, csp=csp)
 
 
-def _file_raw_target(session, sid: str, rel: str) -> tuple[Path, Path] | None:
-    """Resolve /api/file/raw paths from the workspace or this session's uploads."""
+def _file_raw_target(
+    session, sid: str, rel: str, *, allow_attachment_fallback: bool = True
+) -> tuple[Path, Path] | None:
+    """Resolve /api/file/raw paths from the workspace or this session's uploads.
+
+    ``allow_attachment_fallback=False`` restricts the answer to the workspace.
+    Callers that read a 200 as proof that a *workspace* file exists must pass
+    it: the inbox fallback below answers 200 for this session's uploads even
+    when the workspace path is absent, so a plain 200 carries no workspace
+    provenance.
+    """
     workspace_root = Path(session.workspace)
     try:
         target = safe_resolve(workspace_root, rel)
@@ -24432,6 +24441,9 @@ def _file_raw_target(session, sid: str, rel: str) -> tuple[Path, Path] | None:
         target = None
     if target and target.exists() and target.is_file():
         return workspace_root, target
+
+    if not allow_attachment_fallback:
+        return None
 
     # Chat uploads now live in a per-session attachment inbox outside the
     # workspace. Keep the public URL stable while scoping fallback lookup to
@@ -24622,7 +24634,15 @@ def _handle_file_raw(handler, parsed):
         return bad(handler, "Session not found", 404)
     rel = qs.get("path", [""])[0]
     force_download = qs.get("download", [""])[0] == "1"
-    resolved = _file_raw_target(s, sid, rel)
+    # ?workspace_only=1 scopes the lookup to the workspace: this session's
+    # attachment inbox is not consulted. The browser existence probe uses it so
+    # an upload that only lives in the inbox cannot answer "the workspace file
+    # is there". Default behaviour (inbox fallback for chat uploads) is
+    # unchanged for every other caller.
+    workspace_only = qs.get("workspace_only", [""])[0] == "1"
+    resolved = _file_raw_target(
+        s, sid, rel, allow_attachment_fallback=not workspace_only
+    )
     if resolved is None:
         return j(handler, {"error": "not found"}, status=404)
     anchor_root, target = resolved

@@ -293,6 +293,12 @@ function _workspaceRouteForPathRel(path, kind, opts={}){
     if(opts.download) extra.push('download=1');
     // Inline previews intentionally preserve a literal &inline=1 marker in this file.
     if(opts.inline) extra.push('inline=1');
+    // Existence probes must be answered by the workspace, not by the session's
+    // attachment inbox: /api/file/raw falls back to the inbox when the
+    // workspace path is absent, so its 200 alone would not prove that the
+    // workspace file exists. The escape branch above never takes this flag —
+    // /api/escape/file/raw has no inbox fallback and stays authoritative.
+    if(opts.workspaceOnly) extra.push('workspace_only=1');
     const suffix = extra.length ? `&${extra.join('&')}` : '';
     return `/api/file/raw?session_id=${sessionId}&path=${encodeURIComponent(normalizedPath || '.')}${suffix}`;
   }
@@ -688,9 +694,16 @@ async function _workspacePathExists(path){
 // there and only 404s when the path genuinely does not resolve. The body is
 // dropped (statusOnly) so a large file is not buffered just to answer "does
 // it exist?".
+//
+// `workspaceOnly` is what makes the 200 meaningful: by default `raw` falls back
+// to the session's attachment inbox when the workspace path is absent, so an
+// upload that was never written to the workspace would answer 200 too. The
+// probe asks for workspace provenance explicitly, and the server honours it by
+// skipping the inbox fallback. Escape-granted paths keep the escape route,
+// which never consults the inbox.
 async function _workspaceProbeFile(path){
   if(!S.session||!path) return false;
-  const route=_workspaceRouteForPath(path, 'raw');
+  const route=_workspaceRouteForPath(path, 'raw', {workspaceOnly:true});
   if(!route) return false;
   try{
     const res=await api(route, {statusOnly:true});

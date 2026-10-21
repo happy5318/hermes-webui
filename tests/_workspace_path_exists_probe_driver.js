@@ -3,7 +3,11 @@
 //
 // This is a logic test, not a text assertion: the functions are extracted from
 // the file the browser actually downloads, so a change in the shipped source
-// changes what runs here.
+// changes what runs here. The route the probe requests is built by the shipped
+// _workspaceRouteForPath/_workspaceRouteForPathRel pair too, so the URL
+// asserted here is the URL a real browser would request.
+//
+// Usage: node _workspace_path_exists_probe_driver.js <path-to-static/workspace.js>
 const fs = require('fs');
 
 const SRC = process.argv[2];
@@ -14,39 +18,65 @@ if (!SRC) {
 const src = fs.readFileSync(SRC, 'utf8');
 
 function extract(name) {
-  const start = src.indexOf(`async function ${name}(`);
+  let start = src.indexOf(`async function ${name}(`);
+  if (start < 0) start = src.indexOf(`function ${name}(`);
   if (start < 0) throw new Error(`${name} not found in ${SRC}`);
-  const brace = src.indexOf('{', start);
+  // Walk the parameter list first: a default parameter (e.g. `opts={}`) closes
+  // with a brace that is NOT the function body.
+  let i = src.indexOf('(', start);
+  let parens = 0;
+  for (; i < src.length; i++) {
+    if (src[i] === '(') parens++;
+    else if (src[i] === ')') {
+      parens--;
+      if (parens === 0) break;
+    }
+  }
+  const brace = src.indexOf('{', i);
   let depth = 0;
-  for (let i = brace; i < src.length; i++) {
-    if (src[i] === '{') depth++;
-    else if (src[i] === '}') {
+  for (let j = brace; j < src.length; j++) {
+    if (src[j] === '{') depth++;
+    else if (src[j] === '}') {
       depth--;
-      if (depth === 0) return src.slice(start, i + 1);
+      if (depth === 0) return src.slice(start, j + 1);
     }
   }
   throw new Error(`could not extract ${name}`);
 }
 
-// Minimal stand-ins for the two globals the extracted code touches.
+// Minimal stand-ins for the globals the extracted code touches.
 let S = { session: { session_id: 'SID', workspace: '/ws' } };
 let apiCalls = [];
 let apiImpl = async () => ({ entries: [] });
+let grantForPath = () => null;
 
-const sandbox = {
-  S,
-  api: async (...args) => { apiCalls.push(args); return apiImpl(...args); },
-  _workspaceRouteForPath: (path, kind) => `/api/${kind}?path=${encodeURIComponent(path)}`,
-  encodeURIComponent,
-  console,
-};
+// No document/location in Node: _workspaceRouteForPath falls back to the
+// app-relative route, which is exactly the string the probe hands to api().
+const document = undefined;
+const location = undefined;
 
 const factory = new Function(
-  'S', 'api', '_workspaceRouteForPath',
-  `${extract('_workspacePathExists')}\n${extract('_workspaceProbeFile')}\nreturn { _workspacePathExists, _workspaceProbeFile };`
+  'S', 'api', 'document', 'location', 'URL', 'URLSearchParams', 'encodeURIComponent',
+  '_workspaceEscapeGrantForPath', 'console',
+  [
+    extract('_normalizeWorkspaceRelPath'),
+    extract('_isSameOrChildPath'),
+    extract('_workspaceRouteForPathRel'),
+    extract('_workspaceRouteForPath'),
+    extract('_workspacePathExists'),
+    extract('_workspaceProbeFile'),
+  ].join('\n') + '\nreturn { _workspacePathExists, _workspaceProbeFile };'
 );
 const { _workspacePathExists } = factory(
-  sandbox.S, sandbox.api, sandbox._workspaceRouteForPath
+  S,
+  async (...args) => { apiCalls.push(args); return apiImpl(...args); },
+  document,
+  location,
+  URL,
+  URLSearchParams,
+  encodeURIComponent,
+  (path) => grantForPath(path),
+  console
 );
 
 let failures = 0;
@@ -82,8 +112,12 @@ function check(label, cond, extra) {
   r = await _workspacePathExists('a-file-past-the-cap.md');
   check('returns true via the direct probe', r === true, `got ${r}`);
   check('issued the probe request', apiCalls.length === 2, `api calls: ${apiCalls.length}`);
-  check('probe hit the raw route', apiCalls[1] && apiCalls[1][0].includes('/api/raw'), apiCalls[1] && apiCalls[1][0]);
+  check('probe hit the raw route', apiCalls[1] && apiCalls[1][0].includes('/api/file/raw'), apiCalls[1] && apiCalls[1][0]);
   check('probe used statusOnly (no body buffered)', apiCalls[1] && apiCalls[1][1] && apiCalls[1][1].statusOnly === true);
+  // Provenance: /api/file/raw falls back to the session attachment inbox when
+  // the workspace path is absent, so a bare 200 does not prove the WORKSPACE
+  // file exists. The probe must ask for workspace-only resolution.
+  check('probe scoped the lookup to the workspace', !!apiCalls[1] && apiCalls[1][0].includes('workspace_only=1'), apiCalls[1] && apiCalls[1][0]);
 
   // ── Branch 3: the file genuinely does not exist → false ──────────────
   console.log('\nBranch 3: file genuinely absent');
@@ -163,6 +197,46 @@ function check(label, cond, extra) {
   r = await _workspacePathExists('slow.md');
   check('is NOT reported as missing', r === true, `got ${r}`);
   check('the probe was attempted', apiCalls.length >= 2, `api calls: ${apiCalls.length}`);
+
+  // ── Branch 8: escape-granted paths keep the escape route ─────────────
+  // /api/escape/file/raw resolves only against the authorized external root:
+  // it has no attachment-inbox fallback, so it stays an existence authority
+  // without the flag. The probe must not downgrade it to /api/file/raw.
+  console.log('\nBranch 8: escape-granted path keeps the escape route');
+  apiCalls = [];
+  grantForPath = () => ({ token: 'GRANT', path: '/outside' });
+  apiImpl = async (url) => {
+    if (url.includes('/api/list')) return { entries: [] };
+    return { status: 200 };
+  };
+  r = await _workspacePathExists('/outside/note.md');
+  check('returns true', r === true, `got ${r}`);
+  const escapeUrl = apiCalls[1] && apiCalls[1][0];
+  check('probe used the escape raw route', !!escapeUrl && escapeUrl.includes('/api/escape/file/raw'), escapeUrl);
+  check('escape route carried the grant token', !!escapeUrl && escapeUrl.includes('token=GRANT'), escapeUrl);
+  check('escape route did NOT gain workspace_only', !!escapeUrl && !escapeUrl.includes('workspace_only=1'), escapeUrl);
+  grantForPath = () => null;
+
+  // ── Branch 9: an inbox-only upload must not satisfy the workspace probe.
+  // The server answers 404 for a workspace-only lookup when the name exists
+  // only in the session attachment inbox; the predicate must report false so
+  // openArtifactPath refuses the absent workspace artifact instead of opening
+  // (and downloading) the uploaded copy.
+  console.log('\nBranch 9: name exists only in the attachment inbox');
+  apiCalls = [];
+  apiImpl = async (url) => {
+    if (url.includes('/api/list')) return { entries: [] };
+    if (url.includes('workspace_only=1')) {
+      const err = new Error('not found');
+      err.status = 404;
+      throw err;
+    }
+    // The unscoped route would have answered 200 from the inbox fallback.
+    return { status: 200 };
+  };
+  r = await _workspacePathExists('note.txt');
+  check('reports the workspace file as absent', r === false, `got ${r}`);
+  check('the probe asked for workspace provenance', apiCalls.length === 2 && apiCalls[1][0].includes('workspace_only=1'), apiCalls[1] && apiCalls[1][0]);
 
   console.log(`\n${failures === 0 ? '✅ ALL BRANCHES OK' : `❌ ${failures} check(s) failed`}`);
   process.exit(failures === 0 ? 0 : 1);
