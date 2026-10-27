@@ -14,6 +14,8 @@ import os
 import re
 import shutil
 import subprocess
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -56,6 +58,105 @@ def _purge_settings_cache():
     pass
 
 
+def _snapshot_agent_process_home_pin():
+    """Snapshot the Agent's process-home pin, if the Agent package is present.
+
+    ``api.profiles._pin_process_profile_home()`` calls
+    ``hermes_constants.pin_process_hermes_home()``, which sets a
+    process-global. The Agent package is not installed in every test
+    environment, so this returns ``None`` when it is absent.
+    """
+    try:
+        import hermes_constants
+    except Exception:
+        return None
+    pinned = getattr(hermes_constants, "_PINNED_PROCESS_HERMES_HOME", None)
+    pin = getattr(hermes_constants, "pin_process_hermes_home", None)
+    if not callable(pin):
+        return None
+    return (pin, pinned)
+
+
+def _restore_agent_process_home_pin(snapshot) -> None:
+    """Restore the Agent's process-home pin captured earlier."""
+    if not snapshot:
+        return
+    pin, pinned = snapshot
+    try:
+        pin(pinned)
+    except Exception:
+        pass
+
+
+def _snapshot_cron_home_modules() -> dict:
+    """Snapshot the cron modules' cached home paths.
+
+    ``_set_hermes_home()`` patches ``cron.jobs`` and ``cron.scheduler`` with
+    module-level path constants. Those are process state, so a test that
+    boots into a temporary home must put them back — otherwise a later test
+    reads a home that tmp_path has already deleted.
+    """
+    snapshot: dict = {}
+    for module_name, attrs in (
+        ("cron.jobs", ("HERMES_DIR", "CRON_DIR", "JOBS_FILE", "OUTPUT_DIR")),
+        ("cron.scheduler", ("_hermes_home", "_LOCK_DIR", "_LOCK_FILE")),
+    ):
+        try:
+            module = __import__(module_name, fromlist=["_"])
+        except Exception:
+            continue
+        for attr in attrs:
+            snapshot[(module_name, attr)] = (
+                module, attr, hasattr(module, attr), getattr(module, attr, None),
+            )
+    return snapshot
+
+
+def _restore_cron_home_modules(snapshot: dict) -> None:
+    """Restore the cron modules' cached home paths captured earlier."""
+    for (module_name, attr), (module, _attr, had_attr, value) in snapshot.items():
+        try:
+            if had_attr:
+                setattr(module, attr, value)
+            else:
+                delattr(module, attr)
+        except (AttributeError, TypeError):
+            pass
+
+
+def _snapshot_process_home_state(prof) -> dict:
+    """Snapshot every piece of process state the startup boundary mutates.
+
+    ``_set_hermes_home()`` — the real call the fixture's ``boot()`` makes —
+    mutates five process-global things: the ``HERMES_HOME`` env var, the
+    process-profile home pin, the imported skill modules' cached paths, the
+    cron modules' cached paths, and the Agent's process-home pin. All of them
+    point at a ``tmp_path`` home that is deleted with the test, so a teardown
+    that leaves any of them behind makes a later test run against a deleted
+    home.
+    """
+    return {
+        "hermes_home": os.environ.get("HERMES_HOME"),
+        "had_hermes_home": "HERMES_HOME" in os.environ,
+        "process_profile_home": getattr(prof, "_PROCESS_PROFILE_HOME", None),
+        "skill_home": prof.snapshot_skill_home_modules(),
+        "cron_home": _snapshot_cron_home_modules(),
+        "agent_pin": _snapshot_agent_process_home_pin(),
+    }
+
+
+def _restore_process_home_state(prof, snapshot: dict) -> None:
+    """Restore the process state captured by ``_snapshot_process_home_state``."""
+    if snapshot["had_hermes_home"]:
+        os.environ["HERMES_HOME"] = snapshot["hermes_home"] or ""
+    else:
+        os.environ.pop("HERMES_HOME", None)
+    prof._PROCESS_PROFILE_HOME = snapshot["process_profile_home"]
+    prof.restore_skill_home_modules(snapshot["skill_home"])
+    _restore_cron_home_modules(snapshot["cron_home"])
+    _restore_agent_process_home_pin(snapshot["agent_pin"])
+
+
 @pytest.fixture
 def installation_env(monkeypatch, tmp_path):
     """Drive the REAL startup boundary, then isolate every global it touched.
@@ -80,6 +181,13 @@ def installation_env(monkeypatch, tmp_path):
     }
     touched = ("SLOT_NAME", "OPERATOR_SLOT", "UNRELATED_PROFILE_KEY", "DUP_SLOT")
     saved_env = {k: os.environ.get(k) for k in touched}
+    # `_set_hermes_home()` (called by boot()) mutates five pieces of PROCESS
+    # state, not just the loader globals: the HERMES_HOME env var, the
+    # process-profile home pin, the imported skill modules' cached paths, the
+    # cron modules' cached paths, and the Agent's process-home pin. The
+    # teardown used to restore none of them, so a later test could run
+    # against a deleted tmp_path home.
+    home_state = _snapshot_process_home_state(prof)
 
     # Clear the snapshot so the boundary can be driven per case.
     prof._INSTALLATION_ENV_SNAPSHOT = {}
@@ -141,6 +249,11 @@ def installation_env(monkeypatch, tmp_path):
     prof._loaded_profile_env_keys = saved_globals["_loaded_profile_env_keys"]
     prof._profile_overridden_env = saved_globals["_profile_overridden_env"]
     prof._INSTALLATION_ENV_SNAPSHOT = saved_globals["_INSTALLATION_ENV_SNAPSHOT"]
+    # Restore the process-home pin, the skill modules' cached paths, the cron
+    # modules' cached paths and the Agent's process-home pin, so a later test
+    # cannot inherit the temporary home this case booted into (it is deleted
+    # with tmp_path).
+    _restore_process_home_state(prof, home_state)
     for k, v in saved_env.items():
         if v is None:
             monkeypatch.delenv(k, raising=False)
@@ -1264,4 +1377,142 @@ def test_duplicate_dotenv_lines_with_operator_value(installation_env, monkeypatc
     )
     assert (cfg.get("webui") or {}).get("instance_name") == "Prod-B", (
         f"the operator's DUP_SLOT must win over the duplicate profile lines: {cfg!r}"
+    )
+
+
+# ── Fixture process-state isolation (greptile P2, 2026-10-05) ────────────────
+
+
+def test_process_home_state_is_fully_restored_after_the_startup_boundary(
+    tmp_path
+):
+    """The startup boundary's process state must be fully restorable.
+
+    ``_set_hermes_home()`` — the real call the fixture's ``boot()`` makes —
+    mutates the HERMES_HOME env var, the process-profile home pin, the
+    imported skill modules' cached paths, the cron modules' cached paths and
+    the Agent's process-home pin. All of them are process-global and point at
+    a ``tmp_path`` home that is deleted with the test, so a teardown that
+    leaves any of them behind makes a later test run against a deleted home.
+
+    This drives the REAL ``_set_hermes_home()`` and then the real restore
+    helper, and asserts every mutated piece of process state is back where it
+    started. It is the observable form of the finding: if the restore stops
+    covering one of them, this test fails.
+
+    The skill/cron module assertions are conditional on the module being
+    importable: the Agent package is not installed in every environment, and
+    a module that was never imported has no path to leak.
+    """
+    import api.profiles as prof
+
+    snapshot = _snapshot_process_home_state(prof)
+    before = {
+        "hermes_home": os.environ.get("HERMES_HOME"),
+        "had_hermes_home": "HERMES_HOME" in os.environ,
+        "process_profile_home": getattr(prof, "_PROCESS_PROFILE_HOME", None),
+    }
+
+    # The real mutation.
+    prof._set_hermes_home(tmp_path / "temporary-home")
+
+    assert os.environ.get("HERMES_HOME") == str(tmp_path / "temporary-home"), (
+        "the real _set_hermes_home() did not move HERMES_HOME — the case "
+        "below would not be exercising the leak"
+    )
+    assert getattr(prof, "_PROCESS_PROFILE_HOME", None) == str(tmp_path / "temporary-home"), (
+        "the real _set_hermes_home() did not move the process-profile home pin "
+        "— the case below would not be exercising the leak"
+    )
+
+    # The real restore.
+    _restore_process_home_state(prof, snapshot)
+
+    assert os.environ.get("HERMES_HOME") == before["hermes_home"], (
+        f"HERMES_HOME was not restored: {before['hermes_home']!r} -> "
+        f"{os.environ.get('HERMES_HOME')!r}"
+    )
+    assert ("HERMES_HOME" in os.environ) == before["had_hermes_home"], (
+        "the PRESENCE of HERMES_HOME was not restored — a home that did not "
+        "exist before must not exist after"
+    )
+    assert getattr(prof, "_PROCESS_PROFILE_HOME", None) == before["process_profile_home"], (
+        "the process-profile home pin was not restored: "
+        f"{before['process_profile_home']!r} -> "
+        f"{getattr(prof, '_PROCESS_PROFILE_HOME', None)!r}"
+    )
+
+    # The cron modules' cached paths are back to their pre-call values.
+    for (module_name, attr), (_module, _attr, _had, value) in snapshot["cron_home"].items():
+        try:
+            module = __import__(module_name, fromlist=["_"])
+        except Exception:
+            continue
+        assert getattr(module, attr, None) == value, (
+            f"{module_name}.{attr} was not restored: {value!r} -> "
+            f"{getattr(module, attr, None)!r}"
+        )
+
+    # The skill modules' cached paths are back to their pre-call values.
+    # A module that was never imported cannot leak, so the assertion is
+    # skipped for it — but a FAKE module injected here exercises the restore
+    # path even where the Agent package is absent, so the skill restore is
+    # never vacuously green.
+    for module_name, values in snapshot["skill_home"].items():
+        module = sys.modules.get(module_name)
+        if not values.get("module_present"):
+            assert module is None, (
+                f"{module_name} was not importable before the boundary and is "
+                "importable after — the restore did not put it back"
+            )
+            continue
+        if module is None:
+            continue
+        for attr in ("HERMES_HOME", "SKILLS_DIR"):
+            if values.get(f"has_{attr}"):
+                assert getattr(module, attr, None) == values.get(attr), (
+                    f"{module_name}.{attr} was not restored: "
+                    f"{values.get(attr)!r} -> {getattr(module, attr, None)!r}"
+                )
+
+
+def test_skill_module_restore_is_not_vacuous(tmp_path, monkeypatch):
+    """The skill-module restore must work even where the Agent is absent.
+
+    ``patch_skill_home_modules()`` only touches modules that are already in
+    ``sys.modules``, so a package that was never imported has nothing to
+    leak — but that also makes the skill restore silently untested in
+    environments without the Agent package. This injects a fake skill module
+    with the real attribute names, runs the real boundary against it, and
+    asserts the restore puts its cached paths back.
+    """
+    import api.profiles as prof
+
+    fake = types.ModuleType("tools.skills_tool")
+    fake.HERMES_HOME = Path("/original/skill/home")
+    fake.SKILLS_DIR = Path("/original/skill/home/skills")
+    monkeypatch.setitem(sys.modules, "tools.skills_tool", fake)
+
+    snapshot = _snapshot_process_home_state(prof)
+    assert snapshot["skill_home"]["tools.skills_tool"]["module_present"] is True, (
+        "the fake skill module was not captured by the snapshot — the case "
+        "below would not be exercising the restore"
+    )
+
+    # The real mutation: the boundary repoints the module at the new home.
+    prof._set_hermes_home(tmp_path / "temporary-home")
+    assert fake.HERMES_HOME == tmp_path / "temporary-home", (
+        "the real _set_hermes_home() did not repoint the skill module — the "
+        "case below would not be exercising the restore"
+    )
+
+    # The real restore.
+    _restore_process_home_state(prof, snapshot)
+
+    assert fake.HERMES_HOME == Path("/original/skill/home"), (
+        "the skill module's HERMES_HOME was not restored: "
+        f"{fake.HERMES_HOME!r}"
+    )
+    assert fake.SKILLS_DIR == Path("/original/skill/home/skills"), (
+        f"the skill module's SKILLS_DIR was not restored: {fake.SKILLS_DIR!r}"
     )
