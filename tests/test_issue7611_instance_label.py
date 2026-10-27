@@ -33,6 +33,32 @@ def _load_routes():
     return routes
 
 
+def _set_installation_snapshot(monkeypatch, **overrides) -> None:
+    """Express the test's operator env through the STARTUP snapshot.
+
+    #7655 round 7: ``_installation_config_path()`` resolves
+    ``HERMES_CONFIG_PATH`` from the installation snapshot -- the operator env
+    captured once at the startup boundary, before any profile writer ran.
+    A value written into ``os.environ`` AFTER that boundary is, by design,
+    not the operator's: it is a profile writer's value, and the installation
+    resolver must not follow it. So a test that wants an operator value
+    records it in the snapshot, exactly as the ``installation_env`` fixture
+    does when it drives the real boundary.
+
+    ``None`` removes a key, which is how a test asks for "the operator never
+    set this".
+    """
+    import api.profiles as prof
+
+    snap = dict(getattr(prof, "_INSTALLATION_ENV_SNAPSHOT", {}) or {})
+    for key, value in overrides.items():
+        if value is None:
+            snap.pop(key, None)
+        else:
+            snap[key] = str(value)
+    monkeypatch.setattr(prof, "_INSTALLATION_ENV_SNAPSHOT", snap)
+
+
 def _install_config(monkeypatch, tmp_path: Path, config: dict) -> Path:
     """Write an INSTALLATION-scoped config.yaml and point the resolver at it.
 
@@ -41,10 +67,16 @@ def _install_config(monkeypatch, tmp_path: Path, config: dict) -> Path:
     deployment-level override the whole config layer honours). Writing a real
     file also means the race-safe disk read is genuinely exercised rather
     than a monkeypatched in-memory dict.
+
+    The path is recorded BOTH in the live env and in the installation
+    snapshot: the live env is what the ambient config layer honours, and the
+    snapshot is what the installation-scoped resolver reads (the operator's
+    startup value).
     """
     path = tmp_path / "installation-config.yaml"
     path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
     monkeypatch.setenv("HERMES_CONFIG_PATH", str(path))
+    _set_installation_snapshot(monkeypatch, HERMES_CONFIG_PATH=str(path))
     return path
 
 
@@ -222,6 +254,13 @@ def installation_env(monkeypatch, tmp_path):
             home = self.base
             prof._set_hermes_home(home)
             # The real startup boundary: capture BEFORE the first projection.
+            # The snapshot is cleared first because production runs this in a
+            # FRESH process, where it is still empty -- and
+            # capture_installation_env_snapshot() refuses to re-capture over a
+            # non-empty one. Without the clear, a value a test wrote into the
+            # snapshot before boot() would make the capture a no-op and the
+            # operator's launch env would never be recorded.
+            prof._INSTALLATION_ENV_SNAPSHOT = {}
             prof.capture_installation_env_snapshot()
             prof._reload_dotenv(home)
             return home
@@ -407,6 +446,7 @@ def test_read_instance_label_handles_config_exception(monkeypatch, tmp_path):
     bad = tmp_path / "installation-config.yaml"
     bad.write_text("instance_name: [unclosed\n", encoding="utf-8")
     monkeypatch.setenv("HERMES_CONFIG_PATH", str(bad))
+    _set_installation_snapshot(monkeypatch, HERMES_CONFIG_PATH=str(bad))
     assert routes._read_instance_label() == "", (
         "a config read failure must degrade to the empty default; "
         "/api/settings should not 500 because of a broken config"
@@ -461,6 +501,7 @@ def test_read_instance_label_ignores_request_profile_config(monkeypatch, tmp_pat
     # is a named one, and make HERMES_CONFIG_PATH ambient-free so resolution
     # has to go through the base-home path.
     monkeypatch.delenv("HERMES_CONFIG_PATH", raising=False)
+    _set_installation_snapshot(monkeypatch, HERMES_CONFIG_PATH=None)
     monkeypatch.setattr(profiles, "_DEFAULT_HERMES_HOME", base)
     monkeypatch.setattr(profiles, "_active_profile", "alice")
 
@@ -495,6 +536,7 @@ def test_read_instance_label_stable_across_profiles(monkeypatch, tmp_path):
     )
 
     monkeypatch.delenv("HERMES_CONFIG_PATH", raising=False)
+    _set_installation_snapshot(monkeypatch, HERMES_CONFIG_PATH=None)
     monkeypatch.setattr(profiles, "_DEFAULT_HERMES_HOME", base)
 
     labels = {}
@@ -518,6 +560,7 @@ def test_read_instance_label_env_var_beats_profile_env_override(monkeypatch, tmp
     import api.routes as routes
 
     monkeypatch.delenv("HERMES_CONFIG_PATH", raising=False)
+    _set_installation_snapshot(monkeypatch, HERMES_CONFIG_PATH=None)
 
     base = tmp_path / "hermes-home"
     alice = base / "profiles" / "alice"
@@ -1094,75 +1137,62 @@ def _extract_function_body(src: str, name: str) -> str:
 def test_a_profile_dotenv_cannot_repoint_installation_configuration(tmp_path, monkeypatch):
     """A profile must not be able to hijack installation-scoped config (#7611).
 
-    ``_installation_config_path`` reads ``HERMES_CONFIG_PATH`` from the LIVE
-    environment, and a profile activation writes that profile's ``.env`` into
-    ``os.environ`` via ``_reload_dotenv``. So a profile whose ``.env`` sets
-    ``HERMES_CONFIG_PATH`` to its own config.yaml repointed installation
-    configuration at a profile file — and because ``_read_installation_config``
-    reads ``instance_name`` from whatever that path resolves to, the
-    installation label could change per profile. That is exactly the
-    profile-scoping the installation-scoped label exists to avoid.
+    ``_installation_config_path`` resolves the installation-scoped config, and
+    the instance label is read from whatever it resolves to. A profile whose
+    ``.env`` sets ``HERMES_CONFIG_PATH`` to its own config.yaml would
+    repoint installation configuration at a profile file -- and because
+    ``_read_installation_config`` reads ``instance_name`` from whatever that
+    path resolves to, the installation label could change per profile. That is
+    exactly the profile-scoping the installation-scoped label exists to avoid.
 
-    The protected-key list is the mechanism: the same one that already keeps
-    ``HERMES_WEBUI_INSTANCE_NAME`` unspoofable.
+    #7655 round 7: the guarantee is enforced at the READ site, not by
+    protecting the key globally. Upstream #8432 round 4 (76986aef0) lets a
+    profile's ``.env`` SET ``HERMES_CONFIG_PATH`` and tells a profile-chosen
+    path from an operator-chosen one by the loader bookkeeping, so protecting
+    the key globally broke that shared contract (and upstream's own
+    ``test_8432_a_config_path_a_profile_env_chose_is_not_shared`` went red).
+    The resolver now reads the INSTALLATION SNAPSHOT -- the operator env
+    captured at the startup boundary, before any profile writer ran.
     """
     from api import profiles as prof
 
-    assert "HERMES_CONFIG_PATH" in prof._PROTECTED_ENV_KEYS, (
-        "HERMES_CONFIG_PATH resolves installation-scoped config, so a profile "
-        ".env must not be able to set it"
+    assert "HERMES_CONFIG_PATH" not in prof._PROTECTED_ENV_KEYS, (
+        "HERMES_CONFIG_PATH must not be globally protected: upstream #8432 "
+        "round 4 lets a profile .env set it"
     )
 
-    # Drive the real loader: a profile .env carrying the key must leave the
-    # process env untouched, and must not be recorded as a loaded key (so a
-    # later restore cannot drop the operator's value either — greptile P2).
-    prev_loaded = prof._loaded_profile_env_keys
-    monkeypatch.setenv("HERMES_CONFIG_PATH", str(tmp_path / "installation.yaml"))
-    profile_home = tmp_path / "profiles" / "sneaky"
-    profile_home.mkdir(parents=True)
+    routes = _load_routes()
+    operator_cfg = tmp_path / "installation.yaml"
+    operator_cfg.write_text("instance_name: real-deployment\n", encoding="utf-8")
     sneaky_cfg = tmp_path / "sneaky-config.yaml"
     sneaky_cfg.write_text("instance_name: hijacked\n", encoding="utf-8")
-    (profile_home / ".env").write_text(
-        f"HERMES_CONFIG_PATH={sneaky_cfg}\nSOME_OTHER_KEY=x\n", encoding="utf-8"
-    )
 
-    prev_overridden = getattr(prof, "_profile_overridden_env", {})
-    preexisting = {
-        k: os.environ.get(k)
-        for k in ("HERMES_CONFIG_PATH", "SOME_OTHER_KEY")
-    }
-
-    def _restore_profile_env_state():
-        prof._loaded_profile_env_keys = prev_loaded
-        prof._profile_overridden_env = prev_overridden
-        for k, v in preexisting.items():
-            if v is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = v
-
+    # The operator's env at the startup boundary, then the profile's attempt.
+    prev_loaded = prof._loaded_profile_env_keys
+    prev_snapshot = dict(getattr(prof, "_INSTALLATION_ENV_SNAPSHOT", {}) or {})
+    monkeypatch.setattr(prof, "_loaded_profile_env_keys", set())
+    monkeypatch.setattr(prof, "_INSTALLATION_ENV_SNAPSHOT", {})
     try:
+        monkeypatch.setenv("HERMES_CONFIG_PATH", str(operator_cfg))
+        prof.capture_installation_env_snapshot()
+
+        profile_home = tmp_path / "profiles" / "sneaky"
+        profile_home.mkdir(parents=True)
+        (profile_home / ".env").write_text(
+            f"HERMES_CONFIG_PATH={sneaky_cfg}\nSOME_OTHER_KEY=x\n", encoding="utf-8"
+        )
         prof._reload_dotenv(profile_home)
 
-        assert os.environ.get("HERMES_CONFIG_PATH") == str(tmp_path / "installation.yaml"), (
-            "a profile .env overwrote the installation config path"
-        )
-        assert "HERMES_CONFIG_PATH" not in (prof._loaded_profile_env_keys or set()), (
-            "the protected key was recorded as loader state, so a later profile "
-            "reload could remove the operator's value"
-        )
-        # The unrelated key is still projected, so protection is scoped to the
-        # installation-level key and does not freeze the profile's whole env.
-        assert os.environ.get("SOME_OTHER_KEY") == "x"
+        # The loader still projects the key (upstream contract) ...
+        assert os.environ.get("HERMES_CONFIG_PATH") == str(sneaky_cfg)
+        assert "HERMES_CONFIG_PATH" in (prof._loaded_profile_env_keys or set())
+        # ... but the installation resolver follows the OPERATOR's path.
+        assert Path(routes._installation_config_path()) == operator_cfg
+        # And the label resolver therefore cannot be steered by the profile.
+        assert routes._read_instance_label() == "real-deployment"
     finally:
-        _restore_profile_env_state()
-
-    # And the label resolver therefore cannot be steered by the profile.
-    routes = _load_routes()
-    installer = tmp_path / "installation.yaml"
-    installer.write_text("instance_name: real-deployment\n", encoding="utf-8")
-    assert routes._read_instance_label() == "real-deployment"
-
+        prof._loaded_profile_env_keys = prev_loaded
+        prof._INSTALLATION_ENV_SNAPSHOT = prev_snapshot
 
 # ── #7655: base-config placeholders resolve against operator env only ───────
 

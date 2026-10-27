@@ -137,6 +137,40 @@ def capture_installation_env_snapshot() -> dict[str, str]:
     }
     return dict(_INSTALLATION_ENV_SNAPSHOT)
 
+
+def env_value_is_named_launch_home_owned(key: str, value: str) -> bool:
+    """True when *value* was set by the NAMED launch home's ``.env`` at startup.
+
+    #7655 round 7: upstream's ``api.gateway_chat._env_value_is_profile_sourced``
+    applies this rule to the LIVE env value. Here it is applied to the value in
+    the installation snapshot -- the operator/launcher env captured at the
+    startup boundary -- because that is the only authority an installation-scoped
+    reader may use.
+
+    A shell launcher (``ctl.sh``) sources ``$HERMES_HOME/.env`` before Python
+    starts, so for a NAMED launch home those values sit in the env looking
+    like operator exports. Upstream treats such a value as that profile's
+    (fail closed), and so does this: the root home's ``.env`` is shared by
+    definition, so its values are NOT launch-home-owned.
+    """
+    value = str(value or "").strip()
+    if not value:
+        return False
+    launch_env = _INITIAL_HERMES_HOME_DOTENV or {}
+    if str(launch_env.get(key) or "").strip() != value:
+        return False
+    launch_home = str(_INITIAL_HERMES_HOME or "").strip()
+    if not launch_home:
+        return False
+    try:
+        from api.workspace import _safe_resolve
+
+        return _safe_resolve(Path(launch_home).expanduser()) != _safe_resolve(
+            Path(get_hermes_home_for_profile("")).expanduser()
+        )
+    except Exception:
+        return True  # fail closed
+
 # Thread-local profile context: set per-request by server.py, cleared after.
 # Enables per-client profile isolation (issue #798) — each HTTP request thread
 # reads its own profile from the hermes_profile cookie instead of the
@@ -308,15 +342,19 @@ _PROTECTED_ENV_KEYS = frozenset({
     # not be able to rewrite it — otherwise whichever profile loads last wins and
     # two tabs on one deployment disagree on the label.
     'HERMES_WEBUI_INSTANCE_NAME',
-    # #7611: HERMES_CONFIG_PATH points the whole config layer at a specific
-    # config.yaml. It is read LIVE by _installation_config_path(), which exists
-    # so the INSTALLATION-scoped instance label never comes from a request
-    # profile's file. If a profile's .env could set it, activating that profile
-    # would repoint installation configuration at the profile's own config.yaml
-    # — the label could then differ per profile, which is precisely the
-    # profile-scoping this function family is defined against. Only the
-    # operator/launcher env at startup may set it.
-    'HERMES_CONFIG_PATH',
+    # #7655 round 7: HERMES_CONFIG_PATH is deliberately NOT here.
+    #
+    # Round 6 protected it, which changed a shared loader semantic and broke
+    # upstream #8432 round 4 (76986aef0): upstream deliberately lets a profile's
+    # .env SET HERMES_CONFIG_PATH and tells a profile-chosen path from an
+    # operator-chosen one by asking whether the key is in
+    # ``_loaded_profile_env_keys`` (see ``is_profile_sourced_env_value``).
+    # Blocking the key globally made that bookkeeping impossible, and upstream's
+    # own ``test_8432_a_config_path_a_profile_env_chose_is_not_shared`` went red.
+    #
+    # The #7611 guarantee now lives at the READ site instead:
+    # ``api.routes._installation_config_path()`` ignores a HERMES_CONFIG_PATH
+    # that a profile chose, and honours one the operator/launcher set.
 })
 
 

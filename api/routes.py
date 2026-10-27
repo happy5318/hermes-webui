@@ -16173,8 +16173,57 @@ def _installation_config_path():
          deployment-level override the rest of the config layer honours.
       2. ``<base Hermes home>/config.yaml`` — the root that *contains*
          ``profiles/``, never the active profile's home.
+
+    #7655 round 7: the override is only honoured when the OPERATOR chose it.
+
+    A profile's ``.env`` may set ``HERMES_CONFIG_PATH`` — upstream #8432
+    round 4 relies on that, and the loader therefore projects it and records
+    it in ``_loaded_profile_env_keys``. Round 6 of this PR instead blocked the
+    key globally, which changed that shared loader semantic and turned
+    upstream's own ``test_8432_a_config_path_a_profile_env_chose_is_not_shared``
+    red.
+
+    The #7611 guarantee is kept, but at the READ site. The authority is the
+    INSTALLATION SNAPSHOT: the operator/launcher env captured once at the
+    startup boundary, before any profile writer ran
+    (``api.profiles.capture_installation_env_snapshot``). A HERMES_CONFIG_PATH
+    that only exists in the LIVE env was installed after the boundary — by the
+    loader, by the background-worker mirror or by the streaming turn's
+    ``os.environ.update`` — and none of those writers are distinguishable
+    afterwards, because only the loader records its keys in
+    ``_loaded_profile_env_keys``. So the live value is used only when the
+    snapshot cannot say otherwise, and a value the NAMED launch home's ``.env``
+    set is refused outright (upstream's own fail-closed rule).
+
+    Fail closed: an unprovable origin is treated as profile-owned, because
+    adopting a profile's value silently mislabels the installation. The
+    base-home path below is profile-independent either way.
     """
-    override = (os.getenv("HERMES_CONFIG_PATH") or "").strip()
+    override = ""
+    snapshot = {}
+    try:
+        from api.profiles import get_installation_env_snapshot
+
+        snapshot = get_installation_env_snapshot()
+    except Exception:
+        snapshot = {}
+
+    if snapshot:
+        # The startup boundary is the authority.
+        override = str(snapshot.get("HERMES_CONFIG_PATH") or "").strip()
+    else:
+        # No boundary ran (unusual import order): the live env is all there is.
+        override = (os.getenv("HERMES_CONFIG_PATH") or "").strip()
+    if override:
+        try:
+            from api.profiles import env_value_is_named_launch_home_owned
+
+            if env_value_is_named_launch_home_owned("HERMES_CONFIG_PATH", override):
+                # A named launch home's .env set this: it is that profile's
+                # config path, not the installation's (upstream's own rule).
+                override = ""
+        except Exception:
+            override = ""
     if override:
         try:
             return Path(override).expanduser()
