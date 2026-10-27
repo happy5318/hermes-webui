@@ -2932,20 +2932,40 @@ def _build_session_list_cache_payload(
         )
     else:
         diag_stage("filter_webui_sessions")
-        # #8141: display-only bucket derivation for parent-owned delegated
-        # children. CLI sessions are dropped from this payload entirely when
-        # the CLI bucket is hidden, so resolve the parent/lineage within the
-        # pre-filter rows first — a CLI-owned delegated child must follow its
-        # (hidden) CLI parent out of the WebUI bucket instead of being kept and
-        # counted as a WebUI conversation that can never render.
-        _cli_off_rows_by_id = {
-            str(s.get("session_id")): s
-            for s in webui_sessions
-            if isinstance(s, dict) and s.get("session_id")
-        }
+        # #8141 + 2026-10-27 re-gate: display-only bucket derivation for
+        # parent-owned delegated children. CLI sessions are dropped from this
+        # payload entirely when the CLI bucket is hidden, so resolve the
+        # parent/lineage within the pre-filter rows first — a CLI-owned
+        # delegated child must follow its (hidden) CLI parent out of the
+        # WebUI bucket instead of being kept and counted as a WebUI
+        # conversation that can never render.
+        #
+        # The parent-lookup map is built PER PROFILE: these rows are still
+        # cross-profile here (profile scoping runs at profile_scope below), so
+        # one flat map let another profile's parent resolve — beta's orphan
+        # child inherited alpha's shared parent's CLI bucket and was filtered
+        # out of beta's own list, where master lists it (the default view on
+        # established installs). A parent in another profile is filtered out of
+        # this child's view anyway, so its bucket says nothing about where the
+        # child belongs — the same rule the parent_is_cli_session hint below
+        # follows. None/''/renamed-root aliases collapse onto one root group,
+        # mirroring _profiles_match.
+        _cli_off_rows_by_profile: dict[str, dict[str, dict]] = {}
+        for _row in webui_sessions:
+            if not (isinstance(_row, dict) and _row.get("session_id")):
+                continue
+            _profile_group = _sidebar_profile_group_key(_row.get("profile"))
+            _cli_off_rows_by_profile.setdefault(_profile_group, {})[
+                str(_row.get("session_id"))
+            ] = _row
         webui_sessions = [
             s for s in webui_sessions
-            if not _sidebar_display_is_cli(s, _cli_off_rows_by_id)
+            if not _sidebar_display_is_cli(
+                s,
+                _cli_off_rows_by_profile.get(
+                    _sidebar_profile_group_key(s.get("profile")), {}
+                ),
+            )
         ]
         # #4985 second pass — see _prune_orphaned_webui_zero_message_sessions
         # for the gate predicate and the post-#1171-survivor rationale. The
@@ -12046,6 +12066,20 @@ def _is_delegated_subagent_child(row: dict) -> bool:
         or row.get("session_source") or row.get("source") or ""
     ).strip().lower()
     return raw_source == "subagent"
+
+
+def _sidebar_profile_group_key(profile) -> str:
+    """Canonical profile group key for sidebar lineage scoping.
+
+    ``None``/empty and any renamed-root alias collapse onto one root group,
+    mirroring ``_profiles_match``'s coercion, so legacy rows tagged
+    ``'default'`` still resolve their parent after the root profile is
+    renamed. Used to keep a parent/lineage lookup inside one profile.
+    """
+    name = str(profile or "default") or "default"
+    if name == "default" or _is_root_profile(name):
+        return "default"
+    return name
 
 
 def _sidebar_display_is_cli(row: dict, rows_by_id: dict | None = None) -> bool:

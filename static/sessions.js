@@ -9680,11 +9680,6 @@ function _sidebarDisplayBucketIsCli(s, rowsById, memo){
       const parentId=String(cur.parent_session_id||'').trim();
       if(!parentId||seen.has(parentId)) break;
       seen.add(parentId);
-      if(memo&&parentId&&memo.has(parentId)){
-        result=memo.get(parentId);
-        resolved=true;
-        break;
-      }
       const parent=rowsById.get(parentId);
       // #8245 re-gate (2026-10-19): the All-profiles view puts several
       // profiles' rows in one map, so a bare id lookup can resolve a parent
@@ -9692,7 +9687,18 @@ function _sidebarDisplayBucketIsCli(s, rowsById, memo){
       // edge is only meaningful within the same profile, so require the
       // profiles to agree before following it; a cross-profile hit is treated
       // as "parent not present" (the row keeps its own raw bucket).
+      // #8245 re-gate (2026-10-27): the check must run BEFORE the memo
+      // short-circuit. The server sorts by recency, so a newer alpha parent
+      // can be memoised first and beta's child then inherited its bucket
+      // through memo.has(parentId) — parent-first and child-first orders gave
+      // different answers. Resolve (and profile-check) the parent row first,
+      // then take the memoized verdict for it.
       if(!parent||!_sidebarSameProfileForLineage(cur,parent)) break;
+      if(memo&&parentId&&memo.has(parentId)){
+        result=memo.get(parentId);
+        resolved=true;
+        break;
+      }
       cur=parent;
     }
     if(!resolved&&cur!==s){
@@ -9725,7 +9731,17 @@ function _sidebarDisplayBucketIsCli(s, rowsById, memo){
 
 function _partitionSidebarSessionRows(allMatched, activeSidForSidebar){
   // Every payload row, before bucket/project/archive scoping; the attach step classifies parents from it.
-  const rowsById=_sidebarRowsById([allMatched, typeof _sidebarReferenceSessions!=='undefined'?_sidebarReferenceSessions:null]);
+  // #8245 re-gate (2026-10-27): the classifier's map must hold the COMPLETE
+  // cached rows plus the sidebar's parent references, not only the filtered
+  // match set. A search that matched the child but not its parent left the
+  // parent unresolvable, so the child fell back to its raw (WebUI) bucket
+  // even though it arrived in the CLI payload — and the WebUI fetch then
+  // excluded it, hiding it from BOTH tabs. Master shows it.
+  const rowsById=_sidebarRowsById([
+    allMatched,
+    typeof _allSessions!=='undefined'?_allSessions:null,
+    typeof _sidebarReferenceSessions!=='undefined'?_sidebarReferenceSessions:null,
+  ]);
   const projectIdFor=_sidebarProjectResolver(rowsById);
   // #8141: one memo per partition pass so the derived display bucket is
   // resolved once per lineage instead of once per consumer.

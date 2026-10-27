@@ -624,3 +624,139 @@ def test_lineage_lookup_refuses_a_parent_from_another_profile() -> None:
     assert "_sidebarSameProfileForLineage(s,lineageRow)" in walk, (
         "the lineage root/tip fallback must refuse a cross-profile row"
     )
+
+
+# ---------------------------------------------------------------------------
+# 2026-10-27 re-gate: cross-profile lineage resolution and the search case.
+# ---------------------------------------------------------------------------
+
+
+def test_cross_profile_child_not_classified_by_foreign_parent(monkeypatch):
+    """With the CLI bucket hidden and All-profiles off, beta's orphan child
+    (its parent lives in alpha) must stay in beta's own list.
+
+    ``_cli_off_rows_by_id`` was built from the cross-profile rows BEFORE
+    profile scoping, so the child resolved alpha's shared parent and
+    inherited its CLI bucket — filtered out of beta's list entirely. Master
+    lists it, and this is the default view on established installs.
+    """
+    routes = _routes()
+    rows = [
+        _cli_parent_row("alpha_shared_parent", profile="alpha"),
+        _subagent_child_row("beta_orphan", "alpha_shared_parent", profile="beta"),
+        _webui_parent_row("beta_parent", profile="beta"),
+    ]
+    payload = _payload(
+        monkeypatch, routes, rows,
+        active_profile="beta", all_profiles=False, show_cli_sessions=False,
+    )
+    ids = [r["session_id"] for r in payload["sessions"]]
+    assert "beta_orphan" in ids, (
+        f"beta's own child must not inherit alpha's parent bucket: {ids}")
+    assert "alpha_shared_parent" not in ids, ids
+    assert payload["webui_session_count"] == 2, payload
+
+
+def test_same_profile_child_still_follows_its_cli_parent(monkeypatch):
+    """Control: within one profile the derivation is unchanged — a CLI
+    parent's delegated child still rides the CLI bucket out of the WebUI
+    payload when the CLI tab is hidden."""
+    routes = _routes()
+    payload = _payload(
+        monkeypatch, routes,
+        [_cli_parent_row(), _subagent_child_row("cli_sub1", "cli_parent"),
+         _webui_parent_row()],
+        show_cli_sessions=False,
+    )
+    ids = [r["session_id"] for r in payload["sessions"]]
+    assert "cli_sub1" not in ids, ids
+    assert "webui_parent" in ids, ids
+
+
+def test_client_memo_shortcut_runs_after_the_profile_check():
+    """The memo short-circuit must run AFTER the same-profile check.
+
+    The server sorts by recency, so a newer alpha parent can be memoised
+    first; beta's child then hit ``memo.has(parentId)`` and inherited
+    alpha's bucket. Parent-first and child-first orders must give the SAME
+    (own-bucket) answer.
+    """
+    out = _run("""
+const alphaParent = { session_id:'shared_parent', title:'Alpha Parent', profile:'alpha',
+  session_source:'cli', raw_source:'cli', source_tag:'cli', is_cli_session:true,
+  message_count:5, last_message_at:200, updated_at:200 };
+const betaChild = { session_id:'beta_child', title:'Beta Child', profile:'beta',
+  parent_session_id:'shared_parent', relationship_type:'child_session',
+  raw_source:'subagent', source_tag:'subagent', session_source:'other',
+  is_cli_session:false, read_only:true, _cross_surface_child_session:true,
+  message_count:3, last_message_at:201, updated_at:201 };
+global._activeProject = NO_PROJECT_FILTER;
+function buckets(order){
+  const rows = order === 'parent-first' ? [alphaParent, betaChild] : [betaChild, alphaParent];
+  const part = _partitionSidebarSessionRows(rows, null);
+  return { webui: part.webuiSessionsRaw.map(s=>s.session_id).sort(),
+           cli: part.cliSessionsRaw.map(s=>s.session_id).sort() };
+}
+console.log(JSON.stringify({ parentFirst: buckets('parent-first'), childFirst: buckets('child-first') }));
+""")
+    # alpha's own parent is a CLI row and belongs in the CLI bucket either
+    # way; what matters is that beta's child does NOT inherit it.
+    assert out["parentFirst"]["webui"] == ["beta_child"], out
+    assert out["parentFirst"]["cli"] == ["shared_parent"], out
+    assert out["childFirst"]["webui"] == ["beta_child"], out
+    assert out["childFirst"]["cli"] == ["shared_parent"], out
+    assert out["parentFirst"] == out["childFirst"], (
+        f"parent-first and child-first must agree: {out}")
+
+
+def test_client_search_derives_bucket_from_complete_cached_rows():
+    """Searching ``subagent`` matches the archived child but not its parent.
+
+    The classifier's map held only the search matches, so the child could
+    not resolve its parent and fell back to WebUI — then the WebUI fetch
+    excluded it and it vanished from BOTH tabs. The bucket must be derived
+    from the complete cached rows plus the sidebar's parent references.
+    """
+    out = _run("""
+const archP = { session_id:'arch_p', title:'Archived CLI Parent', profile:'default',
+  session_source:'cli', raw_source:'cli', source_tag:'cli', is_cli_session:true,
+  archived:true, message_count:5, last_message_at:100, updated_at:100 };
+const archC = { session_id:'arch_c', title:'Subagent Session', profile:'default',
+  parent_session_id:'arch_p', relationship_type:'child_session',
+  raw_source:'subagent', source_tag:'subagent', session_source:'other',
+  is_cli_session:false, read_only:true, _cross_surface_child_session:true,
+  archived:true, message_count:3, last_message_at:101, updated_at:101 };
+// The search matches only the child; the complete cache holds both rows.
+global._activeProject = NO_PROJECT_FILTER;
+global._showArchived = true;
+global._allSessions = [archP, archC];
+global._sidebarReferenceSessions = [archP];
+const part = _partitionSidebarSessionRows([archC], null);
+console.log(JSON.stringify({ webui: part.webuiSessionsRaw.map(s=>s.session_id),
+  cli: part.cliSessionsRaw.map(s=>s.session_id), cliCount: part.cliSessionCount }));
+""")
+    assert out["cli"] == ["arch_c"], (
+        f"the searched child must keep its parent's CLI bucket: {out}")
+    assert out["webui"] == [], out
+    assert out["cliCount"] == 1, out
+
+
+def test_client_search_without_cached_parent_keeps_own_bucket():
+    """Control: with the parent genuinely absent from every cache the child
+    keeps its own raw bucket — the complete-rows derivation must not invent
+    a bucket for an unresolvable lineage."""
+    out = _run("""
+const archC = { session_id:'arch_c', title:'Subagent Session', profile:'default',
+  parent_session_id:'arch_p', relationship_type:'child_session',
+  raw_source:'subagent', source_tag:'subagent', session_source:'other',
+  is_cli_session:false, read_only:true, _cross_surface_child_session:true,
+  message_count:3, last_message_at:101, updated_at:101 };
+global._activeProject = NO_PROJECT_FILTER;
+global._allSessions = [archC];
+global._sidebarReferenceSessions = [];
+const part = _partitionSidebarSessionRows([archC], null);
+console.log(JSON.stringify({ webui: part.webuiSessionsRaw.map(s=>s.session_id),
+  cli: part.cliSessionsRaw.map(s=>s.session_id) }));
+""")
+    assert out["webui"] == ["arch_c"], out
+    assert out["cli"] == [], out
