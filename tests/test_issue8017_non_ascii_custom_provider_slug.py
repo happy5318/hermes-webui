@@ -56,14 +56,17 @@ def test_fallback_uses_endpoint_slug_when_no_provider_key():
         {"base_url": "http://127.0.0.1:8317/v1"},
         "晨光鑫遇专用",
     )
-    # Prefer the hyphenated endpoint form: it stays a single safe identifier.
-    assert slug == "custom:127.0.0.1-8317"
+    # The endpoint tier keeps the row's OWN identity in the slug: an
+    # endpoint-only slug (custom:<host>-<port>) cannot tell two records that
+    # share one host and port apart, so the name hash is appended.
+    assert slug.startswith("custom:127.0.0.1-8317-")
+    assert slug != "custom:127.0.0.1-8317"
 
 
 def test_fallback_hashes_the_name_when_nothing_else_is_available():
     slug = config._named_custom_slug_fallback({}, "晨光鑫遇专用")
-    assert slug.startswith("custom:")
-    assert len(slug) == len("custom:") + 8
+    assert slug.startswith("custom:name-")
+    assert len(slug) == len("custom:name-") + 8
     # Same name -> same slug; different name -> different slug.
     assert slug == config._named_custom_slug_fallback({}, "晨光鑫遇专用")
     assert slug != config._named_custom_slug_fallback({}, "别的名字")
@@ -74,7 +77,29 @@ def test_fallback_ignores_a_blank_provider_key():
         {"provider_key": "   ", "base_url": "http://10.0.0.5:9000/v1"},
         "晨光鑫遇专用",
     )
-    assert slug == "custom:10.0.0.5-9000"
+    assert slug.startswith("custom:10.0.0.5-9000-")
+
+
+def test_fallback_survives_a_malformed_port():
+    """A malformed port must not abort the whole catalog build."""
+    slug = config._named_custom_slug_fallback(
+        {"base_url": "http://host:notaport/v1"},
+        "晨光鑫遇专用",
+    )
+    assert slug.startswith("custom:")
+    # The host is still usable; the port degrades to the scheme default.
+    assert slug.startswith("custom:host-80-")
+
+
+def test_fallback_folds_an_ipv6_host_into_a_safe_identifier():
+    """An IPv6 literal's colons would corrupt the @provider:model grammar."""
+    slug = config._named_custom_slug_fallback(
+        {"base_url": "http://[::1]:8317/v1"},
+        "晨光鑫遇专用",
+    )
+    assert slug.startswith("custom:")
+    bare = slug.split(":", 1)[1]
+    assert ":" not in bare
 
 
 # ── catalog builder wiring ─────────────────────────────────────────────────
@@ -194,8 +219,8 @@ def test_bare_model_matches_through_the_fallback_identity(monkeypatch):
 
 
 def test_endpoint_derived_identity_round_trips(monkeypatch):
-    """A non-ASCII name without provider_key falls back to the endpoint slug; both
-    the hyphenated and the colon forms the WebUI historically used must resolve."""
+    """A non-ASCII name without provider_key falls back to the endpoint tier;
+    the advertised identity must round-trip back to the record."""
     cfg_dict = {
         "model": {"provider": "custom", "default": "m1"},
         "custom_providers": [
@@ -209,21 +234,110 @@ def test_endpoint_derived_identity_round_trips(monkeypatch):
     }
     _with_direct_config(monkeypatch, cfg_dict)
     entry = cfg_dict["custom_providers"][0]
-    assert config._named_custom_slug_fallback(entry, "晨光鑫遇专用") == "custom:127.0.0.1-8317"
+    slug = config._named_custom_slug_fallback(entry, "晨光鑫遇专用")
+    assert slug.startswith("custom:127.0.0.1-8317-")
 
-    model, provider, base_url = config.resolve_model_provider("@custom:127.0.0.1-8317:m1")
-    assert (provider, base_url) == ("custom:127.0.0.1-8317", "http://127.0.0.1:8317/v1")
+    model, provider, base_url = config.resolve_model_provider(f"@{slug}:m1")
+    assert (provider, base_url) == (slug, "http://127.0.0.1:8317/v1")
 
-    bundle = config.resolve_custom_provider_bundle("custom:127.0.0.1-8317")
+    bundle = config.resolve_custom_provider_bundle(slug)
     assert bundle["status"] == config.CUSTOM_SELECTION_EXACT
     assert bundle["base_url"] == "http://127.0.0.1:8317/v1"
     assert bundle["api_key"] == "sk-2"
 
-    # The colon spelling (custom:<host>:<port>) is the legacy WebUI shape for
-    # endpoint-derived slugs and must select the same record.
-    colon = config.resolve_custom_provider_bundle("custom:127.0.0.1:8317")
-    assert colon["status"] == config.CUSTOM_SELECTION_EXACT
-    assert colon["record"] == bundle["record"]
+
+def test_two_records_sharing_one_endpoint_stay_selectable(monkeypatch):
+    """Two records on the same host and port but different paths must not
+    collapse into one picker option, and each must select its OWN record."""
+    cfg_dict = {
+        "model": {"provider": "custom", "default": "m1"},
+        "custom_providers": [
+            {
+                "name": "晨光甲",
+                "base_url": "http://proxy.invalid:8317/account-a/v1",
+                "api_key": "sk-a",
+                "models": ["m1"],
+            },
+            {
+                "name": "晨光乙",
+                "base_url": "http://proxy.invalid:8317/account-b/v1",
+                "api_key": "sk-b",
+                "models": ["m2"],
+            },
+        ],
+    }
+    _with_direct_config(monkeypatch, cfg_dict)
+    first, second = cfg_dict["custom_providers"]
+
+    slug_a = config._custom_provider_slug_for_entry(first)
+    slug_b = config._custom_provider_slug_for_entry(second)
+    assert slug_a != slug_b, "records sharing one endpoint must stay distinct"
+
+    bundle_a = config.resolve_custom_provider_bundle(slug_a)
+    bundle_b = config.resolve_custom_provider_bundle(slug_b)
+    assert bundle_a["status"] == config.CUSTOM_SELECTION_EXACT
+    assert bundle_b["status"] == config.CUSTOM_SELECTION_EXACT
+    assert bundle_a["record"]["name"] == "晨光甲"
+    assert bundle_b["record"]["name"] == "晨光乙"
+    assert bundle_a["api_key"] == "sk-a"
+    assert bundle_b["api_key"] == "sk-b"
+
+
+def test_an_ascii_record_does_not_claim_a_sibling_fallback_identity(monkeypatch):
+    """A pure-CJK record with an explicit provider_key must not also claim the
+    endpoint spelling an ASCII sibling owns — otherwise selecting the ASCII
+    one raises AmbiguousCustomProviderError and breaks a working connection."""
+    cfg_dict = {
+        "model": {"provider": "custom", "default": "m1"},
+        "custom_providers": [
+            {
+                "name": "gateway-8080",
+                "base_url": "http://gateway:8080/v1",
+                "api_key": "sk-ascii",
+                "models": ["m1"],
+            },
+            {
+                "name": "晨光鑫遇专用",
+                "provider_key": "team-b",
+                "base_url": "http://gateway:8080/v1",
+                "api_key": "sk-cjk",
+                "models": ["m2"],
+            },
+        ],
+    }
+    _with_direct_config(monkeypatch, cfg_dict)
+    ascii_entry, cjk_entry = cfg_dict["custom_providers"]
+
+    assert config._custom_provider_slug_for_entry(ascii_entry) == "custom:gateway-8080"
+    assert config._custom_provider_slug_for_entry(cjk_entry) == "custom:team-b"
+
+    # The CJK record owns exactly ONE identity — its own.
+    assert config._custom_provider_slug_keys_for_record(cjk_entry) == {"team-b"}
+
+    # The ASCII sibling keeps working: no ambiguity error on its own identity.
+    bundle = config.resolve_custom_provider_bundle("custom:gateway-8080")
+    assert bundle["status"] == config.CUSTOM_SELECTION_EXACT
+    assert bundle["record"]["name"] == "gateway-8080"
+    assert bundle["api_key"] == "sk-ascii"
+
+
+def test_a_provider_key_equal_to_a_sibling_name_hash_stays_distinct():
+    """A record whose provider_key equals another record's name hash must not
+    collide with it: the hash is always a COMPONENT of a longer identity
+    (custom:name-<hash>, custom:<host>-<port>-<hash>), never a bare identity
+    on its own, so the two never share one."""
+    import hashlib
+
+    name = "晨光鑫遇专用"
+    bare_hash = hashlib.sha256(name.encode("utf-8")).hexdigest()[:8]
+    cjk = {"name": name, "base_url": "http://127.0.0.1:8317/v1"}
+    other = {
+        "name": "另一个",
+        "provider_key": bare_hash,
+        "base_url": "http://127.0.0.1:8319/v1",
+    }
+    assert config._custom_provider_slug_keys_for_record(cjk) != config._custom_provider_slug_keys_for_record(other)
+    assert config._custom_provider_slug_for_entry(other) == f"custom:{bare_hash}"
 
 
 def test_name_hash_identity_round_trips(monkeypatch):

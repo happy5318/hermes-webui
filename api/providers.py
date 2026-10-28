@@ -68,12 +68,21 @@ def _provider_env_var_for(provider_id: str) -> str | None:
 def _custom_provider_name_matches(provider_id: str, cp: object) -> bool:
     """Return True when *provider_id* refers to the named custom-provider record *cp*.
 
-    Record-aware identity: a record is recognised by ANY bare key it owns —
-    its name-derived slug (the historical contract for ASCII names) and, when
-    the name slugifies empty (e.g. a pure-CJK name), every key the catalog's
-    fallback can mint for it (provider_key slug/hash, endpoint slugs, name
-    hash) — so a selection advertised as ``@custom:<fallback-slug>:model``
-    round-trips back to its record (#8017).
+    Record-aware identity: a record is recognised by the bare key it OWNS —
+    the same identity the catalog advertises for it, so a selection
+    advertised as ``@custom:<slug>:model`` round-trips back to its record
+    through the credential lookups too (#8017).
+
+    A record owns exactly ONE identity. A record whose name slugifies empty
+    (e.g. a pure-CJK name) owns the ONE identity its fallback mints — it
+    does NOT also claim the endpoint spellings or the name hash. Claiming
+    several identities per record is what made an unrelated record look
+    like it owned this one: an ASCII provider named ``gateway-8080`` and a
+    pure-CJK provider with ``provider_key: team-b`` at the same host have
+    different picker identities, but a multi-claim made the CJK record
+    answer to ``gateway-8080`` too, so selecting the ASCII one raised
+    ``AmbiguousCustomProviderError`` and broke a working connection.
+
     ``_custom_provider_slug_keys_for_record`` mirrors the catalog's identity
     production EXACTLY, so the credential/key lookups stay in agreement with
     ``resolve_model_provider()``.
