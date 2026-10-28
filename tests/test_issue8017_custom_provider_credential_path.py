@@ -107,6 +107,20 @@ def test_the_matcher_recognises_the_advertised_identity():
     assert providers._custom_provider_name_matches(f"custom:{PROVIDER_KEY}", entry) is True
 
 
+def test_the_matcher_keeps_the_historical_raw_name_spellings():
+    """The raw-name spellings are the historical contract: a record named
+    ``Local Proxy`` is reachable as ``custom:local proxy`` (the raw name keeps
+    its space) as well as through the name-derived slug. A matcher that only
+    compared the canonical key would drop that spelling and break a working
+    credential lookup."""
+    record = {"name": "Local Proxy"}
+    assert providers._custom_provider_name_matches("custom:local proxy", record) is True
+    assert providers._custom_provider_name_matches("local proxy", record) is True
+    assert providers._custom_provider_name_matches("custom:local-proxy", record) is True
+    # A name that slugifies empty has no raw-name spelling to fall back on.
+    assert providers._custom_provider_name_matches("custom:晨光", _entry()) is False
+
+
 def test_an_unrelated_identity_is_not_matched():
     """A different record's identity must not match this record."""
     entry = _entry()

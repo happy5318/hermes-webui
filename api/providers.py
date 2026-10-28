@@ -38,6 +38,7 @@ from api.config import (
     _coerce_provider_cost_budget,
     _configured_model_ids,
     _custom_provider_slug_for_entry,
+    _custom_provider_slug_from_name,
     _custom_provider_slug_keys_for_record,
     _get_label_for_model,
     _models_from_live_provider_ids,
@@ -68,19 +69,27 @@ def _provider_env_var_for(provider_id: str) -> str | None:
 def _custom_provider_name_matches(provider_id: str, cp: object) -> bool:
     """Return True when *provider_id* refers to the named custom-provider record *cp*.
 
-    Record-aware identity: a record is recognised by the bare key it OWNS —
-    the same identity the catalog advertises for it, so a selection
-    advertised as ``@custom:<slug>:model`` round-trips back to its record
-    through the credential lookups too (#8017).
+    Two vocabularies, matched in this order:
 
-    A record owns exactly ONE identity. A record whose name slugifies empty
-    (e.g. a pure-CJK name) owns the ONE identity its fallback mints — it
-    does NOT also claim the endpoint spellings or the name hash. Claiming
-    several identities per record is what made an unrelated record look
-    like it owned this one: an ASCII provider named ``gateway-8080`` and a
+    1. the RAW-NAME spellings — ``<name>``, ``custom:<name>`` and the
+       name-derived slug. This is the historical contract: a record named
+       ``Local Proxy`` is reachable as ``custom:local proxy`` (the raw name
+       keeps its space) as well as ``custom:local-proxy``. A record-aware
+       matcher that only compared the canonical key would silently drop
+       that spelling and break a working credential lookup.
+    2. the record's CANONICAL catalog identity — the one identity the
+       catalog advertises for it. A pure-CJK name has no name-derived
+       slug, so its fallback identity (``custom:cgxy-cpa`` or the
+       endpoint/name-hash form) is the ONLY way a selection advertised as
+       ``@custom:<slug>:model`` can find its record again (#8017).
+
+    A record owns exactly ONE canonical identity, so the fallback can no
+    longer shadow another record's advertised route: claiming several
+    identities per record is what made an unrelated record look like it
+    owned this one. An ASCII provider named ``gateway-8080`` and a
     pure-CJK provider with ``provider_key: team-b`` at the same host have
-    different picker identities, but a multi-claim made the CJK record
-    answer to ``gateway-8080`` too, so selecting the ASCII one raised
+    different picker identities; with the multi-claim, the CJK record also
+    answered to ``gateway-8080``, so selecting the ASCII one raised
     ``AmbiguousCustomProviderError`` and broke a working connection.
 
     ``_custom_provider_slug_keys_for_record`` mirrors the catalog's identity
@@ -92,8 +101,17 @@ def _custom_provider_name_matches(provider_id: str, cp: object) -> bool:
         return False
     if not isinstance(cp, dict):
         return False
-    if not str(cp.get("name") or "").strip():
+    raw_name = str(cp.get("name") or "").strip().lower()
+    if not raw_name:
         return False
+    # 1. The historical raw-name spellings.
+    candidates = {raw_name, f"custom:{raw_name}"}
+    name_slug = _custom_provider_slug_from_name(raw_name)
+    if name_slug:
+        candidates.add(name_slug)
+    if pid in candidates:
+        return True
+    # 2. The one canonical identity the catalog advertises for this record.
     bare = pid.split(":", 1)[1] if pid.startswith("custom:") else pid
     return bare in _custom_provider_slug_keys_for_record(cp)
 
