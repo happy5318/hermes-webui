@@ -31,7 +31,14 @@ MODEL = "shared:model"
 
 @contextlib.contextmanager
 def _disk_config(entries, tmp_path):
-    """Write a real config.yaml and point both modules at it."""
+    """Write a real config.yaml and point both modules at it.
+
+    The credential lookups go through ``get_config()``, which serves the
+    module's in-memory ``cfg``. Pointing ``_get_config_path`` at a file is
+    not enough on its own — the live config has to actually BE that file's
+    content — so the helper loads it into ``cfg`` and restores the previous
+    state afterwards.
+    """
     config_path = Path(tmp_path) / "config.yaml"
     config_path.write_text(
         yaml.safe_dump(
@@ -46,15 +53,20 @@ def _disk_config(entries, tmp_path):
     original_path = config._get_config_path
     original_reload = config.reload_config
     original_cache = config.invalidate_models_cache
+    original_cfg = config.cfg
     config._get_config_path = lambda: config_path
     config.reload_config = lambda: None
     config.invalidate_models_cache = lambda: None
+    # The live config must BE the file's content: the credential lookups
+    # read the module's in-memory cfg, not the path.
+    config.cfg = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     try:
         yield config_path
     finally:
         config._get_config_path = original_path
         config.reload_config = original_reload
         config.invalidate_models_cache = original_cache
+        config.cfg = original_cfg
 
 
 def _entry():
@@ -73,23 +85,22 @@ def test_the_advertised_identity_is_the_provider_key_slug():
 
 
 def test_provider_has_usable_credential_through_the_advertised_identity(monkeypatch, tmp_path):
-    """The credential check must recognise the identity the picker advertises."""
-    entry = _entry()
-    monkeypatch.setattr(
-        config, "get_config", lambda: {"custom_providers": [entry], "model": {"provider": "custom"}}
-    )
-    monkeypatch.setitem(config.cfg, "custom_providers", [entry])
-    assert providers.provider_has_usable_credential(f"custom:{PROVIDER_KEY}") is True
+    """The credential check must recognise the identity the picker advertises.
+
+    Driven through a real config.yaml: an in-memory ``config.cfg`` patch is
+    not an override (``cfg is _cfg_cache`` stays true), so a later config
+    read can silently replace it — and a preceding test that reloaded the
+    config from disk would leave this test asserting against whatever the
+    previous test had left behind.
+    """
+    with _disk_config([_entry()], tmp_path):
+        assert providers.provider_has_usable_credential(f"custom:{PROVIDER_KEY}") is True
 
 
-def test_provider_api_key_resolves_through_the_advertised_identity(monkeypatch):
+def test_provider_api_key_resolves_through_the_advertised_identity(monkeypatch, tmp_path):
     """The API key lookup must resolve the record's own key."""
-    entry = _entry()
-    monkeypatch.setattr(
-        config, "get_config", lambda: {"custom_providers": [entry], "model": {"provider": "custom"}}
-    )
-    monkeypatch.setitem(config.cfg, "custom_providers", [entry])
-    assert providers._get_provider_api_key(f"custom:{PROVIDER_KEY}") == API_KEY
+    with _disk_config([_entry()], tmp_path):
+        assert providers._get_provider_api_key(f"custom:{PROVIDER_KEY}") == API_KEY
 
 
 def test_the_key_can_be_removed_through_the_advertised_identity(monkeypatch, tmp_path):
