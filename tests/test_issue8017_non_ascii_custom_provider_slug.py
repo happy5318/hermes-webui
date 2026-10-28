@@ -125,6 +125,7 @@ def test_catalog_builder_falls_back_for_non_ascii_names():
 import copy
 
 import pytest
+import yaml
 
 _MAINTAINER_CFG = {
     "model": {"provider": "custom", "default": "shared:model"},
@@ -283,29 +284,44 @@ def test_two_records_sharing_one_endpoint_stay_selectable(monkeypatch):
     assert bundle_b["api_key"] == "sk-b"
 
 
-def test_the_catalog_keeps_the_two_records_apart(monkeypatch):
+def test_the_catalog_keeps_the_two_records_apart(monkeypatch, tmp_path):
     """The CATALOG must show two groups — the behaviour a source-text check
     cannot see. Before the fix both records minted the same slug, so the
     catalog put BOTH records' models under the FIRST record's label and
-    dropped the duplicate model id: one group, one connection."""
-    cfg_dict = {
-        "model": {"provider": "custom", "default": "m1"},
-        "custom_providers": [
+    dropped the duplicate model id: one group, one connection.
+
+    Driven through a REAL config.yaml on disk: the catalog builder reads the
+    live config (not an in-memory override), so an in-memory ``config.cfg``
+    patch would be silently replaced by a disk reload and the test would
+    assert against an empty catalog.
+    """
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
             {
-                "name": "晨光甲",
-                "base_url": "http://gateway:8080/team-a/v1",
-                "api_key": "sk-a",
-                "model": "m1",
+                "model": {"provider": "custom", "default": "m1"},
+                "custom_providers": [
+                    {
+                        "name": "晨光甲",
+                        "base_url": "http://gateway:8080/team-a/v1",
+                        "api_key": "sk-a",
+                        "model": "m1",
+                    },
+                    {
+                        "name": "晨光乙",
+                        "base_url": "http://gateway:8080/team-b/v1",
+                        "api_key": "sk-b",
+                        "model": "m2",
+                    },
+                ],
             },
-            {
-                "name": "晨光乙",
-                "base_url": "http://gateway:8080/team-b/v1",
-                "api_key": "sk-b",
-                "model": "m2",
-            },
-        ],
-    }
-    _with_direct_config(monkeypatch, cfg_dict)
+            allow_unicode=True,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config, "_get_config_path", lambda: config_path)
+    monkeypatch.setattr(config, "reload_config", lambda: None)
+    monkeypatch.setattr(config, "invalidate_models_cache", lambda: None)
     try:
         config.invalidate_models_cache()
     except Exception:
@@ -316,7 +332,7 @@ def test_the_catalog_keeps_the_two_records_apart(monkeypatch):
 
     by_label = {}
     for group in groups:
-        label = group.get("id") or group.get("provider") or group.get("name")
+        label = group.get("provider") or group.get("id") or group.get("name")
         models = [
             m.get("id") if isinstance(m, dict) else m
             for m in (group.get("models") or [])
