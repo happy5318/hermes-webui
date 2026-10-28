@@ -283,6 +283,55 @@ def test_two_records_sharing_one_endpoint_stay_selectable(monkeypatch):
     assert bundle_b["api_key"] == "sk-b"
 
 
+def test_the_catalog_keeps_the_two_records_apart(monkeypatch):
+    """The CATALOG must show two groups — the behaviour a source-text check
+    cannot see. Before the fix both records minted the same slug, so the
+    catalog put BOTH records' models under the FIRST record's label and
+    dropped the duplicate model id: one group, one connection."""
+    cfg_dict = {
+        "model": {"provider": "custom", "default": "m1"},
+        "custom_providers": [
+            {
+                "name": "晨光甲",
+                "base_url": "http://gateway:8080/team-a/v1",
+                "api_key": "sk-a",
+                "model": "m1",
+            },
+            {
+                "name": "晨光乙",
+                "base_url": "http://gateway:8080/team-b/v1",
+                "api_key": "sk-b",
+                "model": "m2",
+            },
+        ],
+    }
+    _with_direct_config(monkeypatch, cfg_dict)
+    try:
+        config.invalidate_models_cache()
+    except Exception:
+        pass
+
+    catalog = config.get_available_models(force_refresh=True)
+    groups = catalog.get("groups", []) if isinstance(catalog, dict) else []
+
+    by_label = {}
+    for group in groups:
+        label = group.get("id") or group.get("provider") or group.get("name")
+        models = [
+            m.get("id") if isinstance(m, dict) else m
+            for m in (group.get("models") or [])
+        ]
+        by_label[label] = models
+
+    # Each record gets its OWN group, carrying its own model.
+    assert "晨光甲" in by_label, by_label
+    assert "晨光乙" in by_label, by_label
+    assert any("m1" in str(m) for m in by_label["晨光甲"]), by_label
+    assert any("m2" in str(m) for m in by_label["晨光乙"]), by_label
+    # The two records' models must NOT share one group's identity.
+    assert by_label["晨光甲"] != by_label["晨光乙"]
+
+
 def test_an_ascii_record_does_not_claim_a_sibling_fallback_identity(monkeypatch):
     """A pure-CJK record with an explicit provider_key must not also claim the
     endpoint spelling an ASCII sibling owns — otherwise selecting the ASCII
