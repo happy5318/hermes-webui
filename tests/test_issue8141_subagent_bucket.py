@@ -631,20 +631,80 @@ def test_lineage_lookup_refuses_a_parent_from_another_profile() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_cross_profile_child_not_classified_by_foreign_parent(monkeypatch):
+def _profile_lineage_db(path, *sessions):
+    """One isolated Agent SessionDB (state.db) for a single profile home.
+
+    Mirrors the schema Hermes Agent writes (``sessions`` + ``messages``) so
+    the production projection (``read_importable_agent_session_rows``)
+    synthesizes the same ``raw_source``/``relationship_type`` signals the
+    sidebar classifier keys on. Each entry is
+    ``(sid, title, source, parent, timestamp)``.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path))
+    conn.execute(
+        "CREATE TABLE sessions (id TEXT PRIMARY KEY, title TEXT, model TEXT, "
+        "message_count INTEGER, started_at REAL, source TEXT, parent_session_id TEXT)"
+    )
+    conn.execute(
+        "CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, timestamp REAL)"
+    )
+    for sid, title, source, parent, ts in sessions:
+        conn.execute(
+            "INSERT INTO sessions (id, title, model, message_count, started_at, "
+            "source, parent_session_id) VALUES (?,?,?,?,?,?,?)",
+            (sid, title, "gpt", 2, 1000.0, source, parent),
+        )
+        conn.execute(
+            "INSERT INTO messages (session_id, role, timestamp) VALUES (?,?,?)",
+            (sid, "user", ts),
+        )
+        conn.execute(
+            "INSERT INTO messages (session_id, role, timestamp) VALUES (?,?,?)",
+            (sid, "assistant", ts + 0.1),
+        )
+    conn.commit()
+    conn.close()
+
+
+def test_cross_profile_child_not_classified_by_foreign_parent(monkeypatch, tmp_path):
     """With the CLI bucket hidden and All-profiles off, beta's orphan child
     (its parent lives in alpha) must stay in beta's own list.
 
-    ``_cli_off_rows_by_id`` was built from the cross-profile rows BEFORE
-    profile scoping, so the child resolved alpha's shared parent and
-    inherited its CLI bucket — filtered out of beta's list entirely. Master
-    lists it, and this is the default view on established installs.
+    Reproduced the maintainer's way: two ISOLATED Agent SessionDB databases
+    (one per profile home) read through the production projection
+    (``read_importable_agent_session_rows``), then merged cross-profile into
+    the sidebar payload — exactly the state ``_cli_off_rows_by_id`` saw
+    BEFORE profile scoping. The parent-lookup map must be scoped per
+    profile: alpha's shared parent resolved beta's child and inherited its
+    CLI bucket, filtering it out of beta's own list entirely (the default
+    view on established installs). Master lists it.
     """
+    from api.agent_sessions import read_importable_agent_session_rows
+
     routes = _routes()
+    alpha_db = tmp_path / "alpha" / "state.db"
+    beta_db = tmp_path / "beta" / "state.db"
+    _profile_lineage_db(
+        alpha_db,
+        ("alpha_shared_parent", "Alpha Parent", "cli", None, 100.0),
+    )
+    _profile_lineage_db(
+        beta_db,
+        ("beta_orphan", "Subagent Session", "subagent", "alpha_shared_parent", 101.0),
+        ("beta_webui_parent", "WebUI Parent", "webui", None, 200.0),
+    )
+    alpha_rows = read_importable_agent_session_rows(alpha_db, limit=200, exclude_sources=None)
+    beta_rows = read_importable_agent_session_rows(beta_db, limit=200, exclude_sources=None)
+    assert {str(r["id"]) for r in [*alpha_rows, *beta_rows]} == {
+        "alpha_shared_parent", "beta_orphan", "beta_webui_parent",
+    }
+    # The sidebar loader tags each row with the home it came from.
     rows = [
-        _cli_parent_row("alpha_shared_parent", profile="alpha"),
-        _subagent_child_row("beta_orphan", "alpha_shared_parent", profile="beta"),
-        _webui_parent_row("beta_parent", profile="beta"),
+        {**r, "session_id": r["id"], "profile": "alpha"} for r in alpha_rows
+    ] + [
+        {**r, "session_id": r["id"], "profile": "beta"} for r in beta_rows
     ]
     payload = _payload(
         monkeypatch, routes, rows,
@@ -716,6 +776,13 @@ def test_client_search_derives_bucket_from_complete_cached_rows():
     not resolve its parent and fell back to WebUI — then the WebUI fetch
     excluded it and it vanished from BOTH tabs. The bucket must be derived
     from the complete cached rows plus the sidebar's parent references.
+
+    This scenario runs from the ARCHIVED tab (``_showArchived``), the view
+    that renders archived search matches. There the server sends NO
+    ``sidebar_reference_sessions`` (``_build_session_list_cache_payload``
+    emits them only when ``include_archived`` is off), so the archived
+    parent is reachable ONLY through the complete ``_allSessions`` cache —
+    the exact hole the pre-fix map (matches + references) had.
     """
     out = _run("""
 const archP = { session_id:'arch_p', title:'Archived CLI Parent', profile:'default',
@@ -727,10 +794,12 @@ const archC = { session_id:'arch_c', title:'Subagent Session', profile:'default'
   is_cli_session:false, read_only:true, _cross_surface_child_session:true,
   archived:true, message_count:3, last_message_at:101, updated_at:101 };
 // The search matches only the child; the complete cache holds both rows.
+// Archived-tab payloads carry no sidebar_reference_sessions (include_archived
+// skips them server-side), so the parent resolves ONLY via _allSessions.
 global._activeProject = NO_PROJECT_FILTER;
 global._showArchived = true;
 global._allSessions = [archP, archC];
-global._sidebarReferenceSessions = [archP];
+global._sidebarReferenceSessions = [];
 const part = _partitionSidebarSessionRows([archC], null);
 console.log(JSON.stringify({ webui: part.webuiSessionsRaw.map(s=>s.session_id),
   cli: part.cliSessionsRaw.map(s=>s.session_id), cliCount: part.cliSessionCount }));
