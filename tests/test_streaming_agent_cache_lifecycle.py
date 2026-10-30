@@ -93,14 +93,16 @@ def test_evicted_agent_lifecycle_keeps_provider_alive_when_commit_still_dirty(mo
     agent._session_db.close.assert_not_called()
 
 
-def test_evicted_agent_with_unresolvable_owner_stops_writer_threads(monkeypatch):
+def test_evicted_agent_with_unresolvable_owner_falls_back_to_release_soft(monkeypatch):
     """#8613 follow-up 2: when the #8517 owner scope refuses the provider
-    shutdown because the session's owner cannot be resolved, the provider's
-    writer threads must still be stopped. Before this fix, ``shutdown_all``
+    shutdown because the session's owner cannot be resolved, the provider
+    teardown must still be attempted. Before this fix, ``shutdown_all``
     (inside ``shutdown_memory_provider``) was skipped too, so the provider's
-    ``mem-sync`` worker lingered until process exit. ``release_soft()`` stops
-    the writer threads without ``on_session_end()`` and has no caller-scope
-    check."""
+    ``mem-sync`` worker lingered until process exit. The fallback calls
+    ``release_soft()``, which attempts flush, drain and provider shutdown
+    without ``on_session_end()`` and has no caller-scope check; its bounded
+    drain can leave an already-running task detached, so this asserts the
+    soft-release fallback ran, not that the writer thread terminated."""
     import api.memory_profile_scope as scope
     import api.session_lifecycle as sl
     import api.streaming as streaming
@@ -121,7 +123,7 @@ def test_evicted_agent_with_unresolvable_owner_stops_writer_threads(monkeypatch)
     streaming._close_evicted_agent_at_session_boundary("orphan-session", agent)
 
     agent.shutdown_memory_provider.assert_not_called()  # refused: owner unknown
-    manager.release_soft.assert_called_once_with()  # #8613: no lingering mem-sync thread
+    manager.release_soft.assert_called_once_with()  # #8613: the soft-release fallback ran
 
 
 def test_identity_mismatch_cache_evictions_close_entries_outside_cache_lock():

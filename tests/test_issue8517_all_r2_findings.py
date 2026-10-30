@@ -21,6 +21,7 @@ from __future__ import annotations
 import logging
 import re
 import sys
+import threading
 import types
 import uuid
 from pathlib import Path
@@ -197,6 +198,142 @@ def test_refusal_capture_survives_a_raised_root_logger(monkeypatch):
         )
     finally:
         root.setLevel(previous_root_level)
+
+
+# ── #8613: overlapping owner windows must share the level safely ────────────
+
+
+def _run_overlapping_owner_windows(monkeypatch, *, original_level, first_out):
+    """Two sessions inside ``call_as_session_owner`` at the same time: A opens
+    its capture window first, B opens its own while A is still live, the window
+    named ``first_out`` returns from ``fn`` and fully exits, and only then does
+    the other window's callback emit the Agent's refusal WARNING. Returns
+    ``(results, final_level)``; the root logger sits at ERROR throughout, as in
+    the deployer configuration the pinning exists for.
+    """
+    monkeypatch.setattr(
+        scope,
+        "_enter_session_owner_scope",
+        lambda agent, session_id, owner_home: (lambda: None, None),
+    )
+    scope_logger = logging.getLogger("agent.memory_caller_scope")
+    root = logging.getLogger()
+    previous_root_level = root.level
+    previous_scope_level = scope_logger.level
+    root.setLevel(logging.ERROR)
+    scope_logger.setLevel(original_level)
+    a_open = threading.Event()
+    b_open = threading.Event()
+    first_out_done = threading.Event()
+    results: dict = {}
+
+    def _run(name):
+        if name == "B":
+            # A's window opens first, so the two windows provably overlap with
+            # a known entry order (A entered before B).
+            assert a_open.wait(10), "A's owner window never opened"
+
+        def fn():
+            if name == "A":
+                a_open.set()
+                # A stays inside its window until B's window is open, so the
+                # two capture windows really overlap.
+                assert b_open.wait(10), "B's owner window never opened"
+            else:
+                b_open.set()
+            if name == first_out:
+                return  # this window exits while the other one is still live
+            assert first_out_done.wait(10), "the first window never exited"
+            scope_logger.warning("refused hook on_session_end")
+
+        agent = SimpleNamespace(_memory_manager=SimpleNamespace())
+        results[name] = scope.call_as_session_owner(
+            agent, fn, session_id=name, owner_home="/home/x", hook="on_session_end"
+        )
+        if name == first_out:
+            first_out_done.set()
+
+    threads = [
+        threading.Thread(target=_run, args=(name,), name=f"owner-{name}")
+        for name in ("A", "B")
+    ]
+    try:
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(10)
+            assert not t.is_alive(), f"overlapping owner window {t.name} deadlocked"
+    finally:
+        root.setLevel(previous_root_level)
+        final_level = scope_logger.level
+        scope_logger.setLevel(previous_scope_level)
+    return results, final_level
+
+
+@pytest.mark.parametrize("first_out", ["A", "B"])
+@pytest.mark.parametrize("original_level", [logging.NOTSET, logging.DEBUG, logging.ERROR])
+def test_overlapping_owner_windows_restore_the_original_level(
+    monkeypatch, original_level, first_out
+):
+    """#8613 follow-up: the per-call save/restore of the caller-scope logger
+    level is not overlap-safe. The window that entered FIRST saves the real
+    level; the window that entered second saves the WARNING the first one set.
+    When the first window exits while the second is still live it puts the
+    original level back, and the second window then restores WARNING on its way
+    out: the process keeps a level nobody configured, and a refusal logged in
+    that window is filtered again (root ERROR), so a refused commit counts as
+    committed. The level must stay pinned until the LAST window exits and then
+    return to exactly the level the first window found — in either exit order.
+    """
+    results, final_level = _run_overlapping_owner_windows(
+        monkeypatch, original_level=original_level, first_out=first_out
+    )
+    last_out = "B" if first_out == "A" else "A"
+    assert final_level == original_level, (
+        f"the caller-scope logger level was left at {final_level} after the "
+        f"{first_out}-first exit order (original {original_level}): a later "
+        "refusal is filtered and a refused commit counts as committed"
+    )
+    assert results[first_out] is True, (
+        f"the window that exited first was wrongly reported as refused ({results})"
+    )
+    assert results[last_out] is False, (
+        f"a refusal emitted while the other session's window had already exited "
+        f"was missed ({results}): the refused commit counts as committed"
+    )
+
+
+@pytest.mark.parametrize("original_level", [logging.NOTSET, logging.DEBUG, logging.ERROR])
+def test_serial_owner_window_restores_the_original_level(monkeypatch, original_level):
+    """No overlap: one window at a time must leave the caller-scope logger
+    exactly as it found it, whichever level the deployer configured."""
+    monkeypatch.setattr(
+        scope,
+        "_enter_session_owner_scope",
+        lambda agent, session_id, owner_home: (lambda: None, None),
+    )
+    scope_logger = logging.getLogger("agent.memory_caller_scope")
+    root = logging.getLogger()
+    previous_root_level = root.level
+    previous_scope_level = scope_logger.level
+    root.setLevel(logging.ERROR)
+    scope_logger.setLevel(original_level)
+    try:
+        agent = SimpleNamespace(_memory_manager=SimpleNamespace())
+
+        def fn():
+            scope_logger.warning("refused hook on_session_end")
+
+        assert scope.call_as_session_owner(
+            agent, fn, session_id="s", owner_home="/home/x", hook="on_session_end"
+        ) is False, "the refused commit was counted as committed"
+        assert scope_logger.level == original_level, (
+            f"the caller-scope logger level was left at {scope_logger.level} "
+            f"(original {original_level})"
+        )
+    finally:
+        root.setLevel(previous_root_level)
+        scope_logger.setLevel(previous_scope_level)
 
 
 # ── 2. the streaming turn must hold a VERIFIED scope, or run without memory ─────

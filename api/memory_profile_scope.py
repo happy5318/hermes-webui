@@ -568,6 +568,42 @@ def _enter_session_owner_scope(agent: Any, session_id: str, owner_home: str) -> 
     return _enter_profile_home(owner, owner_key)
 
 
+# ── overlap-safe ownership of the caller-scope logger level (#8613) ──────────
+#
+# ``call_as_session_owner`` pins ``agent.memory_caller_scope`` to WARNING for
+# its capture window so the Agent's refusal WARNING reaches that window's
+# handler. The logger is process-global and the windows overlap: a session
+# boundary fires from another profile's turn (LRU eviction), from a fresh thread
+# (/api/session/new previous-session commit) and from the shutdown drain, so two
+# sessions can be inside ``call_as_session_owner`` at the same time. A per-call
+# save/restore is not safe there: the window that enters second saves the
+# WARNING the first one set, and when the first window exits while the second is
+# still live it restores the original level; the second window then restores
+# WARNING on its way out, so the process keeps a level nobody configured — and
+# under a deployer's raised root level a refusal logged in that window is
+# filtered again, so a refused commit counts as committed.
+#
+# Reference-counted ownership instead: the FIRST window records the logger's own
+# level and pins it to WARNING; a window that enters while one is live adds only
+# its own handler and leaves the level alone; the LAST window to exit restores
+# the level the first one recorded. The lock guards this bookkeeping only, never
+# the provider call between enter and exit, so overlapping windows still run
+# concurrently and may exit in either order.
+
+
+class _CaptureWindows:
+    """Reference count of the live capture windows and the level they must give
+    back once the last of them exits."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.open = 0
+        self.original_level: Optional[int] = None
+
+
+_capture_windows = _CaptureWindows()
+
+
 def call_as_session_owner(
     agent: Any,
     fn: Callable[[], Any],
@@ -597,17 +633,31 @@ def call_as_session_owner(
         return False
     capture = _HookRefusalCapture(hook)
     scope_logger = logging.getLogger(_CALLER_SCOPE_LOGGER)
-    previous_level = scope_logger.level
     # #8613: the refusal signal is a WARNING on this logger. A deployer who
     # raised the root logger above WARNING would otherwise filter it before the
     # capture handler sees it, and a refused commit would count as committed.
-    scope_logger.setLevel(logging.WARNING)
+    # The level is process-global and windows overlap, so it is owned by
+    # reference count: the first window records the level and pins it to
+    # WARNING, the last window to exit restores what the first one recorded
+    # (see ``_CaptureWindows``). Each window still adds and removes its own
+    # handler around ``fn``.
+    with _capture_windows.lock:
+        if _capture_windows.open == 0:
+            _capture_windows.original_level = scope_logger.level
+            scope_logger.setLevel(logging.WARNING)
+        _capture_windows.open += 1
     scope_logger.addHandler(capture)
     try:
         fn()
     finally:
         scope_logger.removeHandler(capture)
-        scope_logger.setLevel(previous_level)
+        with _capture_windows.lock:
+            _capture_windows.open -= 1
+            if _capture_windows.open == 0:
+                original_level = _capture_windows.original_level
+                if original_level is not None:
+                    scope_logger.setLevel(original_level)
+                _capture_windows.original_level = None
         restore()
     if capture.refused:
         logger.warning(

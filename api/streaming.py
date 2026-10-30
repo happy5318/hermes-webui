@@ -13694,9 +13694,11 @@ def _close_evicted_agent_at_session_boundary(session_id: str, agent) -> bool:
             )
             if not ran:
                 # #8613: the owner could not be resolved, so the provider
-                # shutdown was refused. release_soft() stops the provider's
-                # writer threads without on_session_end() and has no
-                # caller-scope check (agent/memory_manager.py); guard it
+                # shutdown was refused. release_soft() asks the provider to
+                # flush, drain and shut down without on_session_end() and has
+                # no caller-scope check (agent/memory_manager.py); its bounded
+                # drain can leave an already-running task detached, so the call
+                # does not prove the writer terminated. Guard it with getattr
                 # since older Agents may not have it.
                 release_soft = getattr(
                     getattr(agent, "_memory_manager", None), "release_soft", None
