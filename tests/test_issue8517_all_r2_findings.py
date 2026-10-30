@@ -159,6 +159,46 @@ def test_legacy_agent_turn_and_commit_scopes_refuse(legacy_hc, homes, scope_stat
     assert scope.call_as_session_owner(agent, lambda: pytest.fail("ran"), session_id="s", owner_home=root) is False
 
 
+# ── #8613: the refusal signal must survive a raised root log level ──────────
+
+def test_refusal_capture_survives_a_raised_root_logger(monkeypatch):
+    """#8613 follow-up 1: the Agent's hook-time refusal is only visible through
+    its WARNING line on ``agent.memory_caller_scope``. When a deployer raises the
+    root logger above WARNING, that line never reaches ``_HookRefusalCapture``
+    and a refused commit is wrongly counted as committed (never retried). The
+    capture window must pin the scope logger to WARNING, then restore it."""
+    import logging
+
+    import api.memory_profile_scope as scope
+
+    monkeypatch.setattr(
+        scope,
+        "_enter_session_owner_scope",
+        lambda agent, session_id, owner_home: (lambda: None, None),
+    )
+    # A deployer raised the root level; the scope logger inherits it while
+    # unset, so WARNING records are filtered before any handler sees them.
+    scope_logger = logging.getLogger("agent.memory_caller_scope")
+    scope_logger.setLevel(logging.NOTSET)
+    root = logging.getLogger()
+    previous_root_level = root.level
+    root.setLevel(logging.ERROR)
+    try:
+        agent = SimpleNamespace(_memory_manager=SimpleNamespace())
+
+        def fn():
+            scope_logger.warning("refused hook on_session_end")
+
+        assert scope.call_as_session_owner(
+            agent, fn, session_id="s", owner_home="/home/x", hook="on_session_end"
+        ) is False, (
+            "the refused commit was counted as committed: the refusal WARNING "
+            "never reached _HookRefusalCapture under a raised root log level"
+        )
+    finally:
+        root.setLevel(previous_root_level)
+
+
 # ── 2. the streaming turn must hold a VERIFIED scope, or run without memory ─────
 
 def test_streaming_turn_whose_override_setter_fails_runs_without_memory(

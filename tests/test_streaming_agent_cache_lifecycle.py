@@ -93,6 +93,37 @@ def test_evicted_agent_lifecycle_keeps_provider_alive_when_commit_still_dirty(mo
     agent._session_db.close.assert_not_called()
 
 
+def test_evicted_agent_with_unresolvable_owner_stops_writer_threads(monkeypatch):
+    """#8613 follow-up 2: when the #8517 owner scope refuses the provider
+    shutdown because the session's owner cannot be resolved, the provider's
+    writer threads must still be stopped. Before this fix, ``shutdown_all``
+    (inside ``shutdown_memory_provider``) was skipped too, so the provider's
+    ``mem-sync`` worker lingered until process exit. ``release_soft()`` stops
+    the writer threads without ``on_session_end()`` and has no caller-scope
+    check."""
+    import api.memory_profile_scope as scope
+    import api.session_lifecycle as sl
+    import api.streaming as streaming
+
+    monkeypatch.setattr(streaming, "_lifecycle_commit_session_memory", lambda *a, **kw: True)
+    monkeypatch.setattr(streaming, "_lifecycle_has_uncommitted_work", lambda session_id: False)
+    monkeypatch.setattr(streaming, "_lifecycle_unregister_agent", MagicMock())
+    # No recorded owner and no session record: the owner cannot be resolved.
+    monkeypatch.setattr(sl, "recorded_owner_profile_home", lambda session_id: "")
+    monkeypatch.setattr(scope, "session_owner_profile_home", lambda session_id: "")
+
+    manager = MagicMock()
+    agent = MagicMock()
+    agent._memory_manager = manager
+    agent._session_db = MagicMock()
+    agent._session_messages = [{"role": "user", "content": "hi"}]
+
+    streaming._close_evicted_agent_at_session_boundary("orphan-session", agent)
+
+    agent.shutdown_memory_provider.assert_not_called()  # refused: owner unknown
+    manager.release_soft.assert_called_once_with()  # #8613: no lingering mem-sync thread
+
+
 def test_identity_mismatch_cache_evictions_close_entries_outside_cache_lock():
     src = open("api/streaming.py", encoding="utf-8").read()
 

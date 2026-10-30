@@ -607,6 +607,21 @@ python3 -c "import hermes_constants; print(hasattr(hermes_constants, 'pin_proces
 
 ---
 
+## Profile-scoped memory is off, or commits are refused, on older Agents
+
+**Symptom.** Chat memory (MEMORY.md / external providers) does not work even though memory is configured. The WebUI log carries a one-time warning about profile-scoped memory being unavailable — search the server log for `[webui] #8517` or `agent.memory_caller_scope`.
+
+**Why.** Profile-scoped memory (`#8585`) binds every session's memory commit to the session's own profile. That binding needs the installed Hermes Agent's caller-scope support:
+
+- **Agent before v0.18.0** — all memory is off: the Agent has no context-local home to bind.
+- **Multi-profile installs without `claim_instance`** — external providers are off (built-in memory still works): a shared provider instance cannot be re-pointed per profile.
+
+**Fix.** Upgrade the Hermes Agent (`hermes update`), then restart the WebUI. Single-profile installs on current Agents are unaffected.
+
+**When to file a bug.** File a WebUI bug if the warning appears on a current Agent (≥ v0.18.0) in a single-profile install.
+
+---
+
 ## Other troubleshooting
 
 This document grows over time. If a recurring failure mode isn't covered here yet, add it via PR. The format for each entry: **Symptom → Why → Diagnostic commands → Fix → When to file a bug**.

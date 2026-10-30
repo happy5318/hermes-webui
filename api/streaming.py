@@ -13685,13 +13685,24 @@ def _close_evicted_agent_at_session_boundary(session_id: str, agent) -> bool:
         shutdown_memory_provider = getattr(agent, 'shutdown_memory_provider', None)
         if callable(shutdown_memory_provider):
             session_messages = vars(agent).get('_session_messages', [])
-            call_as_session_owner(
+            ran = call_as_session_owner(
                 agent,
                 lambda: shutdown_memory_provider(session_messages),
                 session_id=session_id,
                 owner_home=_owner_home,
                 what="memory provider shutdown",
             )
+            if not ran:
+                # #8613: the owner could not be resolved, so the provider
+                # shutdown was refused. release_soft() stops the provider's
+                # writer threads without on_session_end() and has no
+                # caller-scope check (agent/memory_manager.py); guard it
+                # since older Agents may not have it.
+                release_soft = getattr(
+                    getattr(agent, "_memory_manager", None), "release_soft", None
+                )
+                if callable(release_soft):
+                    release_soft()
     except Exception:
         logger.debug("Failed to shut down evicted agent memory provider for session %s", session_id, exc_info=True)
 

@@ -597,11 +597,17 @@ def call_as_session_owner(
         return False
     capture = _HookRefusalCapture(hook)
     scope_logger = logging.getLogger(_CALLER_SCOPE_LOGGER)
+    previous_level = scope_logger.level
+    # #8613: the refusal signal is a WARNING on this logger. A deployer who
+    # raised the root logger above WARNING would otherwise filter it before the
+    # capture handler sees it, and a refused commit would count as committed.
+    scope_logger.setLevel(logging.WARNING)
     scope_logger.addHandler(capture)
     try:
         fn()
     finally:
         scope_logger.removeHandler(capture)
+        scope_logger.setLevel(previous_level)
         restore()
     if capture.refused:
         logger.warning(
