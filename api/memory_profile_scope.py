@@ -295,6 +295,9 @@ def _detach_memory(agent: Any) -> None:
     down: a shared provider instance may still serve another profile's live agent."""
     if getattr(agent, "_memory_manager", None) is None:
         return
+    # #8613: a detached agent no longer holds the instance, so it must not keep
+    # another agent from being proved its last holder.
+    unregister_provider_holders(agent)
     try:
         agent._memory_manager = None
     except Exception as exc:
@@ -473,6 +476,9 @@ def construct_profile_scoped_agent(
                 "memory provider bound; relying on the profile home override set for "
                 "construction. Upgrade the Agent to verify it.",
             )
+        # #8613: this agent now holds every provider instance its manager serves, so a
+        # later session boundary can prove whether it is the last holder of them.
+        register_provider_holders(agent, home_key=target_key or "")
         return agent, True
     finally:
         restore()
@@ -721,4 +727,347 @@ def install_shared_provider_instance_guard() -> bool:
 
         setattr(claim_instance, _GUARD_MARK, True)
         mm.claim_instance = claim_instance
+    return True
+
+
+# ── who holds a provider instance (#8613) ───────────────────────────────────
+#
+# A provider that hands every agent ONE process-wide instance (mnemosyne-hermes
+# 0.7.1) ends up shared by every agent of the profile that claimed it: the #8517
+# P4 guard above stops a SECOND PROFILE from rebinding such an instance, not a
+# second agent of the same one. Each of those agents owns its own MemoryManager,
+# and every manager-level teardown (``claim_teardown``, ``release_soft``,
+# ``shutdown_all``) shuts the shared INSTANCE down — the profile's other live
+# agents then lose the client their next memory save goes through. That is why
+# the unowned-eviction release was reverted (#8636): it proved a manager, not an
+# instance.
+#
+# WebUI therefore records, per provider instance, which agents currently hold it,
+# and tears an instance down only once the agent reaching the boundary is its LAST
+# holder. Keyed by ``id(provider)`` exactly like the P4 guard (an unhashable or
+# value-equal provider is still tracked), validated against a weak reference so a
+# collected instance's id can never be mistaken for a live one, and emptied by
+# weak-reference callbacks so an agent or an instance that dies without a boundary
+# does not pin the other one forever.
+#
+# The table is PROCESS-LOCAL by nature: a provider instance is a process-local
+# object, and the P4 guard above already keys per-process ownership by ``id()``.
+# Nothing here is shared across processes, so ``_provider_holders_lock`` is the
+# whole concurrency story — the flock-and-re-read-the-disk discipline for
+# cross-process state (state.db) would prove nothing about object identity and is
+# deliberately not used.
+
+
+class _InstanceHolders:
+    """Who holds one provider instance right now, and whether it is being torn down."""
+
+    __slots__ = ("ref", "home_key", "holders", "teardown")
+
+    def __init__(self, ref: Callable[[], Any], home_key: str = ""):
+        self.ref = ref                                    # weak reference: identity, never id() alone
+        self.home_key = home_key                          # profile home key the instance serves
+        self.holders: dict[int, Callable[[], Any]] = {}   # id(agent) -> weak reference
+        self.teardown = False                             # a teardown of this instance is running
+
+
+_provider_holders: dict[int, _InstanceHolders] = {}
+# Reentrant: a weak-reference callback can fire from a GC that runs inside the lock.
+_provider_holders_lock = threading.RLock()
+
+
+def _provider_instances(agent: Any) -> list:
+    """The provider instances ``agent``'s memory manager serves, read defensively:
+    every Agent attribute WebUI touches here has changed shape at least once
+    (``providers`` as a property, as a method, or as a plain list)."""
+    manager = getattr(agent, "_memory_manager", None)
+    if manager is None:
+        return []
+    providers: Any = getattr(manager, "providers", None)
+    if callable(providers):
+        try:
+            providers = providers()
+        except Exception:
+            logger.debug("[webui] #8613: reading the agent's memory providers failed", exc_info=True)
+            return []
+    if not providers:
+        return []
+    try:
+        return [p for p in list(providers) if p is not None]
+    except TypeError:
+        return []
+
+
+def _weak_agent_ref(agent: Any) -> Callable[[], Any]:
+    """Weak reference to ``agent`` whose death drops it from every holder set
+    (#8613); a strong one when it cannot be weakly referenced, so a holder is never
+    silently dropped from an instance it still uses."""
+    agent_pid = id(agent)
+    try:
+        return weakref.ref(agent, lambda dead, pid=agent_pid: _forget_agent_holder(pid, dead))
+    except TypeError:
+        return lambda: agent
+
+
+def _forget_provider_instance(inst_pid: int, ref: Callable[[], Any]) -> None:
+    """Weak-reference callback: the instance itself is gone, so its holder set is."""
+    with _provider_holders_lock:
+        entry = _provider_holders.get(inst_pid)
+        if entry is not None and entry.ref is ref:
+            del _provider_holders[inst_pid]
+
+
+def _forget_agent_holder(agent_pid: int, ref: Callable[[], Any]) -> None:
+    """Weak-reference callback: a collected agent stops holding every instance."""
+    with _provider_holders_lock:
+        for key, entry in list(_provider_holders.items()):
+            if entry.holders.get(agent_pid) is ref:
+                del entry.holders[agent_pid]
+            if not entry.holders and not entry.teardown:
+                del _provider_holders[key]
+
+
+def _live_holders_entry(provider: Any) -> Optional[_InstanceHolders]:
+    """The entry for ``provider``, or None. A stale ``id()`` — the instance it was
+    recorded for has been collected — is dropped, never trusted to describe this one."""
+    inst_pid = id(provider)
+    entry = _provider_holders.get(inst_pid)
+    if entry is None:
+        return None
+    if entry.ref() is not provider:
+        del _provider_holders[inst_pid]
+        return None
+    return entry
+
+
+def register_provider_holders(agent: Any, *, home_key: str = "") -> int:
+    """Record ``agent`` as a holder of every provider instance its memory manager
+    serves (#8613). Idempotent per (agent, instance) — a turn that reuses a cached
+    agent registers nothing new — and returns how many instances it now holds.
+
+    ``construct_profile_scoped_agent`` calls this right after a memory-bearing
+    build, so an agent is in the table before any session boundary can ask whether
+    it is the last holder of an instance.
+    """
+    if agent is None:
+        return 0
+    instances = _provider_instances(agent)
+    if not instances:
+        return 0
+    agent_pid = id(agent)
+    added = 0
+    with _provider_holders_lock:
+        for provider in instances:
+            inst_pid = id(provider)
+            entry = _provider_holders.get(inst_pid)
+            if entry is None or entry.ref() is not provider:
+                try:
+                    ref = weakref.ref(
+                        provider,
+                        lambda dead, pid=inst_pid: _forget_provider_instance(pid, dead),
+                    )
+                except TypeError:  # no weak reference: hold it strongly, never by id() alone
+                    ref = lambda provider=provider: provider
+                entry = _InstanceHolders(ref, home_key)
+                _provider_holders[inst_pid] = entry
+            if agent_pid not in entry.holders:
+                entry.holders[agent_pid] = _weak_agent_ref(agent)
+                added += 1
+    return added
+
+
+def unregister_provider_holders(agent: Any) -> None:
+    """Drop ``agent`` from every holder set: it was detached, evicted or discarded
+    and will never touch those instances again (#8613). Never touches the instances
+    themselves — whether one may be torn down is the caller's decision, taken with
+    ``agent_is_last_provider_holder`` BEFORE this runs."""
+    if agent is None:
+        return
+    agent_pid = id(agent)
+    with _provider_holders_lock:
+        for key, entry in list(_provider_holders.items()):
+            if agent_pid in entry.holders:
+                del entry.holders[agent_pid]
+            if not entry.holders and not entry.teardown:
+                del _provider_holders[key]
+
+
+def _last_provider_holder_locked(agent: Any) -> tuple[bool, str]:
+    """``agent_is_last_provider_holder`` with ``_provider_holders_lock`` already held."""
+    if agent is None:
+        return True, ""
+    instances = _provider_instances(agent)
+    if not instances:
+        return True, ""  # nothing held: no other agent can be broken by a release
+    agent_pid = id(agent)
+    for provider in instances:
+        name = getattr(provider, "name", "?")
+        entry = _live_holders_entry(provider)
+        if entry is None:
+            return False, f"provider {name!r} is not tracked as held by any agent"
+        mine = entry.holders.get(agent_pid)
+        if mine is None or mine() is not agent:
+            return False, f"provider {name!r} is not tracked as held by this agent"
+        # A collected holder does not count: its weak-reference callback removes it,
+        # and a stale reference must not pin an instance nobody uses any more.
+        others = [ref for key, ref in entry.holders.items() if key != agent_pid and ref() is not None]
+        if others:
+            return False, (
+                f"provider {name!r} of profile home {entry.home_key!r} is still held by "
+                f"{len(others)} other agent(s)"
+            )
+        if entry.teardown:
+            return False, f"a teardown of provider {name!r} is already running"
+    return True, ""
+
+
+def agent_is_last_provider_holder(agent: Any) -> tuple[bool, str]:
+    """``(True, "")`` when every provider instance ``agent`` serves has this agent as
+    its ONLY live holder, so a teardown cannot break another agent (#8613);
+    ``(False, reason)`` when one is still held elsewhere, or when that cannot be
+    proven. Every unknown answers False: a provider that keeps running is the status
+    quo, a provider shut down under a live agent is not.
+    """
+    with _provider_holders_lock:
+        return _last_provider_holder_locked(agent)
+
+
+def _claim_last_held_teardown(agent: Any) -> tuple[bool, str, list]:
+    """``agent_is_last_provider_holder`` AND the teardown claim in ONE critical
+    section, so no holder can be registered or dropped between the proof and the
+    release (#8613). The claimed instances are returned by identity: holding them
+    keeps their ``id()`` — and the claim — valid for the whole release."""
+    with _provider_holders_lock:
+        ok, why = _last_provider_holder_locked(agent)
+        if not ok:
+            return False, why, []
+        claimed = _provider_instances(agent)
+        for provider in claimed:
+            entry = _live_holders_entry(provider)
+            if entry is not None:
+                entry.teardown = True
+        return True, "", claimed
+
+
+def _settle_last_held_teardown(agent: Any, claimed: list) -> list[str]:
+    """Clear the teardown claim, drop ``agent`` from the holder sets, and name the
+    instances that gained a holder while the release ran — the one race this design
+    cannot close (an agent constructed for the same profile binds the instance
+    mid-release). Reported so it is visible, not silently swallowed."""
+    raced: list[str] = []
+    agent_pid = id(agent)
+    with _provider_holders_lock:
+        for provider in claimed:
+            entry = _live_holders_entry(provider)
+            if entry is None:
+                continue
+            entry.teardown = False
+            entry.holders.pop(agent_pid, None)
+            if any(ref() is not None for ref in entry.holders.values()):
+                raced.append(str(getattr(provider, "name", "?")))
+        # An instance nobody holds any more leaves the table.
+        for key, entry in list(_provider_holders.items()):
+            if not entry.holders and not entry.teardown:
+                del _provider_holders[key]
+    return raced
+
+
+def release_unowned_memory_provider(agent: Any, *, session_id: str, owner_home: str = "") -> bool:
+    """Stop the memory provider of an evicted ``agent`` whose session owner cannot be
+    resolved, WITHOUT a session end (#8613). True when the release ran.
+
+    ``call_as_session_owner`` refuses ``shutdown_memory_provider`` for such an agent
+    (session end is a commit, and an unknown owner never commits), which also skipped
+    the teardown inside it, so the provider's ``mem-sync`` writer and its clients
+    lingered until the WebUI process exited. This runs only the teardown, and only
+    when ALL of the following hold:
+
+    * the owner is still unresolvable; a refusal for any other reason (provider bound
+      to another profile, no home override) leaves the provider alone;
+    * the manager has ``release_soft`` AND ``claim_teardown`` (Agent 2026-10-19+).
+      ``release_soft`` is not a pure cancellation: it claims teardown once (a later
+      session-end shutdown of this manager then runs neither ``on_session_end`` nor a
+      second ``shutdown_all``), waits up to 10 s for writes the agent ALREADY queued
+      (they run in the provider's bound profile, ``in_owner_home``), then runs
+      ``shutdown_all`` (bounded drain + each provider's ``shutdown()``). It never
+      calls ``on_session_end`` and adds no write of its own;
+    * the manager reports the profile home it is bound to (``_bound_scope``); the
+      release runs with that home held as the context-local home, so anything
+      resolved during the drain or a provider's ``shutdown()`` names the provider's
+      own profile, never the ambient env mirror (another profile's);
+    * this agent is the LAST holder of every provider instance it serves
+      (``agent_is_last_provider_holder``, claimed atomically with
+      ``_claim_last_held_teardown``). A provider that hands one instance to every
+      agent of a profile is shared by them all, and a manager-level teardown shuts
+      that instance down under the agents still using it — which is why an earlier
+      version of this fix was reverted (#8636). While another agent of the same
+      profile holds the instance, nothing runs and the provider keeps its worker;
+      that agent's own session boundary releases it.
+
+    Otherwise nothing runs and it is logged once: that provider lingers until the
+    WebUI restarts, as before.
+    """
+    manager = getattr(agent, "_memory_manager", None)
+    if manager is None:
+        return False
+    owner = str(owner_home or "").strip() or session_owner_profile_home(session_id)
+    if owner and profile_home_key(owner):
+        return False
+    release = getattr(manager, "release_soft", None)
+    if not (callable(release) and callable(getattr(manager, "claim_teardown", None))):
+        _log_once(
+            "release-soft-missing",
+            "[webui] #8613: this Hermes Agent cannot release a memory provider without a "
+            "session end (no MemoryManager.release_soft/claim_teardown; older than "
+            "2026-10-19). An evicted agent whose session owner cannot be resolved keeps "
+            "its provider worker until the WebUI restarts.",
+        )
+        return False
+    state, bound_key = _bound_memory_home_key(agent)
+    bound = getattr(manager, "_bound_scope", None)
+    bound_home = str(bound.get("hermes_home") or "") if isinstance(bound, dict) else ""
+    if state != "bound" or not bound_home or profile_home_key(bound_home) != bound_key:
+        _log_once(
+            "release-unbound",
+            "[webui] #8613: an evicted agent whose session owner cannot be resolved does "
+            "not report the profile home its memory provider is bound to, so the "
+            "provider is not released; it keeps its worker until the WebUI restarts.",
+        )
+        return False
+    # #8613: never tear down an instance another live agent still holds.
+    ok, why, claimed = _claim_last_held_teardown(agent)
+    if not ok:
+        _log_once(
+            "release-shared",
+            "[webui] #8613: the memory provider of evicted session %s was NOT released: "
+            "%s. The provider keeps its worker until the last agent holding it reaches a "
+            "session boundary, or until the WebUI restarts.",
+            session_id, why,
+        )
+        return False
+    restore, reason = _enter_profile_home(bound_home, bound_key)
+    if reason is not None:
+        _log_once(
+            "release-scope",
+            "[webui] #8613: an evicted agent's memory provider was not released (%s); it "
+            "keeps its worker until the WebUI restarts.",
+            reason,
+        )
+        _settle_last_held_teardown(agent, claimed)
+        return False
+    try:
+        release()
+    finally:
+        restore()
+        raced = _settle_last_held_teardown(agent, claimed)
+    if raced:
+        logger.warning(
+            "[webui] #8613: provider(s) %s gained a holder while the release of evicted "
+            "session %s was running; that holder may have been shut down with them.",
+            raced, session_id,
+        )
+    logger.info(
+        "[webui] #8613: released the memory provider of evicted session %s without "
+        "session end (its owner cannot be resolved)",
+        session_id,
+    )
     return True
