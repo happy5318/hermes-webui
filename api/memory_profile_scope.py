@@ -40,6 +40,7 @@ refused BEFORE ``initialize`` runs and builds without that provider.
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import functools
 import importlib
 import inspect
@@ -47,6 +48,7 @@ import logging
 import os
 import sys
 import threading
+import time
 import weakref
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -63,6 +65,17 @@ def _log_once(key: str, message: str, *args: Any) -> None:
             return
         _logged_once.add(key)
     logger.warning(message, *args)
+
+
+# #8613: every provider instance the #8517 P4 guard refused to the construction
+# in progress because a teardown of that instance is running. The Agent's own
+# initialiser drops a refused provider, so once ``agent_cls(...)`` has returned
+# there is no other trace of the refusal — the agent simply has no provider —
+# and the build would be cached as a memory-bearing agent that has none.
+# ``construct_profile_scoped_agent`` scopes this to one construction.
+_lifetime_refusals: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar(
+    "webui_8613_lifetime_refusals", default=()
+)
 
 
 def _hermes_constants():
@@ -425,7 +438,11 @@ def construct_profile_scoped_agent(
     this turn's agent absent while it is acquiring the shared instance. If the
     build still ends up on an instance a teardown is closing, it fails closed
     (memory off, not cached) instead of handing out an agent whose next save would
-    go through a closed client.
+    go through a closed client. The same holds when the #8517 P4 guard refused the
+    instance to it mid-teardown: the Agent then drops the provider itself and
+    keeps built-in memory, which leaves no other trace, so the refusal is noted
+    construction-scoped (``_lifetime_refusals``) and the build is not cached
+    either — a cached memoryless agent would never be given the provider again.
     """
     guarded = install_shared_provider_instance_guard()
     params = _constructor_params(agent_cls) if agent_params is None else set(agent_params)
@@ -471,7 +488,17 @@ def construct_profile_scoped_agent(
         # construction is acquiring the same instance.
         _reserve_acquisition(target_key or "")
         try:
-            agent = agent_cls(**agent_kwargs)
+            # #8613: construction-scoped note of every provider instance the #8517 P4
+            # guard refused because a teardown of it is running (must-fix 2). The
+            # Agent's own initialiser drops a refused provider, so without this the
+            # refusal is unreadable once the constructor has returned: the agent
+            # simply has no provider, and the build would answer cacheable.
+            _refusal_token = _lifetime_refusals.set(())
+            try:
+                agent = agent_cls(**agent_kwargs)
+                refused = _lifetime_refusals.get()
+            finally:
+                _lifetime_refusals.reset(_refusal_token)
             state, bound_key = _bound_memory_home_key(agent)
             if state == "bound" and bound_key != target_key:
                 logger.warning(
@@ -493,12 +520,28 @@ def construct_profile_scoped_agent(
                     "memory provider bound; relying on the profile home override set for "
                     "construction. Upgrade the Agent to verify it.",
                 )
+            # #8613 must-fix 2: a provider the guard refused mid-teardown leaves the
+            # Agent on built-in memory with no other trace, so the construction must
+            # answer NOT cacheable — a cache hit would reuse that memoryless agent and
+            # the profile would never initialise the provider again. Whatever the agent
+            # DID acquire is still recorded, so another agent's boundary cannot release
+            # it under this one.
+            if refused:
+                logger.warning(
+                    "[webui] #8613: memory provider(s) %s were refused to session %s because "
+                    "a teardown of the instance is running, so the agent built for it runs "
+                    "without that provider and is not cached; the next turn constructs it "
+                    "again.",
+                    list(refused), session_id,
+                )
+                register_provider_holders(agent, home_key=target_key or "")
+                return agent, False
             # #8613: fail closed if the build ended up holding an instance a teardown
             # is closing (an Agent without the ``claim_instance`` seam keeps it, since
             # the reservation only fences the table). Such an agent's next save would
             # go through a closed client, so it is rebuilt without memory and not
             # cached: the next turn constructs again, once the teardown has settled.
-            dying, dying_name = agent_holds_retired_instance(agent)
+            dying, dying_name = agent_holds_dying_instance(agent)
             if dying:
                 logger.warning(
                     "[webui] #8613: memory provider %r for session %s is being torn down, "
@@ -704,19 +747,27 @@ def _claim_for_profile(original: Callable[[Any, Any], bool], provider: Any, home
     key = profile_home_key(home) or str(home or "")
     pid = id(provider)
     # #8613: the acquisition half of the instance-lifetime protocol. An instance a
-    # teardown is closing (or has closed) is never handed out again: the Agent
-    # drops a refused provider and keeps built-in memory, which is the only safe
-    # answer for a client that is going away. Without this the claim below would
-    # happily re-bind it and the agent's next save would fail.
+    # teardown is closing is never handed out again: the Agent drops a refused
+    # provider and keeps built-in memory, which is the only safe answer for a
+    # client that is going away. Without this the claim below would happily
+    # re-bind it and the agent's next save would fail. Only the IN-FLIGHT window
+    # is fenced: once the teardown has settled the entry is gone, and the next
+    # construction re-claims and re-initialises the instance, exactly as the
+    # owned path (``shutdown_memory_provider``) already does — a refusal that
+    # outlived the teardown would leave a singleton provider off until restart.
     lifetime = _instance_lifetime_state(provider)
     if lifetime is not None:
+        # The construction that hits this must not be cached (must-fix 2): the
+        # Agent drops the provider and keeps built-in memory, which leaves the
+        # refusal unreadable once the initialiser has returned.
+        _note_lifetime_refusal(provider, lifetime)
         _log_once(
             f"acquire-dying:{pid}:{key}",
             "[webui] #8613: memory provider %r is not acquired for profile home %r: a "
-            "teardown of that instance %s. This agent runs without that provider "
-            "(built-in memory still works) until the WebUI restarts.",
+            "teardown of that instance is running. This agent runs without that provider "
+            "(built-in memory still works); the next turn constructs it again once the "
+            "teardown has settled.",
             getattr(provider, "name", "?"), str(home),
-            "is running" if lifetime == "teardown" else "already completed",
         )
         return False
     with _instance_owners_lock:
@@ -813,22 +864,49 @@ def install_shared_provider_instance_guard() -> bool:
 # deliberately not used.
 
 
-class _InstanceHolders:
-    """Who holds one provider instance right now, and whether it is being torn down."""
+class _AgentHolder:
+    """One agent's hold on a provider instance (#8613).
 
-    __slots__ = ("ref", "home_key", "holders", "teardown", "retired")
+    ``agent`` is the weak reference the table is keyed by; ``manager`` is a weak
+    reference to the memory manager the agent holds the instance through. The
+    manager is only needed to tell, once the agent itself is gone (evicted or
+    collected), whether it still has queued memory work — see
+    ``_InstanceHolders.work``.
+    """
+
+    __slots__ = ("agent", "manager")
+
+    def __init__(self, agent: Callable[[], Any], manager: Callable[[], Any]):
+        self.agent = agent
+        self.manager = manager
+
+
+class _InstanceHolders:
+    """Who holds one provider instance right now, whether a teardown of it is
+    running, and which departed agents still have queued memory work on it."""
+
+    __slots__ = ("ref", "home_key", "holders", "teardown", "work")
 
     def __init__(self, ref: Callable[[], Any], home_key: str = ""):
         self.ref = ref                                    # weak reference: identity, never id() alone
         self.home_key = home_key                          # profile home key the instance serves
-        self.holders: dict[int, Callable[[], Any]] = {}   # id(agent) -> weak reference
+        self.holders: dict[int, _AgentHolder] = {}        # id(agent) -> its hold
         self.teardown = False                             # a teardown of this instance is running
-        self.retired = False                              # a teardown completed: never acquire it again
+        # id(agent) -> weak reference to its manager, for an agent that LEFT the
+        # holder set while its manager still had queued memory work. That work
+        # still writes through this instance, so it holds the instance exactly
+        # like a live holder does — until the work drains, at which point the
+        # weak reference dies with the manager and the hold evaporates.
+        self.work: dict[int, Callable[[], Any]] = {}
 
 
 _provider_holders: dict[int, _InstanceHolders] = {}
 # Reentrant: a weak-reference callback can fire from a GC that runs inside the lock.
 _provider_holders_lock = threading.RLock()
+# The SAME lock as a Condition, so a release can WAIT for the constructions it
+# fences instead of refusing and dropping the instance out of the table (#8613
+# should-fix 5). ``wait()`` releases the lock, so no thread is blocked by it.
+_provider_holders_cond = threading.Condition(_provider_holders_lock)
 
 
 # ── one instance-lifetime protocol: acquisition reservations (#8613) ─────────
@@ -853,14 +931,25 @@ _provider_holders_lock = threading.RLock()
 # only ever touched for a dict update, so the lock is never held across provider
 # I/O (``release()`` runs a 10 s drain outside it, exactly as before).
 #
+# The third hold is queued memory work (#8613 must-fix 1). An agent that reaches a
+# boundary — or is collected — while its manager still has a background save
+# queued keeps holding every instance that save goes through: the work runs in the
+# provider's own profile on the manager's writer thread, so releasing the instance
+# under it would close the client the save needs. That hold is weak (the queued
+# work keeps the manager alive) and evaporates as soon as the work has drained.
+#
 # The other half of the protocol is the acquisition chokepoint: the #8517 P4
-# ``claim_instance`` guard refuses an instance whose entry is ``teardown`` (a
-# release is running) or ``retired`` (one completed), so an agent constructed
-# DURING a release is never handed the client that release is about to close — the
-# Agent drops the provider and keeps built-in memory. ``register_provider_holders``
-# refuses the same entries as a backstop, and ``construct_profile_scoped_agent``
-# fails closed (rebuild without memory, do not cache) for an Agent without that
-# seam, whose manager keeps the instance anyway.
+# ``claim_instance`` guard refuses an instance whose entry is in ``teardown`` (a
+# release is running), so an agent constructed DURING a release is never handed
+# the client that release is about to close — the Agent drops the provider and
+# keeps built-in memory. A refusal is noted construction-scoped
+# (``_lifetime_refusals``) so the build answers ``cacheable=False`` even though
+# the Agent's own initialiser has already dropped the refused provider.
+# ``register_provider_holders`` refuses the same entry as a backstop, and
+# ``construct_profile_scoped_agent`` fails closed (rebuild without memory, do not
+# cache) for an Agent without that seam, whose manager keeps the instance anyway.
+# Once the release has settled the entry is gone and the instance is claimed
+# again, so the fence lasts exactly as long as the teardown it protects.
 
 _inflight_homes: dict[str, int] = {}
 
@@ -885,6 +974,41 @@ def _end_acquisition(home_key: str) -> None:
             _inflight_homes[home_key] = left
         else:
             _inflight_homes.pop(home_key, None)
+        # A release waiting on the fence this construction held may now re-run its
+        # proof: either a holder appeared for the instance (the release is then
+        # correctly refused) or nothing was acquired (the release runs).
+        _provider_holders_cond.notify_all()
+
+
+def _weak_manager_ref(manager: Any) -> Callable[[], Any]:
+    """Weak reference to a memory manager; an inert one when it cannot be weakly
+    referenced, so a hold is never pinned by the manager it describes (#8613)."""
+    try:
+        return weakref.ref(manager)
+    except TypeError:
+        return lambda: None
+
+
+def _agent_manager(agent: Any) -> Any:
+    """The agent's memory manager, read defensively (None without one)."""
+    return getattr(agent, "_memory_manager", None)
+
+
+def _manager_has_outstanding_work(manager: Any) -> bool:
+    """True when ``manager`` still has queued or running memory work (#8613
+    must-fix 1): a background save that has not drained yet. This is the Agent's
+    own executor bookkeeping, read defensively; an unreadable answer counts as
+    work pending, because a provider that keeps running is the status quo while
+    a save that goes through a client another agent's teardown closed is not."""
+    if manager is None:
+        return False
+    futures = getattr(manager, "_background_futures", None)
+    if not isinstance(futures, dict) or not futures:
+        return False
+    try:
+        return any(not future.done() for future in list(futures))
+    except Exception:
+        return True
 
 
 def _inflight_acquisitions(home_key: str) -> int:
@@ -897,12 +1021,30 @@ def _inflight_acquisitions(home_key: str) -> int:
         return sum(_inflight_homes.values())
 
 
+def _note_lifetime_refusal(provider: Any, state: str) -> None:
+    """Note, for the construction in progress, that ``provider`` was refused
+    because a teardown of its instance is ``state`` (#8613 must-fix 2). Read back
+    by ``construct_profile_scoped_agent`` once the constructor has returned."""
+    try:
+        seen = _lifetime_refusals.get()
+    except LookupError:  # pragma: no cover - the ContextVar carries a default
+        seen = ()
+    _lifetime_refusals.set((*seen, f"{getattr(provider, 'name', '?')}:{state}"))
+
+
 def _instance_lifetime_state(provider: Any) -> Optional[str]:
-    """``"teardown"`` while a teardown of ``provider`` is running, ``"retired"``
-    once one has completed, else None (#8613). The acquisition chokepoint (the
-    #8517 P4 ``claim_instance`` guard) refuses an instance in either state: the
-    Agent then drops the provider and keeps built-in memory, which is the only
-    safe answer for an instance whose client is being, or has been, closed.
+    """``"teardown"`` while a teardown of ``provider`` is running, else None
+    (#8613). The acquisition chokepoint (the #8517 P4 ``claim_instance`` guard)
+    refuses an instance in that state: the Agent then drops the provider and
+    keeps built-in memory, which is the only safe answer for an instance whose
+    client is being closed.
+
+    A teardown that has COMPLETED fences nothing: the entry leaves the table with
+    its last holder, and the next construction claims and re-initialises the
+    instance again — the same recovery the owned path
+    (``shutdown_memory_provider`` -> ``release_soft``) has always had. Refusing
+    for longer than the teardown itself would leave a singleton provider off
+    until the WebUI restarts.
 
     Takes ``_provider_holders_lock``. Nothing takes the holder lock while holding
     ``_instance_owners_lock`` (the P4 table's lock), so the two never nest.
@@ -913,17 +1055,15 @@ def _instance_lifetime_state(provider: Any) -> Optional[str]:
             return None
         if entry.teardown:
             return "teardown"
-        if entry.retired:
-            return "retired"
         return None
 
 
-def agent_holds_retired_instance(agent: Any) -> tuple[bool, str]:
-    """``(True, name)`` when ``agent`` serves a provider instance that is being
-    torn down or has been torn down (#8613). Such an agent's next memory save
-    would go through a client another agent's teardown closed, so it must not be
-    handed out as a cacheable agent — ``construct_profile_scoped_agent`` fails
-    closed and rebuilds it without memory instead.
+def agent_holds_dying_instance(agent: Any) -> tuple[bool, str]:
+    """``(True, name)`` when ``agent`` serves a provider instance a teardown is
+    closing right now (#8613). Such an agent's next memory save would go through
+    a client another agent's teardown closed, so it must not be handed out as a
+    cacheable agent — ``construct_profile_scoped_agent`` fails closed and
+    rebuilds it without memory instead.
     """
     if agent is None:
         return False, ""
@@ -978,11 +1118,18 @@ def _forget_agent_holder(agent_pid: int, ref: Callable[[], Any]) -> None:
     """Weak-reference callback: a collected agent stops holding every instance."""
     with _provider_holders_lock:
         for key, entry in list(_provider_holders.items()):
-            if entry.holders.get(agent_pid) is ref:
+            holder = entry.holders.get(agent_pid)
+            if holder is not None and holder.agent is ref:
                 del entry.holders[agent_pid]
-            # A retired instance keeps its (empty) entry: it must still refuse the
-            # next acquisition, so it may only leave with the instance itself.
-            if not entry.holders and not entry.teardown and not entry.retired:
+                # #8613 must-fix 1: the agent is gone, but a save its manager
+                # already queued is not. That manager is still alive — the queued
+                # work holds it — so the hold survives as queued work, weakly, and
+                # evaporates once the work has drained.
+                if _manager_has_outstanding_work(holder.manager()):
+                    entry.work[agent_pid] = holder.manager
+            # An entry nobody holds any more, with no teardown and no queued work
+            # to protect, leaves the table.
+            if not entry.holders and not entry.teardown and not entry.work:
                 del _provider_holders[key]
 
 
@@ -1008,11 +1155,11 @@ def register_provider_holders(agent: Any, *, home_key: str = "") -> int:
     build, so an agent is in the table before any session boundary can ask whether
     it is the last holder of an instance.
 
-    An instance that is being torn down (or already was) admits NO new holder:
-    recording one would claim protection for a client that is being closed, and
-    the holder's next save would fail. The acquisition itself is refused earlier,
-    at the #8517 P4 ``claim_instance`` guard; this is the backstop for an Agent
-    without that seam, whose manager keeps the instance anyway.
+    An instance that is being torn down admits NO new holder: recording one would
+    claim protection for a client that is being closed, and the holder's next save
+    would fail. The acquisition itself is refused earlier, at the #8517 P4
+    ``claim_instance`` guard; this is the backstop for an Agent without that seam,
+    whose manager keeps the instance anyway.
     """
     if agent is None:
         return 0
@@ -1020,6 +1167,7 @@ def register_provider_holders(agent: Any, *, home_key: str = "") -> int:
     if not instances:
         return 0
     agent_pid = id(agent)
+    manager_ref = _weak_manager_ref(_agent_manager(agent))
     added = 0
     with _provider_holders_lock:
         for provider in instances:
@@ -1037,7 +1185,7 @@ def register_provider_holders(agent: Any, *, home_key: str = "") -> int:
                 _provider_holders[inst_pid] = entry
             if agent_pid in entry.holders:
                 continue
-            if entry.teardown or entry.retired:
+            if entry.teardown:
                 _log_once(
                     f"register-dying:{inst_pid}",
                     "[webui] #8613: provider %r was handed to a new agent while it was "
@@ -1046,7 +1194,7 @@ def register_provider_holders(agent: Any, *, home_key: str = "") -> int:
                     getattr(provider, "name", "?"),
                 )
                 continue
-            entry.holders[agent_pid] = _weak_agent_ref(agent)
+            entry.holders[agent_pid] = _AgentHolder(_weak_agent_ref(agent), manager_ref)
             added += 1
     return added
 
@@ -1055,46 +1203,93 @@ def unregister_provider_holders(agent: Any) -> None:
     """Drop ``agent`` from every holder set: it was detached, evicted or discarded
     and will never touch those instances again (#8613). Never touches the instances
     themselves — whether one may be torn down is the caller's decision, taken with
-    ``agent_is_last_provider_holder`` BEFORE this runs."""
+    ``agent_is_last_provider_holder`` BEFORE this runs.
+
+    A manager that still has queued memory work keeps a hold on every instance it
+    served (``_InstanceHolders.work``): that work runs in the provider's own
+    profile on the manager's writer and still goes through the instance, so
+    dropping the agent without a trace would let another agent's boundary prove
+    itself the last holder and close the client that save needs (must-fix 1). The
+    hold is weak — the queued work keeps the manager alive — and the next proof
+    drops it once the work has drained.
+    """
     if agent is None:
         return
     agent_pid = id(agent)
+    manager = _agent_manager(agent)
     with _provider_holders_lock:
         for key, entry in list(_provider_holders.items()):
-            if agent_pid in entry.holders:
-                del entry.holders[agent_pid]
-            # A retired instance keeps its (empty) entry so the next acquisition is
-            # still refused; it leaves only when the instance itself is collected.
-            if not entry.holders and not entry.teardown and not entry.retired:
+            _forget_holder_locked(entry, agent_pid, manager)
+            # An entry nobody holds any more, with no teardown and no queued work
+            # to protect, leaves the table.
+            if not entry.holders and not entry.teardown and not entry.work:
                 del _provider_holders[key]
 
 
-def _last_provider_holder_locked(agent: Any) -> tuple[bool, str]:
-    """``agent_is_last_provider_holder`` with ``_provider_holders_lock`` already held."""
+def _forget_holder_locked(entry: _InstanceHolders, agent_pid: int, manager: Any) -> None:
+    """Drop ``agent_pid`` from ``entry``'s holders, with ``_provider_holders_lock``
+    held, keeping a queued-work hold when its ``manager`` still has outstanding
+    memory work (#8613 must-fix 1)."""
+    holder = entry.holders.pop(agent_pid, None)
+    if holder is None:
+        return
+    if _manager_has_outstanding_work(manager):
+        entry.work[agent_pid] = holder.manager
+
+
+def _last_provider_holder_locked(agent: Any, *, self_dropped: bool = False) -> tuple[bool, str, bool]:
+    """``agent_is_last_provider_holder`` with ``_provider_holders_lock`` already
+    held. Returns ``(ok, why, fenced)``; ``fenced`` is True when the ONLY reason
+    for the refusal is a construction in flight for the instance's profile home,
+    the one reason a bounded wait can clear (see ``_claim_last_held_teardown``).
+
+    ``self_dropped`` is for the claim path, which has already removed ``agent``
+    from the holder sets inside the same critical section: the agent is then no
+    longer expected to be recorded, and its own queued work does not count
+    against it — the release drains that itself.
+    """
     if agent is None:
-        return True, ""
+        return True, "", False
     instances = _provider_instances(agent)
     if not instances:
-        return True, ""  # nothing held: no other agent can be broken by a release
+        return True, "", False  # nothing held: no other agent can be broken by a release
     agent_pid = id(agent)
     for provider in instances:
         name = getattr(provider, "name", "?")
         entry = _live_holders_entry(provider)
         if entry is None:
-            return False, f"provider {name!r} is not tracked as held by any agent"
-        mine = entry.holders.get(agent_pid)
-        if mine is None or mine() is not agent:
-            return False, f"provider {name!r} is not tracked as held by this agent"
+            return False, f"provider {name!r} is not tracked as held by any agent", False
+        if not self_dropped:
+            mine = entry.holders.get(agent_pid)
+            if mine is None or mine.agent() is not agent:
+                # A claim that already dropped this agent (a release in flight for
+                # it) must answer as the teardown it is, not as an untracked hold.
+                if entry.teardown:
+                    return False, f"a teardown of provider {name!r} is already running", False
+                return False, f"provider {name!r} is not tracked as held by this agent", False
         # A collected holder does not count: its weak-reference callback removes it,
         # and a stale reference must not pin an instance nobody uses any more.
-        others = [ref for key, ref in entry.holders.items() if key != agent_pid and ref() is not None]
+        others = [h for key, h in entry.holders.items() if key != agent_pid and h.agent() is not None]
         if others:
             return False, (
                 f"provider {name!r} of profile home {entry.home_key!r} is still held by "
                 f"{len(others)} other agent(s)"
-            )
+            ), False
         if entry.teardown:
-            return False, f"a teardown of provider {name!r} is already running"
+            return False, f"a teardown of provider {name!r} is already running", False
+        # #8613 must-fix 1: an agent that already left the holder set — evicted or
+        # collected — while its manager still had queued memory work holds this
+        # instance exactly like a live holder: that work still writes through it.
+        # Its own work is excluded: the release drains the agent it releases.
+        for pid, manager_ref in list(entry.work.items()):
+            if pid == agent_pid:
+                continue
+            if _manager_has_outstanding_work(manager_ref()):
+                return False, (
+                    f"provider {name!r} of profile home {entry.home_key!r} still has queued "
+                    f"memory work from a departed agent"
+                ), False
+            del entry.work[pid]  # the work drained (or its manager is gone): the hold is spent
         # #8613: a construction in flight for this instance's profile home is a
         # holder the table cannot show yet — the Agent initialises the provider
         # inside its constructor and only registers once it has returned. Counting
@@ -1104,20 +1299,59 @@ def _last_provider_holder_locked(agent: Any) -> tuple[bool, str]:
             return False, (
                 f"provider {name!r} of profile home {entry.home_key!r} is being acquired "
                 f"by {pending} construction(s) in flight"
-            )
-    return True, ""
+            ), True
+    return True, "", False
 
 
 def agent_is_last_provider_holder(agent: Any) -> tuple[bool, str]:
     """``(True, "")`` when every provider instance ``agent`` serves has this agent as
     its ONLY live holder, so a teardown cannot break another agent (#8613);
     ``(False, reason)`` when one is still held elsewhere, when a teardown of it is
-    already running, when a construction is acquiring it right now, or when that
-    cannot be proven. Every unknown answers False: a provider that keeps running is
-    the status quo, a provider shut down under a live agent is not.
+    already running, when a construction is acquiring it right now, when a
+    departed agent still has queued memory work on it, or when that cannot be
+    proven. Every unknown answers False: a provider that keeps running is the
+    status quo, a provider shut down under a live agent is not.
     """
     with _provider_holders_lock:
-        return _last_provider_holder_locked(agent)
+        ok, why, _fenced = _last_provider_holder_locked(agent)
+    return ok, why
+
+
+# How long a release waits for a construction of the same profile home to finish
+# before it gives up and refuses (#8613 should-fix 5). The Agent initialises the
+# provider inside its constructor, so a build that has not returned yet may still
+# be about to acquire the very instance this release would close; refusing there
+# instead of waiting drops the instance out of the holder table with its writer
+# alive, which is the leak #8613 exists to close. ``Condition.wait`` releases the
+# lock while it waits, so no other thread is blocked by it.
+_ACQUISITION_FENCE_WAIT_S = 15.0
+
+
+def _agent_holds_instances_locked(agent: Any) -> tuple[bool, str, list]:
+    """``(True, "", instances)`` when ``agent`` is a recorded holder of every
+    provider instance its manager serves, else ``(False, why, [])`` — with
+    ``_provider_holders_lock`` already held. The claim path runs this BEFORE it
+    drops the agent from the holder sets, so a release is only ever attempted for
+    an agent the table really shows as a holder."""
+    if agent is None:
+        return True, "", []
+    instances = _provider_instances(agent)
+    if not instances:
+        return True, "", []  # nothing held: no other agent can be broken by a release
+    agent_pid = id(agent)
+    for provider in instances:
+        name = getattr(provider, "name", "?")
+        entry = _live_holders_entry(provider)
+        if entry is None:
+            return False, f"provider {name!r} is not tracked as held by any agent", []
+        mine = entry.holders.get(agent_pid)
+        if mine is None or mine.agent() is not agent:
+            # A claim that already dropped this agent (its release is in flight)
+            # must answer as the teardown it is, not as an untracked hold.
+            if entry.teardown:
+                return False, f"a teardown of provider {name!r} is already running", []
+            return False, f"provider {name!r} is not tracked as held by this agent", []
+    return True, "", instances
 
 
 def _claim_last_held_teardown(agent: Any) -> tuple[bool, str, list]:
@@ -1126,35 +1360,67 @@ def _claim_last_held_teardown(agent: Any) -> tuple[bool, str, list]:
     and the release (#8613). The claimed instances are returned by identity:
     holding them keeps their ``id()`` — and the claim — valid for the whole release.
 
-    The proof counts in-flight acquisitions (``_inflight_homes``), so an instance a
-    construction is acquiring right now is never torn down. The lock is dropped
-    before ``release()`` runs: that is a 10 s drain of provider I/O, and no global
-    registry lock may span it. ``entry.teardown`` fences the window instead — the
-    acquisition chokepoint refuses an instance that is being torn down, so no new
-    holder can appear mid-release to be shut down with it.
+    The agent leaves the holder sets FIRST, inside that same critical section, and
+    only then are the others counted: two agents reaching their boundary at the
+    same moment would otherwise each prove the other alive, release nothing, and
+    leave the instance outside the table with its writer running (must-fix 6). An
+    agent's own queued memory work does not count against it — the release drains
+    that itself — but another agent's does (must-fix 1).
+
+    The only refusal a wait can clear is a construction in flight for the
+    instance's profile home, so the claim waits, bounded, on
+    ``_provider_holders_cond`` (``_end_acquisition`` notifies it) and then re-runs
+    the proof: the construction has either registered a holder — the release is
+    then correctly refused — or acquired nothing, and the release runs. The lock
+    is never held across provider I/O: ``wait()`` releases it, and ``release()``
+    still runs a 10 s drain outside it entirely.
     """
+    deadline = time.monotonic() + _ACQUISITION_FENCE_WAIT_S
     with _provider_holders_lock:
-        ok, why = _last_provider_holder_locked(agent)
+        ok, why, claimed = _agent_holds_instances_locked(agent)
         if not ok:
             return False, why, []
-        claimed = _provider_instances(agent)
+        # This agent is leaving: it must not count as its own co-holder, and a
+        # queued save of its own must keep holding what it writes through.
+        manager = _agent_manager(agent)
         for provider in claimed:
             entry = _live_holders_entry(provider)
             if entry is not None:
-                entry.teardown = True
-        return True, "", claimed
+                _forget_holder_locked(entry, id(agent), manager)
+        while True:
+            ok, why, fenced = _last_provider_holder_locked(agent, self_dropped=True)
+            if ok:
+                for provider in claimed:
+                    entry = _live_holders_entry(provider)
+                    if entry is not None:
+                        entry.teardown = True
+                return True, "", claimed
+            if not fenced:
+                return False, why, []
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logger.warning(
+                    "[webui] #8613: waited %.0fs for a construction of the same profile to "
+                    "finish before releasing a memory provider and gave up (%s). The "
+                    "provider keeps its worker until the next session boundary.",
+                    _ACQUISITION_FENCE_WAIT_S, why,
+                )
+                return False, why, []
+            _provider_holders_cond.wait(remaining)
 
 
-def _settle_last_held_teardown(agent: Any, claimed: list, *, retired: bool = False) -> list[str]:
+def _settle_last_held_teardown(agent: Any, claimed: list, *, released: bool = False) -> list[str]:
     """Clear the teardown claim, drop ``agent`` from the holder sets, and name the
     instances that gained a holder while the release ran — the one race this design
     cannot close (an agent constructed for the same profile binds the instance
-    mid-release). Reported so it is visible, not silently swallowed.
+    mid-release, or leaves queued work on it). Reported so it is visible, not
+    silently swallowed.
 
-    ``retired`` marks the instances the caller DID tear down: they must refuse
-    every later acquisition, so their entries survive the settlement. It is False
-    when the release was abandoned before it ran (an unscopable profile home), so
-    the next boundary may retry with the instance still live.
+    ``released`` marks the instances the caller DID tear down: the release drained
+    this agent's own queued memory work, so its work hold is spent. It is False
+    when the release was abandoned before it ran (an unscopable profile home, a
+    manager whose teardown was already claimed), so the next boundary may retry
+    with the instance still live.
     """
     raced: list[str] = []
     agent_pid = id(agent)
@@ -1164,15 +1430,15 @@ def _settle_last_held_teardown(agent: Any, claimed: list, *, retired: bool = Fal
             if entry is None:
                 continue
             entry.teardown = False
-            if retired:
-                entry.retired = True
             entry.holders.pop(agent_pid, None)
-            if any(ref() is not None for ref in entry.holders.values()):
+            if released:
+                entry.work.pop(agent_pid, None)
+            if any(h.agent() is not None for h in entry.holders.values()) or entry.work:
                 raced.append(str(getattr(provider, "name", "?")))
-        # An instance nobody holds any more leaves the table — unless it was torn
-        # down, in which case it must keep refusing acquisitions.
+        # An instance nobody holds any more, with no teardown and no queued work to
+        # protect, leaves the table.
         for key, entry in list(_provider_holders.items()):
-            if not entry.holders and not entry.teardown and not entry.retired:
+            if not entry.holders and not entry.teardown and not entry.work:
                 del _provider_holders[key]
     return raced
 
@@ -1206,15 +1472,21 @@ def release_unowned_memory_provider(agent: Any, *, session_id: str, owner_home: 
       agent of a profile is shared by them all, and a manager-level teardown shuts
       that instance down under the agents still using it — which is why an earlier
       version of this fix was reverted (#8636). While another agent of the same
-      profile holds the instance, or a construction is acquiring it right now
+      profile holds the instance, while a construction is acquiring it right now
       (``_inflight_homes``: the Agent initialises the provider inside its
-      constructor, before the holder can be recorded), nothing runs and the
+      constructor, before the holder can be recorded), or while an agent that
+      already left still has queued memory work on it, nothing runs and the
       provider keeps its worker; that agent's own session boundary releases it.
-      An instance this release DID tear down is retired, so no later construction
-      is handed the client it just closed.
+      A construction in flight is waited for, bounded, rather than refused: the
+      build either registers a holder or acquires nothing. An instance this
+      release DID tear down is claimed again — and re-initialised — by the next
+      construction, exactly as after an owned session-end teardown.
+    * the manager's teardown has not been claimed already: ``release_soft`` is a
+      no-op when it has, and a no-op must not be reported as a release (the
+      provider's worker is still alive).
 
-    Otherwise nothing runs and it is logged once: that provider lingers until the
-    WebUI restarts, as before.
+    Otherwise nothing runs and it is logged once per session: that provider
+    lingers until the WebUI restarts, as before.
     """
     manager = getattr(agent, "_memory_manager", None)
     if manager is None:
@@ -1243,11 +1515,16 @@ def release_unowned_memory_provider(agent: Any, *, session_id: str, owner_home: 
             "provider is not released; it keeps its worker until the WebUI restarts.",
         )
         return False
-    # #8613: never tear down an instance another live agent still holds.
+    # #8613: never tear down an instance another live agent still holds, one a
+    # construction is acquiring, or one a departed agent still has queued memory
+    # work on. The claim waits for a construction in flight, bounded, so the
+    # instance is not dropped out of the table with its writer alive.
     ok, why, claimed = _claim_last_held_teardown(agent)
     if not ok:
+        # Keyed per session: a static key logged only the FIRST refusal in the
+        # process, so every later evicted session was silent about its provider.
         _log_once(
-            "release-shared",
+            f"release-shared:{session_id}",
             "[webui] #8613: the memory provider of evicted session %s was NOT released: "
             "%s. The provider keeps its worker until the last agent holding it reaches a "
             "session boundary, or until the WebUI restarts.",
@@ -1266,11 +1543,24 @@ def release_unowned_memory_provider(agent: Any, *, session_id: str, owner_home: 
         return False
     released = False
     try:
+        # #8613 (low): ``release_soft`` claims the teardown itself and does nothing
+        # when another teardown of this manager already claimed it. Reporting that
+        # as a release would retire the instance with its worker still alive.
+        if getattr(manager, "_teardown_claim", None):
+            _log_once(
+                f"release-claimed:{session_id}",
+                "[webui] #8613: the memory provider of evicted session %s was NOT released: "
+                "a teardown of its memory manager was already claimed, so the release "
+                "would have done nothing. The provider keeps its worker until the WebUI "
+                "restarts.",
+                session_id,
+            )
+            return False
         release()
         released = True
     finally:
         restore()
-        raced = _settle_last_held_teardown(agent, claimed, retired=released)
+        raced = _settle_last_held_teardown(agent, claimed, released=released)
     if raced:
         logger.warning(
             "[webui] #8613: provider(s) %s gained a holder while the release of evicted "
