@@ -32,6 +32,14 @@ closes it; ``remember()`` is the save that then fails.
 and no session record, so ``session_owner_profile_home`` answers ``""``. The
 lifecycle entry is clean (no uncommitted generation), which is the only shape in
 which the eviction path reaches the provider shutdown at all.
+
+Acquisition and teardown are ONE instance-lifetime protocol, and these tests
+replay the two windows where a construction overlaps a teardown: a holder acquired
+while the release is mid-flight (schedule 1) and an eviction that lands after the
+new constructor's native initialisation but before it registers (schedule 2). The
+oracle in both is the SURVIVING agent's next save — a settlement warning reports
+the damage after it happened, and the pre-registration window produces no warning
+at all, so neither is proof on its own.
 """
 # ruff: noqa: F811  (pytest fixtures imported from the #8517 P0 module)
 from __future__ import annotations
@@ -109,12 +117,18 @@ def _fresh_instance():
 
 # ── the stand-in Agent ───────────────────────────────────────────────────────
 
-def make_holder_agent_cls(provider_for_build, *, home, identity="alpha"):
+def make_holder_agent_cls(provider_for_build, *, home, identity="alpha", after_init=None):
     """Stand-in AIAgent. ``__init__`` binds memory the way the real Agent does
     (``MemoryManager.initialize_for_agent`` -> ``claim_instance`` -> ``initialize``);
     ``shutdown_memory_provider`` is ``run_agent.AIAgent.shutdown_memory_provider``
     (claim teardown -> ``on_session_end`` -> ``shutdown_all``); ``save`` is one
-    memory write through the agent's provider."""
+    memory write through the agent's provider.
+
+    ``after_init`` runs at the very end of ``__init__``, AFTER the native manager
+    has been initialised and BEFORE the constructor returns — the window in which
+    the holder is not registered yet (``construct_profile_scoped_agent`` registers
+    it only once ``agent_cls(...)`` has returned).
+    """
 
     class HolderAgent:
         built: list = []
@@ -131,6 +145,8 @@ def make_holder_agent_cls(provider_for_build, *, home, identity="alpha"):
                     session_id=session_id, hermes_home=str(home), agent_identity=identity
                 )
                 self._memory_manager = manager
+                if after_init is not None:
+                    after_init()
             HolderAgent.built.append(self)
 
         def shutdown_memory_provider(self, messages=None):
@@ -153,11 +169,13 @@ def make_holder_agent_cls(provider_for_build, *, home, identity="alpha"):
     return HolderAgent
 
 
-def _build(home, provider_for_build, session_id, *, identity="alpha"):
+def _build(home, provider_for_build, session_id, *, identity="alpha", after_init=None):
     """One agent built through the production constructor, so the holder table is
     populated exactly the way a real turn populates it."""
     agent, cacheable = scope.construct_profile_scoped_agent(
-        make_holder_agent_cls(provider_for_build, home=home, identity=identity),
+        make_holder_agent_cls(
+            provider_for_build, home=home, identity=identity, after_init=after_init
+        ),
         {"model": "m"},
         profile_home=str(home),
         session_id=session_id,
@@ -169,6 +187,27 @@ def _build(home, provider_for_build, session_id, *, identity="alpha"):
 
 def _shared_agent(home, provider, session_id):
     return _build(home, lambda: provider, session_id)
+
+
+def surviving_save(agent, marker):
+    """ORACLE for a shared instance torn down under a live agent: the surviving
+    agent's NEXT memory save — a memory tool call or an autosave in a later turn.
+
+    Returns the provider the save went through, or ``None`` when the shared
+    instance was refused to this agent (it then keeps built-in memory only).
+    Raises the issue's own failure, ``memory provider client is closed: the save
+    failed``, when the instance was shut down underneath an agent that holds it.
+
+    The settlement warning and the release counters only report the damage after
+    it happened, so neither is accepted as proof on its own: the race is only
+    closed when the surviving agent's next save still works.
+    """
+    manager = getattr(agent, "_memory_manager", None)
+    provider = manager.get_provider(PROVIDER_NAME) if manager is not None else None
+    if provider is None:
+        return None
+    provider.remember(marker)
+    return provider
 
 
 @pytest.fixture
@@ -562,6 +601,317 @@ def test_a_stale_instance_id_is_never_trusted_for_a_new_instance(hc, homes, hold
     assert entry is not None and entry.ref() is second
     ok, why = scope.agent_is_last_provider_holder(other)
     assert ok is True, why
+
+
+# ── (c) the two in-flight schedules: acquisition DURING a teardown ───────────
+#
+# Both replay a construction that overlaps a teardown. In each one the shared
+# provider instance ends up shut down under an agent that is still live, and the
+# only signal is the surviving agent's NEXT save — the settlement warning fires
+# after the damage and the pre-registration window produces no warning at all.
+
+def test_a_holder_acquired_during_the_release_is_not_shut_down_with_it(
+    hc, homes, holder_registry, monkeypatch
+):
+    """Schedule 1 — insert a new holder while the release is running.
+
+    The old agent's soft release is paused at its REAL native flush
+    (``MemoryManager.flush_pending``), with the teardown claim already held; a new
+    same-profile agent is then constructed and registered; the release resumes.
+    The instance must not be handed to the new agent — a client the release closes
+    is a save that fails for the agent that just acquired it.
+    """
+    provider = SharedInstanceProvider()
+    old = _shared_agent(homes["alpha"], provider, "8613-s1-old")
+    assert scope.agent_is_last_provider_holder(old)[0] is True
+
+    at_flush = threading.Event()
+    resume = threading.Event()
+    real_flush = mm_mod.MemoryManager.flush_pending
+
+    def gated_flush(self, timeout=None):
+        # The real native flush; only the evicted agent's manager is paused.
+        if self is old._memory_manager:
+            at_flush.set()
+            assert resume.wait(30), "the paused release was never resumed"
+        return real_flush(self, timeout)
+
+    monkeypatch.setattr(mm_mod.MemoryManager, "flush_pending", gated_flush)
+
+    closed: list[bool] = []
+
+    def evict():
+        closed.append(streaming._close_evicted_agent_at_session_boundary("8613-s1-old", old))
+
+    thread = threading.Thread(target=evict, name="8613-s1-eviction", daemon=True)
+    thread.start()
+    assert at_flush.wait(30), "the release never reached its native flush"
+    assert provider.shutdowns == 0, "the provider was shut down before the release finished"
+
+    # Acquire the shared instance while the old agent's release is mid-flight.
+    survivor = _shared_agent(homes["alpha"], provider, "8613-s1-new")
+
+    resume.set()
+    thread.join(30)
+    assert not thread.is_alive()
+    assert closed == [True]
+
+    # ORACLE: the surviving agent's next save must not fail.
+    used = surviving_save(survivor, "8613-s1-save-after-the-release")
+    if used is None:
+        assert provider.client.closed is True, "the release did not run"
+    else:
+        assert used.client.closed is False, "the provider was shut down under a live holder"
+    entry = scope._provider_holders.get(id(provider))
+    assert entry is None or id(survivor) not in entry.holders, (
+        "a holder was recorded for an instance that was torn down"
+    )
+
+
+def test_an_eviction_during_construction_never_tears_the_instance_down(
+    hc, homes, holder_registry
+):
+    """Schedule 2 — insert an eviction before the new holder is registered.
+
+    The new constructor has finished its native initialisation (the instance is
+    claimed and initialised) but has not returned, so the holder is not in the
+    table yet. Evicting the old sole RECORDED holder here must not tear the
+    instance down: the new agent is returned cacheable and its next save goes
+    through the very client a teardown would close. This window produces no
+    gained-holder warning at all, so the save is the only oracle.
+    """
+    provider = SharedInstanceProvider()
+    old = _shared_agent(homes["alpha"], provider, "8613-s2-old")
+
+    initialised = threading.Event()
+    proceed = threading.Event()
+
+    def pause_after_native_init():
+        initialised.set()
+        assert proceed.wait(30), "the paused construction was never resumed"
+
+    built: list = []
+
+    def build():
+        built.append(
+            _build(
+                homes["alpha"],
+                lambda: provider,
+                "8613-s2-new",
+                after_init=pause_after_native_init,
+            )
+        )
+
+    thread = threading.Thread(target=build, name="8613-s2-construction", daemon=True)
+    thread.start()
+    assert initialised.wait(30), "the constructor never initialised its native manager"
+    assert provider.shutdowns == 0
+
+    # The old agent is the sole RECORDED holder — the snapshot the proof would have
+    # used before the reservation existed. Capture what the full proof answers here,
+    # while the construction is paused: it must refuse, because a construction for
+    # the same profile home is acquiring the instance right now.
+    entry = scope._provider_holders.get(id(provider))
+    recorded_solely = entry is not None and list(entry.holders) == [id(old)]
+    ok, why = scope.agent_is_last_provider_holder(old)
+    proof_refused = ok is False and "in flight" in why
+
+    assert streaming._close_evicted_agent_at_session_boundary("8613-s2-old", old) is True
+
+    proceed.set()
+    thread.join(30)
+    assert not thread.is_alive()
+    survivor = built[0]
+
+    # ORACLE: the surviving agent's next save must not fail.
+    used = surviving_save(survivor, "8613-s2-save-after-the-eviction")
+    assert used is not None, "the surviving agent lost the provider it had acquired"
+    assert used.client.closed is False
+    assert provider.client.writes == ["8613-s2-save-after-the-eviction"]
+
+    # The proof that made the oracle pass, and the release that therefore never ran.
+    assert recorded_solely, "the recorded snapshot was not what this schedule assumes"
+    assert proof_refused, why
+    assert provider.shutdowns == 0, "the provider was torn down under the agent being built"
+
+
+# ── (d) the rest of the instance-lifetime protocol ──────────────────────────
+
+def test_a_build_that_lands_on_a_tearing_down_instance_fails_closed(
+    hc, homes, holder_registry
+):
+    """An Agent without the ``claim_instance`` seam keeps the instance its manager
+    was handed, so the reservation alone cannot stop it binding a dying instance.
+    The construction must then fail closed: the agent is rebuilt without memory
+    and not cached, so the next turn constructs it again once the teardown settled.
+    """
+    provider = SharedInstanceProvider()
+    first = _shared_agent(homes["alpha"], provider, "8613-failclosed-a")
+    ok, why, claimed = scope._claim_last_held_teardown(first)
+    assert ok is True, why  # a teardown is now running; nothing has been released yet
+
+    class SeamlessAgent:
+        """An Agent older than 2026-10-17: it binds the provider without ever
+        calling ``claim_instance``, so the P4 acquisition guard never sees it."""
+
+        def __init__(self, session_id=None, skip_memory=False, **kwargs):
+            self.session_id = session_id
+            self._memory_manager = None
+            if not skip_memory:
+                manager = mm_mod.MemoryManager()
+                manager._providers = [provider]
+                manager._bound_scope = {
+                    "hermes_home": str(homes["alpha"]),
+                    "home_key": _key(homes["alpha"]),
+                }
+                self._memory_manager = manager
+
+    agent, cacheable = scope.construct_profile_scoped_agent(
+        SeamlessAgent, {"model": "m"}, profile_home=str(homes["alpha"]), session_id="8613-failclosed-b"
+    )
+    assert cacheable is False, "an agent holding a dying instance must not be cached"
+    assert agent._memory_manager is None, "the dying instance was left on the agent"
+    assert provider.shutdowns == 0
+    assert scope.register_provider_holders(agent) == 0
+
+    # Once the teardown settles the instance is live again and may be acquired.
+    scope._settle_last_held_teardown(first, claimed)
+    again = _shared_agent(homes["alpha"], provider, "8613-failclosed-c")
+    assert again._memory_manager.get_provider(PROVIDER_NAME) is provider
+    assert scope.agent_is_last_provider_holder(again)[0] is True
+
+
+def test_a_torn_down_instance_is_never_acquired_again(hc, homes, holder_registry):
+    """The release shut the shared instance down, so a LATER construction for the
+    same profile must not be handed the client it just closed — the surviving
+    agent's next save would otherwise fail with no release anywhere near it."""
+    provider = SharedInstanceProvider()
+    agent = _shared_agent(homes["alpha"], provider, "8613-retire")
+
+    assert streaming._close_evicted_agent_at_session_boundary("8613-retire", agent) is True
+    assert provider.shutdowns == 1 and provider.client.closed is True
+
+    later = _shared_agent(homes["alpha"], provider, "8613-retire-later")
+    assert later._memory_manager.get_provider(PROVIDER_NAME) is None, (
+        "a torn-down instance was handed to a new agent"
+    )
+    assert scope.register_provider_holders(later, home_key=_key(homes["alpha"])) == 0
+    # The retired entry survives the eviction's holder cleanup, so the refusal
+    # keeps working for every later construction.
+    entry = scope._provider_holders.get(id(provider))
+    assert entry is not None and entry.retired is True and not entry.holders
+    assert scope.agent_is_last_provider_holder(later) == (True, "")
+
+
+def test_an_aborted_construction_releases_its_reservation(hc, homes, holder_registry):
+    """A build that raises after the reservation was taken must not fence this
+    profile's releases for the rest of the process."""
+
+    class Boom:
+        def __init__(self, **kwargs):
+            raise RuntimeError("construction failed")
+
+    with pytest.raises(RuntimeError, match="construction failed"):
+        scope.construct_profile_scoped_agent(
+            Boom, {"model": "m"}, profile_home=str(homes["alpha"]), session_id="8613-abort"
+        )
+    assert scope._inflight_homes == {}, scope._inflight_homes
+
+
+def test_a_construction_for_another_profile_does_not_fence_this_release(
+    hc, homes, holder_registry
+):
+    """The reservation is per profile home: a construction for beta must neither
+    stop alpha's last holder from releasing nor wedge it behind beta's build."""
+    provider = SharedInstanceProvider()
+    agent = _shared_agent(homes["alpha"], provider, "8613-xprofile")
+
+    started = threading.Event()
+    proceed = threading.Event()
+
+    def pause_after_native_init():
+        started.set()
+        assert proceed.wait(30), "the paused construction was never resumed"
+
+    built: list = []
+
+    def build_beta():
+        built.append(
+            _build(
+                homes["beta"],
+                SharedInstanceProvider,
+                "8613-xprofile-beta",
+                after_init=pause_after_native_init,
+            )
+        )
+
+    thread = threading.Thread(target=build_beta, name="8613-xprofile-build", daemon=True)
+    thread.start()
+    assert started.wait(30), "the other profile's construction never started"
+
+    assert scope.agent_is_last_provider_holder(agent)[0] is True, (
+        "another profile's construction fenced this profile's release"
+    )
+    assert scope.release_unowned_memory_provider(agent, session_id="8613-xprofile") is True
+    assert provider.shutdowns == 1 and provider.client.closed is True
+
+    proceed.set()
+    thread.join(30)
+    assert not thread.is_alive()
+    assert built[0]._memory_manager.get_provider(PROVIDER_NAME) is not None
+
+
+def test_the_reservation_counts_concurrent_constructions_of_one_profile(
+    hc, homes, holder_registry
+):
+    """Two constructions for the same profile home hold the fence together and
+    release it only when the last of them finishes."""
+    key = _key(homes["alpha"])
+    scope._reserve_acquisition(key)
+    scope._reserve_acquisition(key)
+    assert scope._inflight_acquisitions(key) == 2
+    scope._end_acquisition(key)
+    assert scope._inflight_acquisitions(key) == 1
+    scope._end_acquisition(key)
+    assert scope._inflight_acquisitions(key) == 0
+    assert scope._inflight_homes == {}
+    # An unkeyed lookup cannot be correlated, so any construction in flight counts.
+    scope._reserve_acquisition(key)
+    assert scope._inflight_acquisitions("") == 1
+    scope._end_acquisition(key)
+
+
+def test_an_unkeyed_instance_is_fenced_by_any_construction_in_flight(
+    hc, homes, holder_registry
+):
+    """An instance whose profile home cannot be correlated must not be released
+    while ANY construction is in flight: an unprovable answer is not a proof."""
+
+    class _Prov:
+        name = "8613unkeyed"
+
+    class _Mgr:
+        def __init__(self):
+            self.providers = [_Prov()]
+            self._bound_scope = {"hermes_home": str(homes["alpha"])}
+            self.release_soft = lambda: None
+            self.claim_teardown = lambda *, session_end: True
+
+    class _Agent:
+        def __init__(self):
+            self._memory_manager = _Mgr()
+
+    agent = _Agent()
+    scope.register_provider_holders(agent, home_key="")
+    assert scope.agent_is_last_provider_holder(agent)[0] is True
+
+    scope._reserve_acquisition(_key(homes["beta"]))
+    try:
+        ok, why = scope.agent_is_last_provider_holder(agent)
+        assert ok is False and "in flight" in why, why
+    finally:
+        scope._end_acquisition(_key(homes["beta"]))
+    assert scope.agent_is_last_provider_holder(agent)[0] is True
 
 
 # ── the wiring the fix depends on ────────────────────────────────────────────
